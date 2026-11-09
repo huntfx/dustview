@@ -32,7 +32,7 @@ The first run without sand slumping left horizontal stripes in eroded sand (a kn
 |---|---|
 | Ground surface, soft ground, water depth (512 × 512) | `.sav` blocks 0/2/1 ([../docs/sav-format.md](../docs/sav-format.md)); hard ground = block 0 − block 2 (checked on 4 maps) |
 | Per-cell state: 4 outflow fluxes, soft ground, sediment | Debug strings in `GalileoSimulatorWater.dll` (`FluxLeft/Right/Up/Down`, `SoftGroundQuantity`, `SedimentQuantity`, `0x16C3C`–`0x16CC8`) and `SaveWaterOutFlux*` functions |
-| Fixed border = open sea | Debug strings `BorderWater`, `BorderHard`, `BorderSoft` (`0x16F38`–`0x16F5C`); the `.sav` outer ring is constant (Map1: ground 30.37, water 9.60) |
+| Fixed 32-cell border band (sea, dry sand, or a drain, per map) | Debug strings `BorderWater`, `BorderHard`, `BorderSoft` (`0x16F38`–`0x16F5C`); the band is identical in every map start and the player's saves after play ([../docs/sav-format.md](../docs/sav-format.md#the-32-cell-border-band-is-constant)). Pinned in the sim since 2026-11-09 (was 1 cell before) |
 | Grid 512 × 512 | `<9,9>` templates; `.sav` layout |
 
 ## What is textbook (to be replaced)
@@ -56,5 +56,5 @@ The first run without sand slumping left horizontal stripes in eroded sand (a kn
 
 ## TODO (skipped, worth revisiting)
 - [ ] Steps 1–3 above.
-- [ ] Decide what the 32-cell border shelf is in-game (outside the playable area?) and whether the game drives tides there.
+- [x] ~~What the 32-cell border is~~: a constant band (never changes during play); now pinned in the sim. Not checked: whether the game has tides elsewhere (Map8 is called "HighTides").
 - [ ] Speed: numba or a C extension if bigger grids get too slow.

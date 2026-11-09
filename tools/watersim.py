@@ -66,7 +66,9 @@ class Sim:
     """
 
     def __init__(self, hard, soft, water, cell=1.0, dt=0.02, g=9.81, damping=0.998,
-                 k_capacity=0.08, k_erode=0.2, k_deposit=0.3, repose=0.8, slump_rate=0.25, border=1):
+                 k_capacity=0.08, k_erode=0.2, k_deposit=0.3, repose=0.8, slump_rate=0.25, border=32):
+        # border: the game keeps a 32-cell band around the map constant (water, ground and soft
+        # identical between every map's start state and the player's saves after play)
         f32 = np.float32
         self.hard, self.soft, self.water = hard.astype(f32), soft.astype(f32), water.astype(f32)
         self.sed = np.zeros_like(self.water)                  # suspended soft ground (height units)
@@ -180,7 +182,7 @@ class Sim:
         b = self.border
         h0, s0, w0 = self.init
         for sl in (np.s_[:b, :], np.s_[-b:, :], np.s_[:, :b], np.s_[:, -b:]):
-            self.water[sl] = w0[sl]; self.soft[sl] = s0[sl]; self.sed[sl] = 0.0
+            self.water[sl] = w0[sl]; self.soft[sl] = s0[sl]; self.hard[sl] = h0[sl]; self.sed[sl] = 0.0
 
     # -- tools
     def brush(self, layer, cx, cy, r, amount):
@@ -278,7 +280,7 @@ def main():
     hard, soft, water = load_map(a.sav)
     K = a.upscale
     hard, soft, water = upsample(hard, K), upsample(soft, K), upsample(water, K)
-    sim = Sim(hard, soft, water, cell=1.0 / K, dt=a.dt / K, border=K)
+    sim = Sim(hard, soft, water, cell=1.0 / K, dt=a.dt / K, border=32 * K)
 
     if not a.no_source:
         if a.source:
