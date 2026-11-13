@@ -10,8 +10,9 @@ diff two sources.
 
 Run with the project venv while a level is loaded:
   .venv/Scripts/python tools/dustview.py [--scale 2] [--flip] [--rotate N] [--model MAP]
---model MAP runs the Python model from a map's .sav (e.g. ALPHA_Map11_Void) with the generators that
-are on at the start (no level script, no game needed).
+--model MAP runs the Python model from a map's .sav (e.g. ALPHA_Map11_Void) driven by its level script
+(tools/level_schedule.py: sources switching on/off/moving, the tide); --villages "0:0,200:1,900:3" gives
+the village counts the script checks. Waves and tsunamis are logged, not simulated. No game needed.
 
 Keys
   1 natural   2 height   3 water depth   4 lava temperature   5 sediment   6 flow speed
@@ -300,7 +301,7 @@ class ModelSource(Source):
     """The Python model (dustsim.tick) stepping in a background thread as fast as it can."""
     name = 'python model'
 
-    def __init__(self, grid, params, sources, tick=0, label='', repulsors=()):
+    def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None):
         self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(params, np.float32))}
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
@@ -316,13 +317,21 @@ class ModelSource(Source):
         self.published = None
         self.times = []
         self.lock = threading.Lock()
+        self.schedule = schedule                 # level_schedule.LevelSchedule: script-driven sources + tide
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
         while self.running:
             if self.paused:
                 time.sleep(0.05); continue
+            sch = self.schedule
+            if sch is not None:
+                sch.tick(1 / 31, ground=self.G['T'])
+                self.sources = sch.sources()
+                self.P['BorderWaterSurfaceHeight'] = sch.border_level
             G = dustsim.tick(self.G, self.P, self.sources, self.other_modifiers)
+            if sch is not None:
+                sch.write_back(self.sources)
             with self.lock:
                 self.G, self.tick = G, self.tick + 1
                 now = time.time()
@@ -338,13 +347,18 @@ class ModelSource(Source):
     def status(self):
         rate = len(self.times) / max(self.times[-1] - self.times[0], 1e-6) if len(self.times) > 1 else 0
         state = 'paused' if self.paused else '%.1f ticks/s' % rate
-        return '%s%s | %s | %d sources, %d repulsors' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers))
+        extra = ''
+        if self.schedule is not None:
+            sch = self.schedule
+            last = sch.events[-1] if sch.events else None
+            extra = ' | level time %.0fs, border %.2f%s' % (sch.time, sch.border_level, (' | last script event at %.0fs: %s' % (last[0], last[1][:70])) if last else '')
+        return '%s%s | %s | %d sources, %d repulsors%s' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers), extra)
 
     def stop(self):
         self.running = False
 
 
-def model_from_map(name):
+def model_from_map(name, villages=None):
     """ModelSource for a map's .sav: its start grids, border values and the generators that are on at
     the start (mode 1 or 2). Parameters are the game's normal set (galileo.fluid_params)."""
     import compare_sim, sav, sav_sources
@@ -353,10 +367,9 @@ def model_from_map(name):
     for c, a in enumerate((T, So, W, C3)):
         grid[c] = a.astype(np.float32).view(np.uint32)
     _, u = sav.read_sav(os.path.join(compare_sim.SAVES, name + '.sav'))
-    srcs = [dict(col=g['col'], row=g['row'], radius=g['radius'], rate=g['rate'], sediment=g['sediment'],
-                 temperature=g['temperature'], z=g['height'], height_mode=g['height_mode'], bury_threshold=5.0)
-            for g in sav_sources.generators(u) if g['mode'] in (1, 2)]
-    return ModelSource(grid, galileo.fluid_params(border=border), srcs, 0, name)
+    import level_schedule
+    sch = level_schedule.LevelSchedule(name, villages=villages, border_level=border[0])
+    return ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, name, schedule=sch)
 
 
 # ---------------------------------------------------------------- rendering
@@ -639,9 +652,12 @@ def main():
     ap.add_argument('--flip', action='store_true', help='flip vertically (row 0 at the bottom)')
     ap.add_argument('--rotate', type=int, default=0, help='rotate by N x 90 degrees')
     ap.add_argument('--model', metavar='MAP', help='run the Python model from this map file instead of reading the game')
+    ap.add_argument('--villages', metavar='T:N,...', help='with --model: villages built over time for the level script, e.g. "0:0,200:1,900:3"')
     a = ap.parse_args()
     root = tk.Tk()
-    App(root, model_from_map(a.model) if a.model else LiveGame(), a.scale, a.flip, a.rotate)
+    import level_schedule
+    vil = level_schedule.parse_villages(a.villages) if a.villages else None
+    App(root, model_from_map(a.model, vil) if a.model else LiveGame(), a.scale, a.flip, a.rotate)
     root.mainloop()
 
 

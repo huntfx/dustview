@@ -74,8 +74,9 @@ def counted(u, p):
 
 
 def utf16(u, p):
+    """u32 length (characters) + UTF-16LE text, padded to a multiple of 4 bytes (odd lengths: 2 bytes)."""
     n = u32(u, p)
-    return u[p + 4:p + 4 + 2 * n].decode('utf-16-le'), p + 4 + 2 * n
+    return u[p + 4:p + 4 + 2 * n].decode('utf-16-le'), p + 4 + 2 * n + (2 * n) % 4
 
 
 def handle_id(cls, index, serial):
@@ -204,6 +205,12 @@ def effect(u, a, b):
         d.update(target=ident, type=u32(u, q + 12), col=None if col == 0xFFFFFFFF else col, row=None if row == 0xFFFFFFFF else row,
                  temperature_editor=temp, temperature=temp / 8, sediment=sed / 100, rate=f32(u, r + 16),
                  size=u32(u, r + 20), radius=u32(u, r + 20) / 2)
+    elif name in ('Tsunami', 'RandomTsunami') and b - q >= 28:
+        d.update(template=u32(u, q + 12), direction=u32(u, q + 16), amplitude=f32(u, q + 20), village_protection=u32(u, q + 24))
+    elif name == 'Wave' and b - q >= 32:
+        d.update(template=u32(u, q + 12), direction=u32(u, q + 16), amplitude=f32(u, q + 20), cycle=u32(u, q + 24), cycle_duration=f32(u, q + 28))
+    elif name == 'Tide' and b - q >= 28:
+        d.update(amplitude=f32(u, q + 12), high_duration=f32(u, q + 16), low_duration=f32(u, q + 20), transition_duration=f32(u, q + 24))
     elif b - q >= 20 and u32(u, q + 16) == 8:            # effects that target one object by ID
         d['target'] = u[q + 20:q + 36].decode('utf-16-le', 'replace')
     return d
@@ -258,6 +265,16 @@ def describe_effect(e, gens):
             what += ' sediment %g' % e['sediment']
         until = 'for %gs, then off' % e['duration'] if e['duration'] >= 0 else 'permanently'
         return 'generator %s ON:%s rate %g radius %g %s, %s' % (who, where, e['rate'], e['radius'], what, until)
+    EDGES = {2: 'col 36 (low x)', 4: 'row 476 (high y)', 6: 'col 476 (high x)', 8: 'row 36 (low y)'}   # dustai jump tables
+    if e['name'] in ('Tsunami', 'RandomTsunami'):
+        return '%s from the %s edge, amplitude %g, for %gs%s' % (e['name'], EDGES.get(e['direction'], e['direction']), e['amplitude'], e['duration'],
+                                                                ', villages protected' if e['village_protection'] else '')
+    if e['name'] == 'Wave':
+        return 'Wave on the %s edge, amplitude %g, cycle %gs%s' % (EDGES.get(e['direction'], e['direction']), e['amplitude'], e['cycle_duration'],
+                                                                  '' if e['duration'] < 0 else ' (for %gs)' % e['duration'])
+    if e['name'] == 'Tide':
+        return 'Tide: sea level drops by %g over %gs, stays low %gs, rises over %gs, stays high %gs, repeating' % (
+            e['amplitude'], e['transition_duration'], e['low_duration'], e['transition_duration'], e['high_duration'])
     s = e['name']
     if 'target' in e:
         s += ' ' + e['target']

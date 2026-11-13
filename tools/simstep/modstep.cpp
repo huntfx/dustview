@@ -9,8 +9,8 @@
 //   grid_*.bin 8 MB grid (same layout as simstep); the modifier edits it in place
 //
 // The DLL has no imports and no entry point, so LoadLibrary + base + RVA is enough. The modifier
-// functions are __stdcall with the block pointer as the only argument (RepulseFluid ends in ret 4;
-// note SimulatorWater::Modify calls AddWater without a push, so AddWater may need checking).
+// functions are __stdcall with the block pointer as the only argument (ret 4), except AddWater, which
+// takes it in edx and ends in a plain ret (SimulatorWater::Modify calls it that way).
 // Build: build.bat (MSVC x86).
 #include <windows.h>
 #include <malloc.h>
@@ -37,9 +37,17 @@ static bool writeFile(const char *path, const void *src, size_t n) {
     return put == n;
 }
 
-static int run(ModFn fn, const void *block) {
+static int run(ModFn fn, const void *block, bool inEdx) {
     __try {
-        fn(block);
+        if (inEdx) {                       // AddWater: block pointer in edx, plain ret
+            void *f = (void *)fn;
+            __asm {
+                mov edx, block
+                call f
+            }
+        } else {
+            fn(block);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return (int)GetExceptionCode();
     }
@@ -53,13 +61,15 @@ int main(int argc, char **argv) {
     }
     HMODULE dll = LoadLibraryA(argv[1]);
     if (!dll) { fprintf(stderr, "LoadLibrary failed (%lu)\n", GetLastError()); return 1; }
-    ModFn fn = (ModFn)((unsigned char *)dll + strtoul(argv[2], NULL, 16));
+    unsigned long rva = strtoul(argv[2], NULL, 16);
+    ModFn fn = (ModFn)((unsigned char *)dll + rva);
+    bool inEdx = rva == 0xF800;            // AddWater
     unsigned char *block = (unsigned char *)_aligned_malloc(0x50, 64);
     unsigned char *grid = (unsigned char *)_aligned_malloc(GRID_BYTES, 64);
     if (!readFile(argv[3], block, 0x50)) { fprintf(stderr, "cannot read %s\n", argv[3]); return 1; }
     if (!readFile(argv[4], grid, GRID_BYTES)) { fprintf(stderr, "cannot read %s\n", argv[4]); return 1; }
     *(unsigned char **)(block + 0x08) = grid;
-    int ex = run(fn, block);
+    int ex = run(fn, block, inEdx);
     if (ex) { fprintf(stderr, "exception 0x%08X\n", ex); return 1; }
     if (!writeFile(argv[5], grid, GRID_BYTES)) { fprintf(stderr, "cannot write %s\n", argv[5]); return 1; }
     printf("ok: modifier at %p\n", (void *)fn);

@@ -112,6 +112,9 @@ def step(G, P):
     # ---------------- transport
     out = f.sum(0)
     rem = H - out                                    # what stays in the cell
+    # float leftovers of a fully drained lava cell (~1e-7) count as empty: the DLL (approximate
+    # reciprocals, other summation order) ends at exactly 0 there and keeps no lava below 1/256
+    rem = np.where(lava & (np.abs(rem) < f32(1e-6)), f32(0), rem).astype(f32)
     fin = Fq.astype(f32) / f32(256)                  # what receivers get (rounded)
     def gather(a):                                   # sum over the 4 neighbours of a[opposite dir]
         return sum(shift(a[OPP[kk]], *NB[kk]) for kk in NB)
@@ -120,20 +123,42 @@ def step(G, P):
     heat_in = gather(np.where(lava, fin * Tm, 0))
     sq = np.rint(fin * np.where(lava, 0, ratio) * f32(4096))   # sediment, 1/4096 units
     sed_in = gather(sq).astype(f32) / f32(4096)
-    lava_vol = np.where(lava, rem, 0) + lava_in
-    water_vol = np.where(lava, 0, rem) + water_in
-    becomes_lava = lava_vol > 0
-    # lava + water: the water boils away but dilutes the lava's temperature
-    Tn = np.where(becomes_lava, (np.where(lava, rem * Tm, 0) + heat_in) /
-                  np.where(becomes_lava, lava_vol + water_vol, 1), 0)
-    # diluted down to the solidify point or below: the lava hardens into ground at once and the cell
-    # stays water (own + incoming water). Found live against the DLL (2026-11-13, Map 4 lava front).
-    freeze = becomes_lava & (Tn <= f32(P['WaterTemperatureMax']))
-    T = np.where(freeze, T + lava_vol, T).astype(f32)
-    becomes_lava &= ~freeze
-    Sn = np.where(lava, 0, Sd - out * ratio) + sed_in
-    Wn = np.where(becomes_lava, -lava_vol, water_vol)
-    C3 = np.where(becomes_lava, Tn, Sn)
+    Sn = (np.where(lava, 0, Sd - out * ratio) + sed_in).astype(f32)
+    # Mixing, row by row as the DLL does it (found 2026-11-13 against the DLL on flowing lava; this is
+    # also the old "drained lava" quirk). The inflow from the row below (y - 1, through that cell's Up
+    # outflow) is classified by that cell's NEW state from this step: if it ended as lava, the inflow is
+    # lava at its new temperature; otherwise (drained, water) it counts as water. The other three
+    # neighbours count by their old state, lava at its cooled temperature. Lava + water: the water boils
+    # away but dilutes the temperature; diluted to WaterTemperatureMax or below, the lava hardens at once
+    # (ground += lava volume) and the cell stays water.
+    noD = [kk for kk in NB if kk != D]
+    lv0 = (np.where(lava, rem, 0) + sum(shift(np.where(lava, fin, 0)[OPP[kk]], *NB[kk]) for kk in noD)).astype(f32)
+    wv0 = (np.where(lava, 0, rem) + sum(shift(np.where(lava, 0, fin)[OPP[kk]], *NB[kk]) for kk in noD)).astype(f32)
+    num0 = (np.where(lava, rem * Tm, 0) + sum(shift(np.where(lava, fin * Tm, 0)[OPP[kk]], *NB[kk]) for kk in noD)).astype(f32)
+    fD = shift(fin[U], *NB[D])                                 # inflow from row y - 1 (any fluid)
+    Tmax = f32(P['WaterTemperatureMax'])
+    C3 = np.empty_like(Sn); Wn = np.empty_like(Sn)
+    lava_vol = np.empty_like(Sn); water_vol = np.empty_like(Sn)
+    below_lava = np.zeros(Sn.shape[1], bool); below_C3 = np.zeros(Sn.shape[1], f32)
+    rows = range(Sn.shape[0]) if (lv0 > 0).any() else ()      # no lava anywhere: vectorised below
+    if not rows:
+        lava_vol, water_vol = lv0, wv0 + fD
+        C3, Wn = Sn.copy(), water_vol.astype(f32)
+    for y in rows:
+        f = fD[y]
+        lv = lv0[y] + np.where(below_lava, f, 0)
+        wv = wv0[y] + np.where(below_lava, 0, f)
+        bl = lv > 0
+        tn = np.where(bl, (num0[y] + np.where(below_lava, f * below_C3, 0)) / np.where(bl, lv + wv, 1), 0).astype(f32)
+        fr = bl & (tn <= Tmax)
+        if fr.any():
+            T[y] = np.where(fr, T[y] + lv, T[y])
+            bl = bl & ~fr
+        C3[y] = np.where(bl, tn, Sn[y])
+        Wn[y] = np.where(bl, -lv, wv)
+        lava_vol[y], water_vol[y] = lv, wv
+        below_lava, below_C3 = bl, C3[y]
+    T = T.astype(f32)
     out_d = {'T': T, 'soft': So, 'W': Wn.astype(f32), 'sed': C3.astype(f32), 'F': Fq}
     if DEBUG:
         out_d['_dbg'] = dict(lava_vol=lava_vol, water_vol=water_vol, rem=rem, lava_in=lava_in, water_in=water_in, heat_in=heat_in, Tm=Tm, lava=lava)
@@ -197,50 +222,108 @@ def bury_activity(G, s):
     return 1.0 - min(max(ground - s['z'], 0.0), T) / T if T > 0 else 1.0
 
 
-def apply_sources(G, sources):
-    """Add what springs, lava vents and drains put in after a step. sources: dicts with col, row,
-    radius, rate (per cell per tick; negative = drain), sediment (fraction), temperature (internal
-    units; > 0 = lava vent) and optional activity (bury factor, default 1).
-    Measured in the game: a spring adds `rate` water and `rate x sediment` sediment per cell; a vent
-    adds `rate` lava and sets the cell temperature. Not measured (approximations): a vent on a water
-    cell (here the water boils off), a spring on a lava cell (here it cools the lava like mixing in water
-    at 0 degrees). Drains lower their own kind of fluid by up to |rate| (measured for lava drains: they
-    leave water alone and do not set the temperature; water drains leaving lava alone is assumed)."""
-    W, Sd = G['W'], G['sed']
+WATER_ENERGY = 8.0          # ParamF[46] WaterEnergy as the running game has it (galileo.fluid_params gives 0)
+WATER_TEMPERATURE_MAX = 12.5
+
+
+def fluid_modifier(G, ys, xs, rate, sediment=0.0, temperature=0.0, P=None):
+    """kModifier_Fluid on the cells ys, xs, as GalileoSimulatorWater.dll does it (AddWater / RemoveWater
+    / AddLava / RemoveLava, chosen by the sign of `rate` and temperature > 0; checked with
+    galileo.modify on random grids). E = WaterEnergy (8), Tmax = WaterTemperatureMax (12.5).
+      AddWater:    water cell: depth += rate, sediment = min(sediment + rate x fraction, old depth); dry cell: depth = rate (no
+                   sediment); lava cell (depth d, temperature T0): T = T0 - E x rate / d, and if that is
+                   <= Tmax the lava hardens (ground += d) and the cell becomes water of depth
+                   d + max(0, E x rate - T0 x d) (as the DLL does: no division by E), sediment 0.
+      RemoveWater: water cells: depth = max(depth - |rate|, 0); sediment unchanged; lava untouched.
+      AddLava:     lava / dry cell: lava += rate, temperature = T; water cell (depth w): h = w x E / T
+                   hardens from the new lava: if h <= rate: ground += h, lava = rate - h at T;
+                   else ground += rate and the water loses rate x T / E (sediment kept); outflows of
+                   every water cell hit become 0.
+      RemoveLava:  lava cells: lava = max(lava - |rate|, 0); emptied cells become dry (temperature 0)."""
+    f32 = np.float32
+    E = f32(P['WaterEnergy'] if P is not None and P.get('WaterEnergy') else WATER_ENERGY)
+    Tmax = f32(P['WaterTemperatureMax'] if P is not None and P.get('WaterTemperatureMax') else WATER_TEMPERATURE_MAX)
+    W, Sd, T, F = G['W'], G['sed'], G['T'], G['F']
+    w = W[ys, xs].astype(f32)
+    s0 = Sd[ys, xs].astype(f32)
+    rate, sediment, temperature = f32(rate), f32(sediment), f32(temperature)
+    if temperature <= 0:
+        if rate > 0:                                                    # AddWater
+            lava = w < 0
+            d = -w
+            cooled = s0 - E * rate / np.where(lava, d, f32(1))
+            harden = lava & (cooled <= Tmax)
+            newW = np.where(w > 0, w + rate, np.where(w == 0, rate,
+                   np.where(harden, d + np.maximum(f32(0), E * rate - s0 * d), w)))
+            newS = np.where(w > 0, np.minimum(s0 + rate * sediment, w), np.where(w == 0, s0, np.where(harden, f32(0), cooled)))
+            T[ys, xs] = np.where(harden, T[ys, xs] + d, T[ys, xs])
+            W[ys, xs], Sd[ys, xs] = newW.astype(f32), newS.astype(f32)
+        else:                                                           # RemoveWater
+            W[ys, xs] = np.where(w > 0, np.maximum(w + rate, f32(0)), w).astype(f32)
+    else:
+        if rate > 0:                                                    # AddLava
+            water = w > 0
+            h = w * E / temperature
+            some = water & (h <= rate)
+            alls = water & (h > rate)
+            T[ys, xs] = np.where(some, T[ys, xs] + h, np.where(alls, T[ys, xs] + rate, T[ys, xs]))
+            newW = np.where(alls, w - rate * temperature / E, np.where(some, -(rate - h), -(np.maximum(-w, f32(0)) + rate)))
+            newS = np.where(alls, s0, temperature)
+            W[ys, xs], Sd[ys, xs] = newW.astype(f32), newS.astype(f32)
+            if water.any():
+                F[:, ys[water], xs[water]] = 0
+        else:                                                           # RemoveLava
+            lava = w < 0
+            left = np.maximum(-w + rate, f32(0))
+            empty = lava & (left == 0)
+            W[ys, xs] = np.where(empty, f32(0), np.where(lava, -left, w)).astype(f32)
+            Sd[ys, xs] = np.where(empty, f32(0), s0).astype(f32)
+
+
+def ground_modifier(G, ys, xs, amount, soft=False):
+    """kModifier_HardGround / kModifier_SoftGround on the cells ys, xs (as the DLL; checked with
+    galileo.modify): HardGround moves the ground surface by `amount` but the hard part (ground - soft)
+    cannot go below 0; SoftGround adds `amount` to the soft layer and the surface, removing at most the
+    soft layer there. Water, sediment / temperature and outflows are untouched."""
+    f32 = np.float32
+    T, So = G['T'], G['soft']
+    a = f32(amount)
+    if soft:
+        s0 = So[ys, xs]
+        d = np.maximum(a, -s0)
+        So[ys, xs] = (s0 + d).astype(f32)
+        T[ys, xs] = (T[ys, xs] + d).astype(f32)
+    else:
+        T[ys, xs] = np.maximum(T[ys, xs] + a, So[ys, xs]).astype(f32)
+
+
+def apply_sources(G, sources, P=None):
+    """Apply springs, lava vents and drains (dicts with col, row, radius, rate per cell per tick,
+    sediment fraction, temperature; optional height data for the bury rule) with the game's
+    modifier rules (fluid_modifier) on each source's disc (dx^2 + dy^2 <= r^2)."""
     for s in sources:
         act = bury_activity(G, s)
         s['activity'] = act
-        rate = np.float32(s['rate'] * act)
+        rate = s['rate'] * act
         if rate == 0:
             continue
         ys, xs = s.get('_cells') or disc(s['col'], s['row'], s['radius'])
-        w = W[ys, xs]
-        if rate < 0:                                            # drain: only its own kind of fluid
-            mine = (w < 0) if s['temperature'] > 0 else (w > 0)
-            depth = np.abs(w)
-            new = np.where(mine, np.maximum(depth + rate, 0), depth)
-            keep = np.where(depth > 0, new / np.maximum(depth, 1e-12), 0)
-            W[ys, xs] = np.sign(w) * new
-            Sd[ys, xs] = np.where(w > 0, Sd[ys, xs] * keep, Sd[ys, xs])
-        elif s['temperature'] > 0:                              # lava vent
-            lava = np.maximum(-w, 0)
-            W[ys, xs] = -(lava + rate)
-            Sd[ys, xs] = np.float32(s['temperature'])
-        else:                                                   # spring
-            lava = w < 0
-            Sd[ys, xs] = np.where(lava, Sd[ys, xs] * -w / (-w + rate), Sd[ys, xs] + rate * np.float32(s.get('sediment', 0)))
-            W[ys, xs] = np.where(lava, w, w + rate)
+        fluid_modifier(G, ys, xs, rate, s.get('sediment', 0.0), s.get('temperature', 0.0), P)
 
 
-def apply_modifiers(G, entries):
+def apply_modifiers(G, entries, P=None):
     """Apply the game's per-tick modifier list in its order: type 0 = fluid source (dict with 'amount'
-    or 'rate'), type 1 = RepulseFluid (col, row, radius, amount, f5 = mode). Other types are skipped."""
+    or 'rate'), type 1 = RepulseFluid (col, row, radius, amount, f5 = mode), 2 / 3 = HardGround /
+    SoftGround (col, row, radius, amount). Other types are skipped."""
     for e in entries:
         t = e.get('type', 0)
         if t == 0:
-            apply_sources(G, [dict(e, rate=e.get('amount', e.get('rate', 0)))] if 'amount' in e else [e])
+            apply_sources(G, [dict(e, rate=e.get('amount', e.get('rate', 0)))] if 'amount' in e else [e], P)
         elif t == 1:
             repulse_fluid(G, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
+        elif t in (2, 3):                                   # HardGround, SoftGround
+            ys, xs = disc(e['col'], e['row'], e['radius'])
+            ground_modifier(G, ys, xs, e['amount'], soft=(t == 3))
 
 
 def tick(G, P, sources=(), repulsors=()):
@@ -258,7 +341,7 @@ def tick(G, P, sources=(), repulsors=()):
     F = G['F'].copy()
     F[:, inner[0], inner[1]] = out['F'][:, inner[0], inner[1]]
     out['F'] = F
-    apply_sources(out, sources)
+    apply_sources(out, sources, P)
     for e in repulsors:
         repulse_fluid(out, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
     return out
