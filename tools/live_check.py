@@ -29,8 +29,11 @@ def capture_pair(p, base):
     only read once the following step is running: that step reads it and writes the other buffer."""
     rd = lambda off, n: p.read(base + off, n)
     frame = lambda: struct.unpack('<I', rd(0x92C, 4))[0]
-    def wait_change(f):
+    def wait_change(f, timeout=3.0):
+        t0 = time.time()
         while frame() == f:
+            if time.time() - t0 > timeout:
+                raise SystemExit('simulation frame counter not moving (game paused?)')
             time.sleep(0.0005)
         return frame()
     n = wait_change(frame())                 # step n just started: buf[(n-1)&1] is complete

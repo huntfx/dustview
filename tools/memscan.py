@@ -82,6 +82,27 @@ def main():
     if sys.argv[1] == 'find':
         for a in p.find(bytes.fromhex(sys.argv[2])):
             print(hex(a))
+    elif sys.argv[1] == 'watch':
+        # log every change of the live simulator parameters for N seconds (default 180)
+        import time
+        import numpy as np
+        sys.path.insert(0, __import__('os').path.dirname(__file__))
+        from galileo import PARAM_NAMES
+        base = next(a - 0x920 for a in p.find(struct.pack('<3I', 9, 9, 2))
+                    if p.read(a - 0x900, 4) and abs(struct.unpack('<f', p.read(a - 0x920 + 0x28, 4))[0] - 0.4) < 1e-6)
+        rd = lambda: (struct.unpack('<I', p.read(base + 0x92C, 4))[0],
+                      np.frombuffer(p.read(base + 0x20, 224), np.float32).copy())
+        secs = float(sys.argv[2]) if len(sys.argv) > 2 else 180
+        f0, prev = rd()
+        t0 = time.time()
+        print('watching simulator at %s from frame %d for %.0f s' % (hex(base), f0, secs), flush=True)
+        while time.time() - t0 < secs:
+            f, cur = rd()
+            for i in np.nonzero(cur != prev)[0]:
+                print('t=%6.1fs frame %6d  %2d %-40s %g -> %g' % (time.time() - t0, f, i, PARAM_NAMES[i], prev[i], cur[i]), flush=True)
+            prev = cur
+            time.sleep(0.1)
+        print('done at frame %d' % rd()[0], flush=True)
     elif sys.argv[1] == 'params':
         sys.path.insert(0, __import__('os').path.dirname(__file__))
         from galileo import PARAM_NAMES

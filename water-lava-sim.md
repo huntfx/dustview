@@ -14,7 +14,8 @@ One tick = one call of the simulation step (30 per second at the default frame c
 - **Lava cooling:** while at or above 12.5°, temperature drops `0.0375 + 1.0 × max(0, 1 − depth)` per tick. Deep lava loses 0.0375 per tick (from 255° that's ~6,500 ticks ≈ 3.6 min); lava half a unit deep loses 0.54 per tick. At or below 12.5° it turns into rock of its own depth.
 - **Lava meets water:** water flowing into lava boils away and cools the lava as if mixed in at 0°. Lava flowing into water boils that water off too but is diluted by it (`temperature = lava heat / (lava + water)`), so a little lava entering a lake hardens almost at once.
 - **Border:** the outer 32 cells never change; the ring just inside is reset to the map's border values every tick (sea level, or a drain).
-- **Outside the step** (seen in the running game, not part of this DLL code): water sources/springs are topped up each tick, and the player's powers edit the grid.
+- **Outside the step** (seen in the running game, not part of this DLL code): waterfall sources are topped up each tick, a sea edge is driven up and down in a ~12 s wave/tide cycle, and the player's powers edit the grid. **Jellify** doesn't stop the simulation: it swaps the water parameters map-wide for 60 s (the power's timer) (fluidity 0.032 → 0.0032, damping 0.999 → 0.99, flow capped at 0.005 per side per tick), so water almost stops but still creeps.
+- **Rendering** is separate from all this: the simulation only knows the 512 × 512 heights. The smooth look comes from the display jobs in the same DLL (`SetupDisplayListTemplate` builds the terrain/water meshes with LOD, `UpdateTextureTemplate` uses bilinear fetches, normals use `NormalScaleGround/Water` = 2). Judged from function and parameter names; that code was not read.
 
 ## Where things live
 | What | Where |
@@ -162,7 +163,9 @@ Other indices: 31 border water surface (set per map and from scripts, setter cal
 | Lava fluidity 0 / 1 | 0.01 / 0.02 | 0.001 / 0.002 |
 | Lava flux damping thresholds (stored) | 100 / 1000 | 0 / 0 |
 
-The flux mask is a plain cap (oracle test: mask 1 limits a 40-deep column to 1.0 per side; 0.1 → 0.1; 0.005 → 1/256 per side). Slow water is almost a gel. The game has a **Jellify power that freezes the water** (observed in play), which fits this set; that Jellify actually switches to it is not yet confirmed.
+The flux mask is a plain cap (oracle test: mask 1 limits a 40-deep column to 1.0 per side; 0.1 → 0.1; 0.005 → 1/256 per side). Slow water is almost a gel.
+
+**The Jellify power uses exactly this set, for the whole map** (read from the running game while Jellify was active): `WaterFluxDamping` 0.99, `WaterFluidity` 0.0032, `WaterFluidityMin` 0.003, `WaterFluxMask` 0.005; all other parameters unchanged, lava included. The simulation keeps running (31 ticks/s), so water can still creep at most 0.005 per side per tick (~0.15 per second), and erosion, deposit and sand slumping carry on. The values switched back to normal at frame 2085 of the level, after being in force at frame 711, matching the power's in-game timer of **60 s**: a second, fully logged cast (`tools/memscan.py watch`) switched at tick 351 and back at tick 2211, exactly 1,860 ticks = 60.0 s. On a map with flowing lava, **no lava parameter changed** during Jellify (the power is called "Jellify Water", and the lava visibly kept flowing). When the slow *lava* set is used was not seen.
 
 ### How the parameters are combined (`ConstParam`)
 Read from the constructor; `P[k]` = parameter k. `ramp` = linear, clamped to its two end values.
@@ -197,7 +200,12 @@ Read from the constructor; `P[k]` = parameter k. `ramp` = linear, clamped to its
 - Simulator object (`ISimulatorWater`) found via its parameter array; in the session checked it was at `0x4F933A0` (heap, so it moves between runs). Live fields: width/height bits 9/9, **border skip 2**, frame counter `+0x92C`, cursor position `+0x940`, grid buffers `+0x950`. The frame counter stops while the game is paused.
 - **Live parameter array confirms the ×1/8 temperature scaling** (12.5, 125, 0.0375), flux masks 10000 (element [0]), index 35 = 1.0, border water 39 (that map's sea level), plus display/path values: 20/21 normal scale 2, 22 display scale 1.5, 41/42 path max slope/water 100, 46 `WaterEnergy` 8, 50 minimum visible water 0.5, 52–55 outline thresholds 0.1 / 10 / 2 / 2.8.
 - **Capture timing:** the frame counter increments when a step *starts*, and the step runs on worker threads. A buffer is only complete once the following step has started, so read state *n* when the counter shows *n+1*. Reading earlier gave half-written grids.
-- Result (3 state pairs on a level with ~197k water and ~1.3k lava cells): the DLL harness reproduces the game's terrain, soft ground and **all outflows exactly**; the Python model matches with 1–2 flux rounding ties. About 600 cells per tick differ in fluid height, all in fixed spots: small discs (5×5 to 11×11) that the game keeps topped up (water sources: the game's level there is unchanged tick to tick while the bare step lowers it), and the column x = 476 along the right edge (not investigated; see TODO).
+- Result (3 state pairs on a level with ~197k water and ~1.3k lava cells): the DLL harness reproduces the game's terrain, soft ground and **all outflows exactly**; the Python model matches with 1–2 flux rounding ties. About 600 cells per tick differ in fluid height, all in fixed spots: small discs (5×5 to 11×11) that the game keeps topped up (water sources: the game's level there is unchanged tick to tick while the bare step lowers it), and the column x = 476 along the right edge (see below).
+- Speed of the running game: 31 simulation ticks per second (124 per 4 s), i.e. the 30 fps cap.
+
+### Things the game does outside the step (live, one level with border sea level 39)
+- **Waterfall sources:** small discs near one edge (5×5 to 11×11 cells, e.g. rows 37–47 / cols 234–244) where the game adds a fixed amount per cell each tick (0.14, 0.23, 0.53, 0.66 per cell in the four found), keeping their level steady. Five waterfalls on that edge were seen in play; four were caught by the comparison.
+- **Sea edge / tides:** along the right edge (x ≈ 470–479) the game rewrites column 476 every tick (the bare step would drain it from ~47 to ~4), and the ring column 479 holds 73–86 instead of the border value 39. The sea level near that edge oscillates by about ±0.9 with a period of ~373 ticks (≈ 12 s): the column-470 mean was 46.356 / 46.368 / 46.368 at frames 4010 / 4383 / 4756. Parameter 31 (border water level) stayed at 39.0 the whole time, so the tide is not done through the border parameter. Which code writes these columns, and its formula, is not established.
 - Speed: the DLL step takes ~4.3 ms (single thread, 200 steps in 0.86 s); the Python model ~75 ms.
 
 ## Quirks
@@ -220,9 +228,11 @@ The worker DLL has **no imports** and exports a job table: `sCodeAddrJob(0)` = `
 ## TODO (skipped, worth revisiting)
 - [x] ~~`WaterHeightTemperatureDampingFactor` (index 35) at runtime~~: **1.0**, read from the running game (the earlier guess of 0.125 was wrong).
 - [ ] Which code writes the simulator's index 35, and what the value stored at `[0x10184F38]+0xAC` (`LavaHeightTemperatureDampingFactor ÷ [+0xA8]`) is used for.
-- [ ] Live comparison: the right-edge column x = 476 differed from the DLL step by up to ±53 in the one session checked (not investigated; the game was paused before it could be looked at). Water sources: which object/modifier refills them and by how much.
-- [ ] Confirm Jellify uses the slow-water set: run `tools/memscan.py params` while Jellify is active and see whether the parameter array switches (or which values change).
-- [ ] When the game uses `m_fluidParameters[1]` (flux caps 1000) and the slow water/lava sets, i.e. what drives the material index in the copy routine `0x100FBA20`.
+- [ ] Sea-edge driver: which code writes columns 476/479 each tick and with what formula (~12 s period, ±0.9 near the edge). Probably an AI/level script or modifier in dustai; Map 8 is called "HighTides", worth checking there too.
+- [ ] Waterfall sources: which object/modifier adds the fixed amounts, and whether they also set sediment/temperature (lava sources).
+- [x] ~~Confirm Jellify uses the slow-water set~~: yes, map-wide, for 60 s (in-game timer; matches the measured window).
+- [ ] When the slow *lava* set (`m_slowLavaParameters`) is used: not by Jellify Water (checked on a lava map). Possibly another power, a level script, or unused.
+- [ ] When the game uses `m_fluidParameters[1]` (flux caps 1000), i.e. what drives the element index in the copy routine `0x100FBA20`.
 - [ ] Drained-lava edge case (Quirks): trigger not isolated; probably the float sign of a zero remainder. Affects a few front cells per 10 steps.
 - [ ] Vegetation `ErosionBlocking` (component 6 low nibble → `ParamU8` 16–31) not tested; `ParamU8` values the game passes not read.
 - [ ] Not exercised: `SedimentTransportThreshold/Factor` at non-default values, `WaterFluxScale`/`LavaFluxScale` ≠ 1, `LateralErosionWaterHeightThreshold`, and components 6/7 (vegetation, fire), which another job (`SimulatorGanjaIterator`) updates.
