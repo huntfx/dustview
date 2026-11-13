@@ -208,6 +208,20 @@ Read from the constructor; `P[k]` = parameter k. `ramp` = linear, clamped to its
 - **Sea edge / tides:** along the right edge (x ≈ 470–479) the game rewrites column 476 every tick (the bare step would drain it from ~47 to ~4), and the ring column 479 holds 73–86 instead of the border value 39. The sea level near that edge oscillates by about ±0.9 with a period of ~373 ticks (≈ 12 s): the column-470 mean was 46.356 / 46.368 / 46.368 at frames 4010 / 4383 / 4756. Parameter 31 (border water level) stayed at 39.0 the whole time, so the tide is not done through the border parameter. Which code writes these columns, and its formula, is not established.
 - Speed: the DLL step takes ~4.3 ms (single thread, 200 steps in 0.86 s); the Python model ~75 ms.
 
+### Sources, vents and waves (second level, 4 minutes of logging)
+Logged with [../tools/live_sources.py](../tools/live_sources.py) (every ~3 s: game's next state minus the game's own step on the previous state; log `data/live/sources_20261113_140605.log`). Level with ~236k water and ~1.6k lava cells, border sea level 29.99.
+- **Water source:** a 21-cell round patch (5 × 5 without corners) centred at (191, 365), adding exactly **+0.4 per cell per tick**, constant for the whole 4 minutes.
+- **Lava vents (the volcano):** three 3 × 3 patches close together, centred at (199, 213), (202, 223), (211, 215). Each adds exactly **+0.1 lava per cell per tick** and **sets** the cell temperature to a fixed value: **150.0** for one vent, **112.5** for the other two (1200 and 900 in editor/stored units). Constant for all 4 minutes: no phase change was seen, so the volcano's phases are slower than that or event-driven.
+- **Sea-edge wave:** the right-edge column (x = 476, 440 cells) was driven only between ~123 s and ~162 s (per-cell additions rising from +24 to +99, falling back, ending at −43), then left alone. So on this level the edge drive is an intermittent ~40 s wave event, not the continuous ~12 s cycle seen on the first level.
+- **Moving terrain dips:** 2–11 small spots (up to 5 cells, plus-shaped), each lowering terrain by 0.02 per cell per tick and moving between samples. Cause unknown (creatures or villagers walking is a guess).
+- About 1 sample in 15 was a mistimed read (half-written buffer, 150k "differences"); those were skipped.
+
+### Where per-map sources are defined (static, partial)
+- Class definitions (templates) are in the shared archive `Wor_BD00993D.lin.bf`: `FluidGenerator.obj`, `FluidGeneratorGeiser.obj`, `SpecieFluidGenerator.obj`, `Volcano.obj`, `SpecieVolcano.obj`, `VolcanoBomb.obj`, `SpecieVolcanoBomb.obj`; `LavaGeneratorFumarole.obj` / `VolcanoFumarole.obj` are in `Wor_BD00AFCD.lin.bf`. Their reflection records use the same name hash as the simulation parameters.
+- dustai names point to the controls: volcano script functions `VolcanoChangeQuantity`, `VolcanoChangeTemperature`, `VolcanoChangePhase`, `VolcanoChangePhaseDuration`, `VolcanoChangeCraterRadius`, `VolcanoChangeCraterDepth`; fields `VolcanoPhase`, `VolcanoPhaseDuration`, `Volcano_ashes_brush_radius/strength`, `Volcano_crater_radius_factor`; power sources `m_massivePowerWaterSource`, `m_massivePowerLavaSource`, `m_massivePowerWaterSourceSediment`.
+- Per-map **instances** are most likely in the tail of each map's `.sav` (after the grids, ~1,600 records framed by big-endian `12 34 56 78` / `87 65 43 21` markers, nested). These are *not* name-hash records; records seen contain three big-endian floats that look like positions (e.g. 124.95, −17.85, 47.77) followed by what look like rotations. Entity type IDs not decoded yet.
+- The grid edit itself most likely goes through the manager's modifiers (`SimulatorModifierTemplate::AddLava`, `RemoveLava`, `RepulseFluid` in `GalileoSimulatorWater.dll`; modifier enum `AddWater`, `RemoveWater`, `AddLava`, `RemoveLava`, `HardGround`, `SoftGround`, `RepulseFluid`, `Fluid`). Inferred from names; not traced.
+
 ## Quirks
 - **Volume drift:** water, sediment and lava are subtracted unrounded and added rounded (outflows to 1/256, sediment to 1/4096).
 - **16-column temperature wrap:** lava crossing between column 16k−1 and 16k gets its temperature reduced modulo 256. If the wrapped value is ≤ the solidify threshold, it even arrives as water. The DLL hands block-edge values over as `temperature × 256` in 16 bits (driver `Run12345_Middle`). Real temperatures never exceed 255, so this never shows in play. It's only relevant when feeding the DLL custom values.
@@ -228,8 +242,9 @@ The worker DLL has **no imports** and exports a job table: `sCodeAddrJob(0)` = `
 ## TODO (skipped, worth revisiting)
 - [x] ~~`WaterHeightTemperatureDampingFactor` (index 35) at runtime~~: **1.0**, read from the running game (the earlier guess of 0.125 was wrong).
 - [ ] Which code writes the simulator's index 35, and what the value stored at `[0x10184F38]+0xAC` (`LavaHeightTemperatureDampingFactor ÷ [+0xA8]`) is used for.
-- [ ] Sea-edge driver: which code writes columns 476/479 each tick and with what formula (~12 s period, ±0.9 near the edge). Probably an AI/level script or modifier in dustai; Map 8 is called "HighTides", worth checking there too.
-- [ ] Waterfall sources: which object/modifier adds the fixed amounts, and whether they also set sediment/temperature (lava sources).
+- [ ] **Per-map sources for the Python model:** decode the `.sav` tail entity records (type IDs, positions → grid cells, per-instance amount/radius/temperature) so each map's springs, vents, volcano phases and wave events can be reproduced. Cross-check against `tools/live_sources.py` logs (known so far: spring 21 cells +0.4/tick; vents 3 × 3, +0.1/tick, temperature set to 150 / 112.5).
+- [ ] Volcano phases: not seen in 4 minutes; log longer or find the phase durations in the data.
+- [ ] Sea-edge driver: which code writes columns 476/479 and its formula (continuous ~12 s cycle, ±0.9, on one level; ~40 s wave event on another). Probably a level script or modifier in dustai; Map 8 "HighTides" worth checking. Also the moving 0.02/tick terrain dips.
 - [x] ~~Confirm Jellify uses the slow-water set~~: yes, map-wide, for 60 s (in-game timer; matches the measured window).
 - [ ] When the slow *lava* set (`m_slowLavaParameters`) is used: not by Jellify Water (checked on a lava map). Possibly another power, a level script, or unused.
 - [ ] When the game uses `m_fluidParameters[1]` (flux caps 1000), i.e. what drives the element index in the copy routine `0x100FBA20`.
