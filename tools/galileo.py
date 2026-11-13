@@ -98,9 +98,8 @@ def stored_fluid_params(element=0):
 
 
 # Indices the game multiplies by 0.125 on the way in (dustai.win32.f.dll 0x100FBA20, setter 0x10049A40).
-# 35 is not written by that routine; it is LavaHeightTemperatureDampingFactor / [obj+0xA8]
-# (0x100FBFE5), assumed to be 8 like the others (inferred, see findings/water-lava-sim.md).
-TEMPERATURE_SCALED = (12, 14, 17, 24, 25, 35, 43, 47)
+# Checked against the running game's parameter array (tools/memscan.py params); index 35 is 1.0 there.
+TEMPERATURE_SCALED = (12, 14, 17, 24, 25, 43, 47)
 
 
 def fluid_params(element=0, border=(0.0, 0.0, 0.0), material='normal', raw=False):

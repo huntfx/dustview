@@ -2,14 +2,19 @@
 
 Status: **answered.** The complete per-step update is known and re-implemented in Python ([../tools/dustsim.py](../tools/dustsim.py)). It was checked against the game's own simulation DLL, run outside the game on the same inputs: water, sand, sediment and lava match to float rounding (fluxes identical in all but a handful of cells per step). Open edge cases are listed under TODO.
 
-## In short
-- The world is a 512 × 512 grid. Each cell holds: terrain height, how much of that is soft ground (sand), a **fluid height**, one extra value, and four outflows (left/right/up/down).
-- **Water and lava are the same fluid.** A negative fluid height means lava. The extra value is the amount of suspended sand for water and the temperature for lava.
-- **Flow** is the classic "virtual pipes" model. Each step every cell pushes fluid towards lower neighbours: `new outflow = damping × old outflow + fluidity × height difference`, never more than the cell holds. Water: damping 0.999, fluidity 0.032. Lava: fluidity 0.01–0.02 depending on temperature, plus a yield threshold, so thin or cool lava doesn't move.
-- **Sand is carried inside the water column.** Fast shallow water picks sand up, slow water drops it. Muddy water flows worse.
-- **Steep sand slopes crumble into mud**, but only when dry or when the water on them is draining away. The mud then flows and settles, which is how sand "pours".
-- **Lava cools a fixed amount per step** (faster when thin) and turns into rock at 12.5°. Water running into lava boils away and cools it. Lava running into water also boils the water off and gets diluted by it, so a little lava entering a lake hardens almost at once.
-- There is **no time step**: all rates are per simulation tick. That's why unlocking the frame rate (one sim tick per frame) speeds up the water.
+## What the game does each tick
+One tick = one call of the simulation step (30 per second at the default frame cap). There is no time step: every rate below is "per tick".
+
+- **The grid:** 512 × 512 cells. Each cell holds terrain height, how much of that is soft ground (sand), a **fluid height**, one extra value, and four outflows (to the left, right, up and down neighbours).
+- **Water and lava are the same fluid.** A negative fluid height means lava. The extra value is the suspended sand for water and the temperature for lava.
+- **Flow (water):** each cell pushes fluid to its four direct neighbours: `new outflow = 0.999 × last tick's outflow + 0.032 × (my surface − neighbour's surface)`, never negative, and scaled down so a cell never sends more than it holds. There are no diagonal pipes. Water reaches a diagonal neighbour in two ticks via a side neighbour, so a puddle on flat ground spreads as a slightly diamond-shaped blob.
+- **Sand is carried inside the water column.** Flow speed = total outflow / √depth. Fast (> 0.4), shallow (≤ 4) water picks sand up, `0.002 × (speed − 0.4)`, at most 0.01 per tick. Slow water (< 0.6) drops `0.2 × (0.6 − speed)` of its sand per tick, i.e. 12% when still. Muddy water flows worse: from 50% sand upwards, damping drops towards 0.7 and fluidity towards 0.03.
+- **Steep sand slumps:** sand more than 1 unit higher than a neighbour turns `0.05 × (drop − 1)` per tick into mud (a column of pure sand) that then flows and settles. This happens only when the cell is dry or at least 10% of its water drains away that tick; under standing water, slopes hold.
+- **Lava flow:** same rule with fluidity 0.01 at ≤ 12.5° rising to 0.02 at ≥ 125°, damping 0.95 → 0.99 over the same range, and a **yield threshold**: if the total push is under 0.05, the lava doesn't move at all, so thin or cool lava stays put.
+- **Lava cooling:** while at or above 12.5°, temperature drops `0.0375 + 1.0 × max(0, 1 − depth)` per tick. Deep lava loses 0.0375 per tick (from 255° that's ~6,500 ticks ≈ 3.6 min); lava half a unit deep loses 0.54 per tick. At or below 12.5° it turns into rock of its own depth.
+- **Lava meets water:** water flowing into lava boils away and cools the lava as if mixed in at 0°. Lava flowing into water boils that water off too but is diluted by it (`temperature = lava heat / (lava + water)`), so a little lava entering a lake hardens almost at once.
+- **Border:** the outer 32 cells never change; the ring just inside is reset to the map's border values every tick (sea level, or a drain).
+- **Outside the step** (seen in the running game, not part of this DLL code): water sources/springs are topped up each tick, and the player's powers edit the grid.
 
 ## Where things live
 | What | Where |
@@ -45,7 +50,7 @@ Directions: Left = x−1, Right = x+1, **Up = y+1, Down = y−1** (found by matc
 3. Deposit `d = clamp(0.2·(0.6 − v)·sediment, 0, 0.5)`, using the sediment after step 2: terrain +d, soft +d, depth −d, sediment −d. (If sediment exceeds the fluid, the excess drops at once; not reachable in play.)
 
 **Step 1, lava cells:**
-4. Cooling, while temperature ≥ 12.5: `temperature −= 0.0375 + 0.125·max(0, 1 − depth)` (the 0.125 is inferred, see TODO).
+4. Cooling, while temperature ≥ 12.5: `temperature −= 0.0375 + 1.0·max(0, 1 − depth)` (values confirmed in the running game).
 5. Lava at ≤ 12.5° solidifies: terrain += depth, fluid = 0.
 
 **Step 2, flow:**
@@ -99,6 +104,8 @@ Lava tests used temperatures up to 255, the range seen in real saves (below).
 ### Temperature range in real data
 Lava temperatures in all shipped maps and the player's 13 saves are between ~12.5 and **255.0** (component 3 / `.sav` block 3; e.g. Map 9 median 200, Map 4 max 125, many maps max exactly 255). That fits the runtime parameters below: solidify at 12.5, full fluidity at 125, temperatures stored as 8.8 fixed point (max 255.99, `mv_255`).
 
+**The built-in editor's lava temperature is in the stored units, i.e. 8× the simulator's.** Observed in play: lava placed at 100 turned to rock almost instantly (100/8 = 12.5, the solidify point); lava placed at 700 (87.5 internally) stayed hot after flattening out. Deep lava at 87.5 needs ~2,000 ticks ≈ 67 s to reach 12.5. A live read during that session showed ~50 lava cells between 75 and 100°.
+
 ## Parameters
 `SimulatorParam` (`0x360` bytes) holds `mav_ParamF` at `+0x10`: 56 floats indexed by the PDB enum `kSimulatorParamF_*`. In the manager object (`ISimulatorWater`) the same array sits at `+0x20`. Other fields the step reads: `+0x340` log2 width (9), `+0x348` border skip, `+0x350` input grid, `+0x354` output grid (`PointerManager` constructor `0x100048C9`).
 
@@ -134,7 +141,7 @@ The copy routine (dustai `0x100FBA20`) names each Galileo index explicitly, whic
 | SoftGroundErosionWaterHeightMax | 4.0 | 30 | 4.0 |
 | LateralErosionFluxSumThreshold / Factor | 0.1 / 0.05 | 32 / 33 (`ErosionSumFluxSum…`) | same |
 | LavaHeightTemperatureDampingThreshold | 1.0 | 34 (`WaterHeight…`) | 1.0 |
-| LavaHeightTemperatureDampingFactor | 1.0 | 35 (`WaterHeight…`) | **0.125 (inferred)**: stored as value ÷ `[obj+0xA8]` (`0x100FBFE5`); the divisor is assumed to be 8 |
+| LavaHeightTemperatureDampingFactor | 1.0 | 35 (`WaterHeight…`) | **1.0** (read from the running game; the copy routine doesn't write index 35, it stores value ÷ `[obj+0xA8]` at `0x100FBFE5` for some other use) |
 | LateralErosionSlopeThreshold Left/Right/Up/Down | 1.0 | 36–39 | same |
 | LateralErosionWaterHeightThreshold | −1.0 | 40 | same (role not isolated) |
 | LavaFluxDampingThresholdMin / Max | 100 / 1000 | 43 / 47 | **12.5 / 125** |
@@ -155,7 +162,7 @@ Other indices: 31 border water surface (set per map and from scripts, setter cal
 | Lava fluidity 0 / 1 | 0.01 / 0.02 | 0.001 / 0.002 |
 | Lava flux damping thresholds (stored) | 100 / 1000 | 0 / 0 |
 
-The flux mask is a plain cap (oracle test: mask 1 limits a 40-deep column to 1.0 per side; 0.1 → 0.1; 0.005 → 1/256 per side). Slow water is almost a gel. This fits the game's "jellify" style powers, but that is a guess.
+The flux mask is a plain cap (oracle test: mask 1 limits a 40-deep column to 1.0 per side; 0.1 → 0.1; 0.005 → 1/256 per side). Slow water is almost a gel. The game has a **Jellify power that freezes the water** (observed in play), which fits this set; that Jellify actually switches to it is not yet confirmed.
 
 ### How the parameters are combined (`ConstParam`)
 Read from the constructor; `P[k]` = parameter k. `ramp` = linear, clamped to its two end values.
@@ -185,6 +192,14 @@ Read from the constructor; `P[k]` = parameter k. `ramp` = linear, clamped to its
 | `mv_255`, `mv_Rcp255` | 255, 1/255 | |
 | `mv_ErosionBlocking` | `ParamU8` bytes 16–31 | 16-entry lookup for vegetation |
 
+## Check against the running game
+[../tools/memscan.py](../tools/memscan.py) reads the game's memory (read-only). [../tools/live_check.py](../tools/live_check.py) captures two consecutive simulation states and compares them with the DLL harness and the Python model.
+- Simulator object (`ISimulatorWater`) found via its parameter array; in the session checked it was at `0x4F933A0` (heap, so it moves between runs). Live fields: width/height bits 9/9, **border skip 2**, frame counter `+0x92C`, cursor position `+0x940`, grid buffers `+0x950`. The frame counter stops while the game is paused.
+- **Live parameter array confirms the ×1/8 temperature scaling** (12.5, 125, 0.0375), flux masks 10000 (element [0]), index 35 = 1.0, border water 39 (that map's sea level), plus display/path values: 20/21 normal scale 2, 22 display scale 1.5, 41/42 path max slope/water 100, 46 `WaterEnergy` 8, 50 minimum visible water 0.5, 52–55 outline thresholds 0.1 / 10 / 2 / 2.8.
+- **Capture timing:** the frame counter increments when a step *starts*, and the step runs on worker threads. A buffer is only complete once the following step has started, so read state *n* when the counter shows *n+1*. Reading earlier gave half-written grids.
+- Result (3 state pairs on a level with ~197k water and ~1.3k lava cells): the DLL harness reproduces the game's terrain, soft ground and **all outflows exactly**; the Python model matches with 1–2 flux rounding ties. About 600 cells per tick differ in fluid height, all in fixed spots: small discs (5×5 to 11×11) that the game keeps topped up (water sources: the game's level there is unchanged tick to tick while the bare step lowers it), and the column x = 476 along the right edge (not investigated; see TODO).
+- Speed: the DLL step takes ~4.3 ms (single thread, 200 steps in 0.86 s); the Python model ~75 ms.
+
 ## Quirks
 - **Volume drift:** water, sediment and lava are subtracted unrounded and added rounded (outflows to 1/256, sediment to 1/4096).
 - **16-column temperature wrap:** lava crossing between column 16k−1 and 16k gets its temperature reduced modulo 256. If the wrapped value is ≤ the solidify threshold, it even arrives as water. The DLL hands block-edge values over as `temperature × 256` in 16 bits (driver `Run12345_Middle`). Real temperatures never exceed 255, so this never shows in play. It's only relevant when feeding the DLL custom values.
@@ -203,7 +218,10 @@ The worker DLL has **no imports** and exports a job table: `sCodeAddrJob(0)` = `
 - [python-water-sim.md](python-water-sim.md)'s textbook model is superseded by [../tools/dustsim.py](../tools/dustsim.py).
 
 ## TODO (skipped, worth revisiting)
-- [ ] `WaterHeightTemperatureDampingFactor` (index 35) at runtime: stored 1.0 ÷ `[obj+0xA8]` (dustai `0x100FBFE5`); assumed 8 like the other temperature values. Thin-lava cooling depends on it. Read `ISimulatorWater+0x20` in a running game to confirm (needs a launch), or find what writes `[0x10184F38]+0xA8`.
+- [x] ~~`WaterHeightTemperatureDampingFactor` (index 35) at runtime~~: **1.0**, read from the running game (the earlier guess of 0.125 was wrong).
+- [ ] Which code writes the simulator's index 35, and what the value stored at `[0x10184F38]+0xAC` (`LavaHeightTemperatureDampingFactor ÷ [+0xA8]`) is used for.
+- [ ] Live comparison: the right-edge column x = 476 differed from the DLL step by up to ±53 in the one session checked (not investigated; the game was paused before it could be looked at). Water sources: which object/modifier refills them and by how much.
+- [ ] Confirm Jellify uses the slow-water set: run `tools/memscan.py params` while Jellify is active and see whether the parameter array switches (or which values change).
 - [ ] When the game uses `m_fluidParameters[1]` (flux caps 1000) and the slow water/lava sets, i.e. what drives the material index in the copy routine `0x100FBA20`.
 - [ ] Drained-lava edge case (Quirks): trigger not isolated; probably the float sign of a zero remainder. Affects a few front cells per 10 steps.
 - [ ] Vegetation `ErosionBlocking` (component 6 low nibble → `ParamU8` 16–31) not tested; `ParamU8` values the game passes not read.
