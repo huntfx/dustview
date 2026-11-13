@@ -177,6 +177,26 @@ def disc(col, row, radius):
     return ys[ok], xs[ok]
 
 
+def bury_activity(G, s):
+    """The game's bury rule (dustai 0x10065DE0), for sources that carry their height ('z') and height
+    mode: mode 0 keeps a stored height that is lowered when the surface drops below it, and the source
+    fades out linearly as the ground over it rises 0..threshold (5) above that height; mode 2 rides on the
+    surface and is never buried. Without 'z' the given 'activity' (default 1) is used as is.
+    Checked live on Map 2 (ground 0.4 below / 6.4 above the stored height -> activity 1 / 0). Which
+    height lowers the stored height (here ground + fluid) is inferred, not traced."""
+    if 'z' not in s:
+        return s.get('activity', 1.0)
+    if s.get('height_mode', 2) != 0:
+        return 1.0
+    r, c = int(s['row']), int(s['col'])
+    ground = float(G['T'][r, c])
+    surface = ground + abs(float(G['W'][r, c]))
+    if 0 < surface < s['z']:
+        s['z'] = surface
+    T = s.get('bury_threshold', 5.0)
+    return 1.0 - min(max(ground - s['z'], 0.0), T) / T if T > 0 else 1.0
+
+
 def apply_sources(G, sources):
     """Add what springs, lava vents and drains put in after a step. sources: dicts with col, row,
     radius, rate (per cell per tick; negative = drain), sediment (fraction), temperature (internal
@@ -188,7 +208,9 @@ def apply_sources(G, sources):
     leave water alone and do not set the temperature; water drains leaving lava alone is assumed)."""
     W, Sd = G['W'], G['sed']
     for s in sources:
-        rate = np.float32(s['rate'] * s.get('activity', 1.0))
+        act = bury_activity(G, s)
+        s['activity'] = act
+        rate = np.float32(s['rate'] * act)
         if rate == 0:
             continue
         ys, xs = s.get('_cells') or disc(s['col'], s['row'], s['radius'])

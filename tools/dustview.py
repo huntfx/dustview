@@ -15,9 +15,17 @@ are on at the start (no level script, no game needed).
 
 Keys
   1 natural   2 height   3 water depth   4 lava temperature   5 sediment   6 flow speed
+  7 unexplained changes (live only): a background thread takes two consecutive game states, runs the
+    game's own step (DLL via the simstep helper; Python if that fails) plus the known sources on the
+    first and subtracts the result from the game's second state. What is left was done outside the
+    simulation (creatures, volcanoes, waves, powers, script changes, unknown sources). Cyan = fluid
+    gained, orange = fluid lost, yellow = ground raised, magenta = ground lowered; fades with a 1.5 s
+    half-life. A few cells are always left (rounding, the small-vent timing).
   M  switch to the Python model, starting from the state on screen (sources as last found)
   L  switch back to the live game       Space  pause / resume the model
-  O  overlays (sources) on/off          V  flip vertically     R  rotate 90 degrees
+  O  overlays on/off: cyan spring, orange lava vent, violet water drain, dark red lava drain, grey = buried
+     below 95% strength (labels show the amount applied per cell per tick, with % when reduced), white = other modifier (e.g. a village's water repulsion)
+  O  (toggle)          V  flip vertically     R  rotate 90 degrees
   D  terrain-change markers on/off (live only): terrain that changes in dry areas between frames,
      i.e. not caused by the simulation (moving dips, scripted terrain, powers). Magenta = lowered,
      yellow = raised; markers fade over 8 s; every spot is also logged to data/live/terrain_events_*.log
@@ -123,6 +131,7 @@ class LiveGame(Source):
             self.paused = False
             now = time.time()
             self.tick_times = [(t, s) for t, s in self.tick_times if now - s < 3] + [(m, now)]
+            self.refresh_sources()
             fr = Frame(m - 1, galileo.unpack(raw), params, self.sources, self.name)
             self._terrain_events(fr)
             return fr
@@ -159,6 +168,63 @@ class LiveGame(Source):
                 self._elog.write('%d %.1f %.1f %d %+.4f\n' % (fr.tick, r, c, n, tot))
             self._elog.flush()
 
+    def enable_explain(self):
+        """Start the background check for changes the simulation does not explain (view 7)."""
+        if getattr(self, '_explain_on', False):
+            return
+        self._explain_on = True
+        self.explained = None
+        self.explain_note = 'unexplained: starting'
+        threading.Thread(target=self._explain_loop, daemon=True).start()
+
+    def _explain_loop(self):
+        times = []
+        while True:
+            try:
+                cap = live_check.capture_pair(self.p, self.base)
+            except SystemExit:
+                self.explain_note = 'unexplained: game paused'
+                time.sleep(0.5)
+                continue
+            except Exception as e:
+                self.explain_note = 'unexplained: %s' % e
+                time.sleep(1)
+                continue
+            if not cap:
+                continue
+            n, A, B, prm = cap
+            applied = self.applied_sources()                # read right after the pair: same list as that tick
+            GA, GB = dustsim.from_grid(A), dustsim.from_grid(B)
+            if (np.abs(GA['W'] - GB['W']) > 1e-3).sum() > 100000:
+                continue                                    # mistimed read
+            Pa = np.frombuffer(prm[:224], np.float32).copy()
+            try:
+                X = dustsim.from_grid(galileo.run(A, Pa, steps=1, skip_border=2, param_i=np.frombuffer(prm[0xE0:0x100], np.int32),
+                                                  param_u8=prm[0x100:0x130], ganja=prm[0x130:0x330]))
+                how = 'DLL'
+            except Exception:
+                X = dustsim.tick(GA, {k: float(v) for k, v in zip(galileo.PARAM_NAMES, Pa)}, [])
+                how = 'python'
+            dustsim.apply_sources(X, applied)
+            # A torn read (a buffer copied while the game was writing it) shows as thousands of outflow
+            # mismatches; normally ~300 (the village repulsion etc.), so skip such pairs.
+            torn = int((GB['F'] != X['F']).any(0).sum())
+            if torn > 3000:
+                self.rejected = getattr(self, 'rejected', 0) + 1
+                continue
+            dT = GB['T'] - X['T']
+            dF = np.abs(GB['W']) - np.abs(X['W'])
+            for a in (dT, dF):
+                a[:33] = a[479:] = 0
+                a[:, :33] = a[:, 479:] = 0
+                a[np.abs(a) < 1e-3] = 0
+            now = time.time()
+            times = [t for t in times if now - t < 3] + [now]
+            cells = int(((dT != 0) | (dF != 0)).sum())
+            self.explained = dict(tick=n, dT=dT, dF=dF, time=now, cells=cells, how=how)
+            self.explain_note = 'unexplained: tick %d checked by %s, %d cells, %.1f checks/s, %d torn reads skipped' % (
+                n, how, cells, len(times) / max(times[-1] - times[0], 1e-6) if len(times) > 1 else 0, getattr(self, 'rejected', 0))
+
     def ticks_per_second(self):
         if len(self.tick_times) < 2:
             return 0.0
@@ -166,46 +232,68 @@ class LiveGame(Source):
         return (t1 - t0) / max(s1 - s0, 1e-6)
 
     def _source_loop(self):
-        """Every ~15 s: find the generator objects, then their records in the simulation's source table
-        (36-byte records: col, row, radius, ?, rate, ?, sediment, temperature, ?), matched by radius + rate."""
+        """Every ~10 s: find (once) the simulator's per-tick modifier list and cache the generator objects'
+        addresses. The list itself is read every frame (refresh_sources), so script switches, burying,
+        fade-in and Jellify show up at once."""
         delta = None
         while True:
             try:
                 delta = live_generators.dustai_delta(self.p) if delta is None else delta
-                gens = [g for g in live_generators.generators(self.p, delta) if g['mode'] != 0]
-                pats = {struct.pack('<3f', g['radius'], 0.0, g['rate']): g for g in gens}
-                found = {}          # address -> record; the table array is pooled, so stale copies of
-                                    # earlier levels' records can match too: filtered below
-                for base, size in self.p.regions():
-                    if size > 64 << 20:
-                        continue
-                    data = self.p.read(base, size)
-                    if not data:
-                        continue
-                    for pat, g in pats.items():
-                        i = data.find(pat)
-                        while i >= 0:
-                            if i >= 8:
-                                col, row = struct.unpack_from('<2f', data, i - 8)
-                                rec = struct.unpack_from('<9f', data, i - 8)
-                                if (0 <= col < N and 0 <= row < N and col == int(col) and row == int(row)
-                                        and abs(rec[6] - g['sediment']) < 1e-4 and abs(rec[7] - g['temperature']) < 1e-3):
-                                    found[base + i - 8] = dict(col=col, row=row, radius=rec[2], rate=rec[4], sediment=rec[6],
-                                                               temperature=rec[7], activity=g['activity'], buried=g['activity'] < 1,
-                                                               height_mode=g['height_mode'])
-                            i = data.find(pat, i + 1)
-                if found:                                   # keep the cluster around the median address
-                    mid = sorted(found)[len(found) // 2]
-                    found = {a: r for a, r in found.items() if abs(a - mid) < 36 * 256}
-                self.sources = list({(r['col'], r['row']): r for r in found.values()}.values())
-                self.source_note = '%d sources (%d generator objects active)' % (len(self.sources), len(gens))
+                gens = live_generators.generators(self.p, delta)
+                self.gen_addrs = [int(g['address'], 16) for g in gens]
+                if getattr(self, 'vec', None) is None:
+                    self.source_note = 'looking for the source list...'
+                    self.vec = live_generators.find_modifier_list(self.p, gens)
+                if self.vec is None:
+                    self.source_note = 'source list not found yet (needs a running, unburied source)'
+                else:
+                    self.refresh_sources()
             except Exception as e:                       # game closed, level changing, ...
                 self.source_note = 'sources: %s' % e
-            time.sleep(15)
+            time.sleep(10)
+
+    def refresh_sources(self, settle=0.01):
+        """Read the modifier list now; pair each fluid entry with a generator object for its nominal rate,
+        stored height and height mode (needed by the Python model's bury rule). Generators with identical
+        settings are told apart by the effective amount (rate x activity x fade-in), then by stored height
+        vs the ground at the entry's cell."""
+        vec = getattr(self, 'vec', None)
+        if vec is None:
+            return
+        entries = live_generators.read_modifier_list(self.p, vec, settle)
+        if not entries:
+            return
+        gens = [g for g in (live_generators.read_generator(self.p, a) for a in getattr(self, 'gen_addrs', [])) if g and g['mode'] != 0]
+        ground = self._prev[0] if getattr(self, '_prev', None) is not None else None
+        sig = lambda d: (round(d['radius'], 2), round(d['sediment'], 3), round(d['temperature'], 1))
+        free, out, other = list(gens), [], []
+        for e in entries:
+            if e['type'] != 0:
+                other.append(e)
+                continue
+            src = dict(col=e['col'], row=e['row'], radius=e['radius'], rate=e['amount'], amount=e['amount'],
+                       sediment=e['sediment'], temperature=e['temperature'])
+            cands = [g for g in free if sig(g) == sig(e)]
+            if cands:
+                gz = float(ground[int(e['row']), int(e['col'])]) if ground is not None else 0.0
+                eff = lambda g: g['rate'] * g['activity'] * (g['fade'] / g['fade_length'] if g['fade_length'] else 1)
+                g = min(cands, key=lambda g: (round(abs(eff(g) - e['amount']), 3), abs(g['stored_z'] - gz)))
+                free.remove(g)
+                src.update(rate=g['rate'], activity=g['activity'], buried=g['activity'] < 1, height_mode=g['height_mode'],
+                           z=g['stored_z'], bury_threshold=g['bury_threshold'])
+            out.append(src)
+        self.sources, self.other_modifiers = out, other
+        self.source_note = '%d sources, %d other modifiers (live list)' % (len(out), len(other))
+
+    def applied_sources(self):
+        """The fluid entries as the game applies them this tick (effective amounts, no bury rule needed)."""
+        return [dict(col=s['col'], row=s['row'], radius=s['radius'], rate=s['amount'], sediment=s['sediment'],
+                     temperature=s['temperature']) for s in self.sources]
 
     def status(self):
         state = 'paused' if self.paused else '%.0f ticks/s' % self.ticks_per_second()
-        return '%s | %s | %s' % (self.name, state, self.source_note)
+        extra = (' | ' + self.explain_note) if getattr(self, '_explain_on', False) else ''
+        return '%s | %s | %s%s' % (self.name, state, self.source_note, extra)
 
 
 class ModelSource(Source):
@@ -265,13 +353,15 @@ def model_from_map(name):
         grid[c] = a.astype(np.float32).view(np.uint32)
     _, u = sav.read_sav(os.path.join(compare_sim.SAVES, name + '.sav'))
     srcs = [dict(col=g['col'], row=g['row'], radius=g['radius'], rate=g['rate'], sediment=g['sediment'],
-                 temperature=g['temperature']) for g in sav_sources.generators(u) if g['mode'] in (1, 2)]
+                 temperature=g['temperature'], z=g['height'], height_mode=g['height_mode'], bury_threshold=5.0)
+            for g in sav_sources.generators(u) if g['mode'] in (1, 2)]
     return ModelSource(grid, galileo.fluid_params(border=border), srcs, 0, name)
 
 
 # ---------------------------------------------------------------- rendering
 LIGHT = np.array([-0.6, -0.6, 0.55]) / np.linalg.norm([-0.6, -0.6, 0.55])
-VIEWS = {'1': 'natural', '2': 'height', '3': 'water depth', '4': 'lava temperature', '5': 'sediment', '6': 'flow speed'}
+VIEWS = {'1': 'natural', '2': 'height', '3': 'water depth', '4': 'lava temperature', '5': 'sediment', '6': 'flow speed',
+         '7': 'unexplained changes'}
 
 
 def ramp_colours(x, stops):
@@ -328,6 +418,18 @@ def render(fr, view):
     return np.clip(col, 0, 255).astype(np.uint8)
 
 
+UNEXPLAINED = (('f_up', (0, 220, 255)), ('f_down', (255, 140, 0)), ('t_up', (255, 240, 0)), ('t_down', (255, 0, 255)))
+
+
+def render_unexplained(fr, acc):
+    col = render(fr, 'natural').astype(np.float32).mean(-1, keepdims=True).repeat(3, -1) * 0.4
+    if acc:
+        for name, colour in UNEXPLAINED:
+            a = np.clip(np.log10(np.maximum(acc[name], 1e-3) / 1e-3) / 2.5, 0, 1)[..., None]   # 0.001 .. ~0.3
+            col += (np.array(colour, np.float32) - col) * a
+    return np.clip(col, 0, 255).astype(np.uint8)
+
+
 # ---------------------------------------------------------------- window
 class App:
     def __init__(self, root, source, scale, flip, rotate):
@@ -336,6 +438,7 @@ class App:
         self.flip, self.rotate = flip, rotate % 4
         self.view, self.overlay = 'natural', True
         self.show_events, self.events = True, []        # (time, row, col, cells, total)
+        self.acc, self.acc_time, self.acc_tick = {}, time.time(), None   # view 7 accumulators
         self.frame = None
         self.dirty = True
         self.mouse = None
@@ -365,10 +468,18 @@ class App:
         ys, xs = np.mgrid[0:N, 0:N]
         self.cell_to_disp[disp[..., 0], disp[..., 1]] = np.stack([ys, xs], -1)
 
+    def current_sources(self):
+        """The source's current list (a paused game keeps returning no new frames, so the frame's own copy
+        can predate the background source search)."""
+        srcs = getattr(self.src, 'sources', None)
+        return list(srcs) if srcs is not None else (list(self.frame.sources) if self.frame is not None else [])
+
     def on_key(self, e):
         k = e.keysym.lower()
         if e.char in VIEWS:
             self.view = VIEWS[e.char]
+            if self.view == 'unexplained changes' and hasattr(self.src, 'enable_explain'):
+                self.src.enable_explain()
         elif k == 'o':
             self.overlay = not self.overlay
         elif k == 'd':
@@ -381,7 +492,11 @@ class App:
             self.screenshot()
         elif k == 'm' and self.frame is not None and not isinstance(self.src, ModelSource):
             fr = self.frame
-            self.src = ModelSource(fr.grid, fr.params, fr.sources, fr.tick, 'from live tick %d' % fr.tick)
+            srcs = self.current_sources()
+            if not srcs and 'looking' in getattr(self.src, 'source_note', ''):
+                self.info.configure(text='sources not found yet (the search takes a few seconds); press M again shortly')
+                return
+            self.src = ModelSource(fr.grid, fr.params, srcs, fr.tick, 'from live tick %d' % fr.tick)
         elif k == 'l' and isinstance(self.src, ModelSource):
             self.src.stop()
             try:
@@ -411,19 +526,27 @@ class App:
 
     def draw(self):
         fr = self.frame
-        img = Image.fromarray(np.ascontiguousarray(self.orient(render(fr, self.view))), 'RGB')
+        rgb = render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else render(fr, self.view)
+        img = Image.fromarray(np.ascontiguousarray(self.orient(rgb)), 'RGB')
         if self.scale != 1:
             img = img.resize((N * self.scale, N * self.scale), Image.NEAREST)
-        if self.overlay and fr.sources:
+        sources = self.current_sources()
+        if self.overlay and sources:
             dr = ImageDraw.Draw(img)
-            for s in fr.sources:
+            for s in sources:
                 y, x = self.cell_to_disp[int(s['row']), int(s['col'])]
                 cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, max(3, (s['radius'] + 1.5) * self.scale)
-                colour = (255, 90, 40) if s['temperature'] else (255, 60, 220) if s['rate'] < 0 else (120, 230, 255)
-                if s.get('buried'):
+                if s['rate'] < 0:          # drains: dark red = lava drain, violet = water drain
+                    colour = (200, 40, 60) if s['temperature'] else (170, 90, 255)
+                else:                      # orange = lava vent, cyan = spring
+                    colour = (255, 140, 30) if s['temperature'] else (120, 230, 255)
+                act = s.get('activity', 1.0)
+                if act < 0.95:                         # noticeably buried: grey
                     colour = (150, 150, 150)
+                amount = s.get('amount', s['rate'] * act)
+                label = '%+.2f' % amount + (' (%d%%)' % round(act * 100) if act < 0.99 else '')
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
-                dr.text((cx + r + 2, cy - 6), '%+.2f' % s['rate'], fill=colour)
+                dr.text((cx + r + 2, cy - 6), label, fill=colour)
         if self.show_events and self.events:
             dr = ImageDraw.Draw(img)
             now = time.time()
@@ -436,6 +559,14 @@ class App:
                 dr.line([cx - r, cy, cx + r, cy], fill=colour, width=2)
                 dr.line([cx, cy - r, cx, cy + r], fill=colour, width=2)
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=1)
+        others = getattr(self.src, 'other_modifiers', []) if self.overlay else []
+        if others:
+            dr = ImageDraw.Draw(img)
+            for e in others:
+                y, x = self.cell_to_disp[int(e['row']), int(e['col'])]
+                cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, e['radius'] * self.scale
+                dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(235, 235, 235), width=1)
+                dr.text((cx + r + 2, cy - 6), 'mod %+g/%+g' % (e['amount'], e['f5']), fill=(235, 235, 235))
         self.last_image = img
         self.photo = ImageTk.PhotoImage(img)
         self.canvas.configure(image=self.photo)
@@ -459,6 +590,9 @@ class App:
                     fluid = 'dry'
                 lines.append('col %d row %d | ground %.2f (soft %.2f, hard %.2f) | %s | outflow L %.2f R %.2f U %.2f D %.2f' % (
                     c, r, fr.ground[r, c], fr.soft[r, c], fr.ground[r, c] - fr.soft[r, c], fluid, *fr.flux[:, r, c]))
+                ex = getattr(self.src, 'explained', None)
+                if self.view == 'unexplained changes' and ex is not None:
+                    lines.append('unexplained at this cell (tick %d): ground %+.4f, fluid %+.4f' % (ex['tick'], ex['dT'][r, c], ex['dF'][r, c]))
         self.info.configure(text='\n'.join(lines))
 
     def tick(self):
@@ -471,6 +605,23 @@ class App:
             self.frame, self.dirty = fr, True
             now = time.time()
             self.events = [e for e in self.events if now - e[0] < 8] + [(now,) + e for e in fr.terrain_events]
+        ex = getattr(self.src, 'explained', None)
+        if self.view == 'unexplained changes':
+            now = time.time()
+            decay = 0.5 ** ((now - self.acc_time) / 1.5)
+            self.acc_time = now
+            new = ex if ex is not None and ex['tick'] != self.acc_tick else None
+            if new is not None:
+                self.acc_tick = new['tick']
+            parts = {'f_up': lambda e: np.maximum(e['dF'], 0), 'f_down': lambda e: np.maximum(-e['dF'], 0),
+                     't_up': lambda e: np.maximum(e['dT'], 0), 't_down': lambda e: np.maximum(-e['dT'], 0)}
+            for k, f in parts.items():
+                cur = self.acc.get(k, np.zeros((N, N), np.float32)) * decay
+                self.acc[k] = np.maximum(cur, f(new)) if new is not None else cur
+            self.dirty = self.dirty or new is not None or any(a.max() > 1e-3 for a in self.acc.values())
+        if id(getattr(self.src, 'sources', None)) != getattr(self, '_drawn_sources', None):
+            self._drawn_sources = id(getattr(self.src, 'sources', None))
+            self.dirty = True
         if self.frame is not None and self.dirty:
             self.draw()
             self.dirty = False
