@@ -25,6 +25,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 INSTALL = r'D:\Games\Steam\steamapps\common\From Dust'
 WORKER = os.path.join(INSTALL, 'SSE41', 'GalileoSimulatorWater_9_9.dll')
 SIMSTEP = os.path.join(HERE, 'simstep', 'build', 'simstep.exe')
+MODSTEP = os.path.join(HERE, 'simstep', 'build', 'modstep.exe')
+MODIFIER_DLL = os.path.join(INSTALL, 'SSE41', 'GalileoSimulatorWater.dll')
+# SimulatorModifierTemplate::* RVAs in MODIFIER_DLL (from its PDB), by ISimulatorWaterConst::tModifier name
+MODIFIER_RVA = {'SoftGround': 0xA8F0, 'HardGround': 0xB420, 'RepulseFluid': 0xBEE0, 'AddLava': 0xDC60,
+                'RemoveLava': 0xEED0, 'AddWater': 0xF800, 'RemoveWater': 0x10B40}
 N = 512
 
 TERRAIN, SOFT, WATER, TEMPSED, FLUX_LR, FLUX_UD, RANDGANJA, GANJATIMEFIRE = range(8)
@@ -181,6 +186,39 @@ def run(grid, P, steps=1, skip_border=0, dump_every_step=False, **kw):
             raise RuntimeError(r.stderr or r.stdout)
         if dump_every_step:
             return [unpack(open(os.path.join(td, 'step%d.bin' % (i + 1)), 'rb').read()) for i in range(steps)]
+        return unpack(open(gout, 'rb').read())
+
+
+def modifier_block(center, param, P, skip=2):
+    """0x50-byte SimulatorModifierTemplateParam as SimulatorWater::Modify (0x10012060) builds it:
+    rows / 16-cell column groups of the bounding box centre +- (radius + 1), clamped to the processed
+    area; Center (col, row, radius as given, first row as float: Modify overwrites w); Param; (ParamF[17], WaterEnergy = ParamF[46],
+    1 / WaterEnergy, 0). The grid pointer (+0x08) is filled in by modstep."""
+    cx, cy, r = (int(np.rint(np.float32(v))) for v in center[:3])
+    lo, hi = skip * 16, N - skip * 16 - 1
+    row0 = max(cy - r - 1 if cy >= r + 1 else 0, lo)
+    row1 = min(cy + r + 1, hi)
+    col0 = max(cx - r - 1 if cx >= r + 1 else 0, lo)
+    col1 = min(cx + r + 1, hi)
+    b = bytearray(0x50)
+    struct.pack_into('<8I', b, 0, row0, row1, 0, 9, row0, row1, col0 >> 4, (col1 + 15) >> 4)
+    struct.pack_into('<4f', b, 0x20, center[0], center[1], center[2], float(row0))   # w = first row (the row loop's counter)
+    struct.pack_into('<4f', b, 0x30, *param)
+    e = np.float32(P[46])
+    struct.pack_into('<4f', b, 0x40, P[17], e, np.float32(1) / e if e else 0, 0)
+    return bytes(b)
+
+
+def modify(grid, kind, center, param, P, skip=2):
+    """Run the game's own modifier `kind` (MODIFIER_RVA key, e.g. 'RepulseFluid') once on grid
+    (8, 512, 512) uint32 with Center (col, row, radius, w) and Param (4 floats). Returns the new grid."""
+    with tempfile.TemporaryDirectory() as td:
+        pb, gin, gout = (os.path.join(td, n) for n in ('block.bin', 'in.bin', 'out.bin'))
+        open(pb, 'wb').write(modifier_block(center, param, P, skip))
+        open(gin, 'wb').write(pack(grid))
+        r = subprocess.run([MODSTEP, MODIFIER_DLL, '%X' % MODIFIER_RVA[kind], pb, gin, gout], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stderr or r.stdout)
         return unpack(open(gout, 'rb').read())
 
 

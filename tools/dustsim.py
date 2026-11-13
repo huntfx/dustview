@@ -232,8 +232,20 @@ def apply_sources(G, sources):
             W[ys, xs] = np.where(lava, w, w + rate)
 
 
-def tick(G, P, sources=()):
-    """One full game tick as far as modelled: border ring reset, step(), sources. The 32-cell band
+def apply_modifiers(G, entries):
+    """Apply the game's per-tick modifier list in its order: type 0 = fluid source (dict with 'amount'
+    or 'rate'), type 1 = RepulseFluid (col, row, radius, amount, f5 = mode). Other types are skipped."""
+    for e in entries:
+        t = e.get('type', 0)
+        if t == 0:
+            apply_sources(G, [dict(e, rate=e.get('amount', e.get('rate', 0)))] if 'amount' in e else [e])
+        elif t == 1:
+            repulse_fluid(G, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
+
+
+def tick(G, P, sources=(), repulsors=()):
+    """One full game tick as far as modelled: border ring reset, step(), sources, then RepulseFluid
+    modifiers (village outposts; entries with col, row, radius, amount, f5). The 32-cell band
     outside the ring is kept unchanged. Not modelled: tides/waves, script changes, player powers."""
     a, b = RING
     set_border_ring(G, P)
@@ -247,4 +259,40 @@ def tick(G, P, sources=()):
     F[:, inner[0], inner[1]] = out['F'][:, inner[0], inner[1]]
     out['F'] = F
     apply_sources(out, sources)
+    for e in repulsors:
+        repulse_fluid(out, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
     return out
+
+
+def repulse_fluid(G, col, row, radius, amount, mode, skip=SKIP):
+    """kModifier_RepulseFluid (SimulatorModifierTemplate::RepulseFluid in GalileoSimulatorWater.dll):
+    pushes fluid out of a disc by rewriting the stored outflows. Village outposts use it (mode -1 =
+    water; mode > 0 = lava). For each cell of the chosen fluid (water mode: depth >= 0, so dry cells too) with d <= radius:
+      s = 1 - d / radius
+      outflows = old outflows * (1 - s) + 256 * amount * s * (outward unit vector split into L/R/U/D)
+      if their sum exceeds the depth x 256, all four are scaled down to the depth; then rounded.
+    Nothing else changes. Matched against the DLL with tools/simstep/modstep.exe (galileo.modify)."""
+    f32 = np.float32
+    W, F = G['W'], G['F']
+    r0, r1 = max(int(row - radius - 1), skip), min(int(row + radius + 1), 511 - skip)
+    c0, c1 = max(int(col - radius - 1), skip), min(int(col + radius + 1), 511 - skip)
+    ys, xs = np.mgrid[r0:r1 + 1, c0:c1 + 1]
+    dx, dy = (xs - f32(col)).astype(f32), (ys - f32(row)).astype(f32)
+    d = np.sqrt(dx * dx + dy * dy).astype(f32)
+    w = W[r0:r1 + 1, c0:c1 + 1]
+    target = (w < 0) if mode > 0 else (w >= 0)          # water mode includes dry cells (their flows -> 0)
+    inside = target & (d <= f32(radius))                # centre cell: old flows x 0, no push -> 0
+    if not inside.any():
+        return
+    inv_r = f32(1) / f32(radius)                        # the DLL uses a refined rsqrt(r^2): last-bit
+    s = (f32(1) - d * inv_r).astype(f32)                # differences can flip an exact .5 when rounding
+    push = f32(256) * f32(amount) * s
+    dd = np.where(d > 0, d, 1)
+    comp = np.stack([np.maximum(-dx, 0), np.maximum(dx, 0), np.maximum(dy, 0), np.maximum(-dy, 0)]) / dd * push   # L R U D
+    old = F[:, r0:r1 + 1, c0:c1 + 1].astype(f32)
+    new = (old * (f32(1) - s) + comp).astype(f32)
+    cap = np.abs(w) * f32(256)
+    tot = new.sum(0)
+    new = np.where(tot > cap, new * (cap / np.where(tot > 0, tot, 1)), new)
+    region = F[:, r0:r1 + 1, c0:c1 + 1]
+    region[:, inside] = np.rint(new[:, inside]).astype(region.dtype)

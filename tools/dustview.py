@@ -24,7 +24,7 @@ Keys
   M  switch to the Python model, starting from the state on screen (sources as last found)
   L  switch back to the live game       Space  pause / resume the model
   O  overlays on/off: cyan spring, orange lava vent, violet water drain, dark red lava drain, grey = buried
-     below 95% strength (labels show the amount applied per cell per tick, with % when reduced), white = other modifier (e.g. a village's water repulsion)
+     below 95% strength (labels show the amount applied per cell per tick, with % when reduced), white = RepulseFluid (village outposts: mode -1 pushes water, +1 lava; modelled)
   O  (toggle)          V  flip vertically     R  rotate 90 degrees
   D  terrain-change markers on/off (live only): terrain that changes in dry areas between frames,
      i.e. not caused by the simulation (moving dips, scripted terrain, powers). Magenta = lowered,
@@ -193,7 +193,7 @@ class LiveGame(Source):
             if not cap:
                 continue
             n, A, B, prm = cap
-            applied = self.applied_sources()                # read right after the pair: same list as that tick
+            applied = list(getattr(self, 'entries', []))    # read right after the pair: same list as that tick
             GA, GB = dustsim.from_grid(A), dustsim.from_grid(B)
             if (np.abs(GA['W'] - GB['W']) > 1e-3).sum() > 100000:
                 continue                                    # mistimed read
@@ -205,7 +205,7 @@ class LiveGame(Source):
             except Exception:
                 X = dustsim.tick(GA, {k: float(v) for k, v in zip(galileo.PARAM_NAMES, Pa)}, [])
                 how = 'python'
-            dustsim.apply_sources(X, applied)
+            dustsim.apply_modifiers(X, applied)
             # A torn read (a buffer copied while the game was writing it) shows as thousands of outflow
             # mismatches; normally ~300 (the village repulsion etc.), so skip such pairs.
             torn = int((GB['F'] != X['F']).any(0).sum())
@@ -282,7 +282,7 @@ class LiveGame(Source):
                 src.update(rate=g['rate'], activity=g['activity'], buried=g['activity'] < 1, height_mode=g['height_mode'],
                            z=g['stored_z'], bury_threshold=g['bury_threshold'])
             out.append(src)
-        self.sources, self.other_modifiers = out, other
+        self.sources, self.other_modifiers, self.entries = out, other, entries
         self.source_note = '%d sources, %d other modifiers (live list)' % (len(out), len(other))
 
     def applied_sources(self):
@@ -300,10 +300,11 @@ class ModelSource(Source):
     """The Python model (dustsim.tick) stepping in a background thread as fast as it can."""
     name = 'python model'
 
-    def __init__(self, grid, params, sources, tick=0, label=''):
+    def __init__(self, grid, params, sources, tick=0, label='', repulsors=()):
         self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(params, np.float32))}
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
+        self.other_modifiers = [dict(e) for e in repulsors if e.get('type') == 1]
         for s in self.sources:
             s['_cells'] = dustsim.disc(s['col'], s['row'], s['radius'])
         self.G = dustsim.from_grid(grid)
@@ -321,7 +322,7 @@ class ModelSource(Source):
         while self.running:
             if self.paused:
                 time.sleep(0.05); continue
-            G = dustsim.tick(self.G, self.P, self.sources)
+            G = dustsim.tick(self.G, self.P, self.sources, self.other_modifiers)
             with self.lock:
                 self.G, self.tick = G, self.tick + 1
                 now = time.time()
@@ -337,7 +338,7 @@ class ModelSource(Source):
     def status(self):
         rate = len(self.times) / max(self.times[-1] - self.times[0], 1e-6) if len(self.times) > 1 else 0
         state = 'paused' if self.paused else '%.1f ticks/s' % rate
-        return '%s%s | %s | %d sources' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources))
+        return '%s%s | %s | %d sources, %d repulsors' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers))
 
     def stop(self):
         self.running = False
@@ -496,7 +497,8 @@ class App:
             if not srcs and 'looking' in getattr(self.src, 'source_note', ''):
                 self.info.configure(text='sources not found yet (the search takes a few seconds); press M again shortly')
                 return
-            self.src = ModelSource(fr.grid, fr.params, srcs, fr.tick, 'from live tick %d' % fr.tick)
+            self.src = ModelSource(fr.grid, fr.params, srcs, fr.tick, 'from live tick %d' % fr.tick,
+                                   getattr(self.src, 'other_modifiers', []))
         elif k == 'l' and isinstance(self.src, ModelSource):
             self.src.stop()
             try:
