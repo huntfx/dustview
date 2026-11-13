@@ -144,3 +144,78 @@ def from_grid(grid):
 
 
 
+
+
+# ---------------------------------------------------------------- outside the step: border and sources
+SKIP = 32           # SkipBorderSize 2 (x 16 cells): rows/cols 0-31 and 480-511 never change
+RING = (SKIP, 511 - SKIP)
+
+
+def set_border_ring(G, P):
+    """Reset the outermost processed ring (row/col 32 and 479) to the map's border values. The game
+    does this before each step (live: the ring reads just below the border level after a step)."""
+    ground = np.float32(P['BorderHardgroundSurfaceHeight'])
+    soft = np.float32(P['BorderSoftgroundSurfaceHeight'])
+    water = max(np.float32(P['BorderWaterSurfaceHeight']) - ground, np.float32(0))
+    a, b = RING
+    for sl in ((a, slice(a, b + 1)), (b, slice(a, b + 1)), (slice(a, b + 1), a), (slice(a, b + 1), b)):
+        G['T'][sl], G['soft'][sl], G['W'][sl], G['sed'][sl] = ground, soft, water, 0
+
+
+def disc(col, row, radius):
+    """Cells of a source: dx^2 + dy^2 <= r^2 around the centre cell (as measured in the game)."""
+    r = int(np.ceil(radius))
+    dy, dx = np.mgrid[-r:r + 1, -r:r + 1]
+    keep = dx * dx + dy * dy <= radius * radius
+    ys, xs = (dy[keep] + int(row)), (dx[keep] + int(col))
+    ok = (ys >= 0) & (ys < 512) & (xs >= 0) & (xs < 512)
+    return ys[ok], xs[ok]
+
+
+def apply_sources(G, sources):
+    """Add what springs, lava vents and drains put in after a step. sources: dicts with col, row,
+    radius, rate (per cell per tick; negative = drain), sediment (fraction), temperature (internal
+    units; > 0 = lava vent) and optional activity (bury factor, default 1).
+    Measured in the game: a spring adds `rate` water and `rate x sediment` sediment per cell; a vent
+    adds `rate` lava and sets the cell temperature. Not measured (approximations): a vent on a water
+    cell (here the water boils off), a spring on a lava cell (here it cools the lava like mixing in water
+    at 0 degrees), drains (here they lower any fluid, sediment in proportion)."""
+    W, Sd = G['W'], G['sed']
+    for s in sources:
+        rate = np.float32(s['rate'] * s.get('activity', 1.0))
+        if rate == 0:
+            continue
+        ys, xs = s.get('_cells') or disc(s['col'], s['row'], s['radius'])
+        w = W[ys, xs]
+        if rate < 0:                                            # drain
+            depth = np.abs(w)
+            new = np.maximum(depth + rate, 0)
+            keep = np.where(depth > 0, new / np.maximum(depth, 1e-12), 0)
+            W[ys, xs] = np.sign(w) * new
+            Sd[ys, xs] = np.where(w > 0, Sd[ys, xs] * keep, Sd[ys, xs])
+        elif s['temperature'] > 0:                              # lava vent
+            lava = np.maximum(-w, 0)
+            W[ys, xs] = -(lava + rate)
+            Sd[ys, xs] = np.float32(s['temperature'])
+        else:                                                   # spring
+            lava = w < 0
+            Sd[ys, xs] = np.where(lava, Sd[ys, xs] * -w / (-w + rate), Sd[ys, xs] + rate * np.float32(s.get('sediment', 0)))
+            W[ys, xs] = np.where(lava, w, w + rate)
+
+
+def tick(G, P, sources=()):
+    """One full game tick as far as modelled: border ring reset, step(), sources. The 32-cell band
+    outside the ring is kept unchanged. Not modelled: tides/waves, script changes, player powers."""
+    a, b = RING
+    set_border_ring(G, P)
+    out = step(G, P)
+    inner = (slice(a, b + 1), slice(a, b + 1))
+    for k in ('T', 'soft', 'W', 'sed'):
+        keep = G[k].copy()
+        keep[inner] = out[k][inner]
+        out[k] = keep
+    F = G['F'].copy()
+    F[:, inner[0], inner[1]] = out['F'][:, inner[0], inner[1]]
+    out['F'] = F
+    apply_sources(out, sources)
+    return out
