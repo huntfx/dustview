@@ -126,6 +126,11 @@ def step(G, P):
     # lava + water: the water boils away but dilutes the lava's temperature
     Tn = np.where(becomes_lava, (np.where(lava, rem * Tm, 0) + heat_in) /
                   np.where(becomes_lava, lava_vol + water_vol, 1), 0)
+    # diluted down to the solidify point or below: the lava hardens into ground at once and the cell
+    # stays water (own + incoming water). Found live against the DLL (2026-11-13, Map 4 lava front).
+    freeze = becomes_lava & (Tn <= f32(P['WaterTemperatureMax']))
+    T = np.where(freeze, T + lava_vol, T).astype(f32)
+    becomes_lava &= ~freeze
     Sn = np.where(lava, 0, Sd - out * ratio) + sed_in
     Wn = np.where(becomes_lava, -lava_vol, water_vol)
     C3 = np.where(becomes_lava, Tn, Sn)
@@ -179,7 +184,8 @@ def apply_sources(G, sources):
     Measured in the game: a spring adds `rate` water and `rate x sediment` sediment per cell; a vent
     adds `rate` lava and sets the cell temperature. Not measured (approximations): a vent on a water
     cell (here the water boils off), a spring on a lava cell (here it cools the lava like mixing in water
-    at 0 degrees), drains (here they lower any fluid, sediment in proportion)."""
+    at 0 degrees). Drains lower their own kind of fluid by up to |rate| (measured for lava drains: they
+    leave water alone and do not set the temperature; water drains leaving lava alone is assumed)."""
     W, Sd = G['W'], G['sed']
     for s in sources:
         rate = np.float32(s['rate'] * s.get('activity', 1.0))
@@ -187,9 +193,10 @@ def apply_sources(G, sources):
             continue
         ys, xs = s.get('_cells') or disc(s['col'], s['row'], s['radius'])
         w = W[ys, xs]
-        if rate < 0:                                            # drain
+        if rate < 0:                                            # drain: only its own kind of fluid
+            mine = (w < 0) if s['temperature'] > 0 else (w > 0)
             depth = np.abs(w)
-            new = np.maximum(depth + rate, 0)
+            new = np.where(mine, np.maximum(depth + rate, 0), depth)
             keep = np.where(depth > 0, new / np.maximum(depth, 1e-12), 0)
             W[ys, xs] = np.sign(w) * new
             Sd[ys, xs] = np.where(w > 0, Sd[ys, xs] * keep, Sd[ys, xs])

@@ -18,6 +18,9 @@ Keys
   M  switch to the Python model, starting from the state on screen (sources as last found)
   L  switch back to the live game       Space  pause / resume the model
   O  overlays (sources) on/off          V  flip vertically     R  rotate 90 degrees
+  D  terrain-change markers on/off (live only): terrain that changes in dry areas between frames,
+     i.e. not caused by the simulation (moving dips, scripted terrain, powers). Magenta = lowered,
+     yellow = raised; markers fade over 8 s; every spot is also logged to data/live/terrain_events_*.log
   S  save a screenshot to data/live/    Esc quit
 Mouse: hover for the cell's values (col/row, ground, soft ground, water or lava, sediment/temperature).
 
@@ -36,6 +39,7 @@ from PIL import Image, ImageTk, ImageDraw
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import memscan, galileo, live_check, live_generators, dustsim  # noqa: E402
+from live_sources import regions  # noqa: E402
 
 N = 512
 GRID_BYTES = 8 * N * N * 4
@@ -60,6 +64,7 @@ class Frame:
         lr, ud = grid[4], grid[5]
         self.flux = np.stack([lr & 0xFFFF, lr >> 16, ud & 0xFFFF, ud >> 16]).astype(np.float32) / 256
         self.params = params
+        self.terrain_events = []        # (row, col, cells, total change) for terrain changed outside the sim
         self.sources = list(sources)    # dicts with col, row, radius, rate, sediment, temperature
         self.source_name = source_name
 
@@ -118,8 +123,41 @@ class LiveGame(Source):
             self.paused = False
             now = time.time()
             self.tick_times = [(t, s) for t, s in self.tick_times if now - s < 3] + [(m, now)]
-            return Frame(m - 1, galileo.unpack(raw), params, self.sources, self.name)
+            fr = Frame(m - 1, galileo.unpack(raw), params, self.sources, self.name)
+            self._terrain_events(fr)
+            return fr
         return None
+
+    def _terrain_events(self, fr):
+        """Terrain changes in dry areas since the previous frame. The simulation only changes terrain where
+        fluid is (erosion, deposit, lava hardening) or next to it (lateral erosion, slumping into water),
+        so a change where a cell and its 8 neighbours were dry in both frames comes from outside it."""
+        fluid = (fr.water + fr.lava) > 1e-3
+        prev = getattr(self, '_prev', None)
+        self._prev = (fr.ground.copy(), fluid)
+        if prev is None:
+            return
+        ground0, fluid0 = prev
+        wet = fluid | fluid0
+        near = wet.copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                near |= dustsim.shift(wet, dy, dx)
+        dg = fr.ground - ground0
+        mask = (np.abs(dg) > 0.004) & ~near
+        mask[:33] = mask[479:] = False
+        mask[:, :33] = mask[:, 479:] = False
+        if mask.sum() > 5000:                       # level change / load: ignore
+            return
+        for ys, xs in regions(mask):
+            fr.terrain_events.append((float(ys.mean()), float(xs.mean()), len(ys), float(dg[ys, xs].sum())))
+        if fr.terrain_events:
+            if not hasattr(self, '_elog'):
+                self._elog = open(os.path.join(HERE, 'data', 'live', time.strftime('terrain_events_%Y%m%d_%H%M%S.log')), 'w', encoding='utf-8')
+                self._elog.write('tick row col cells total_change (terrain changed in dry areas, outside the simulation)\n')
+            for r, c, n, tot in fr.terrain_events:
+                self._elog.write('%d %.1f %.1f %d %+.4f\n' % (fr.tick, r, c, n, tot))
+            self._elog.flush()
 
     def ticks_per_second(self):
         if len(self.tick_times) < 2:
@@ -297,6 +335,7 @@ class App:
         self.live = source if isinstance(source, LiveGame) else None
         self.flip, self.rotate = flip, rotate % 4
         self.view, self.overlay = 'natural', True
+        self.show_events, self.events = True, []        # (time, row, col, cells, total)
         self.frame = None
         self.dirty = True
         self.mouse = None
@@ -332,6 +371,8 @@ class App:
             self.view = VIEWS[e.char]
         elif k == 'o':
             self.overlay = not self.overlay
+        elif k == 'd':
+            self.show_events = not self.show_events
         elif k == 'v':
             self.flip = not self.flip; self._make_index()
         elif k == 'r':
@@ -383,6 +424,18 @@ class App:
                     colour = (150, 150, 150)
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
                 dr.text((cx + r + 2, cy - 6), '%+.2f' % s['rate'], fill=colour)
+        if self.show_events and self.events:
+            dr = ImageDraw.Draw(img)
+            now = time.time()
+            for t, row, col, n, tot in self.events:
+                y, x = self.cell_to_disp[int(round(row)), int(round(col))]
+                cx, cy = (x + 0.5) * self.scale, (y + 0.5) * self.scale
+                f = max(0.25, 1 - (now - t) / 8)
+                colour = tuple(int(v * f) for v in ((255, 0, 255) if tot < 0 else (255, 230, 0)))
+                r = 4 * self.scale + n ** 0.5 * self.scale
+                dr.line([cx - r, cy, cx + r, cy], fill=colour, width=2)
+                dr.line([cx, cy - r, cx, cy + r], fill=colour, width=2)
+                dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=1)
         self.last_image = img
         self.photo = ImageTk.PhotoImage(img)
         self.canvas.configure(image=self.photo)
@@ -393,8 +446,9 @@ class App:
         if fr is not None:
             fps = len(self.fps) / max(self.fps[-1] - self.fps[0], 1e-6) if len(self.fps) > 1 else 0
             border = fr.params[31] if fr.params is not None else float('nan')
-            lines.append('tick %d | viewer %.1f fps | border water level %.2f | water %.0f, lava %.0f in total' % (
-                fr.tick, fps, border, fr.water.sum(), fr.lava.sum()))
+            recent = [e for e in self.events if time.time() - e[0] < 8]
+            lines.append('tick %d | viewer %.1f fps | border water level %.2f | water %.0f, lava %.0f in total | terrain changes outside the sim (8 s): %d lowered, %d raised (D)' % (
+                fr.tick, fps, border, fr.water.sum(), fr.lava.sum(), sum(e[4] < 0 for e in recent), sum(e[4] > 0 for e in recent)))
             if self.mouse is not None:
                 r, c = self.idx_r[self.mouse], self.idx_c[self.mouse]
                 if fr.lava[r, c] > 0:
@@ -415,6 +469,8 @@ class App:
             self.info.configure(text='read failed: %s' % e)
         if fr is not None:
             self.frame, self.dirty = fr, True
+            now = time.time()
+            self.events = [e for e in self.events if now - e[0] < 8] + [(now,) + e for e in fr.terrain_events]
         if self.frame is not None and self.dirty:
             self.draw()
             self.dirty = False
