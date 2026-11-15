@@ -12,7 +12,7 @@ Run with the project venv while a level is loaded:
   .venv/Scripts/python tools/dustview.py [--scale 2] [--flip] [--rotate N] [--model MAP]
 --model MAP runs the Python model from a map's .sav (e.g. ALPHA_Map11_Void) driven by its level script
 (tools/level_schedule.py: sources switching on/off/moving, the tide); --villages "0:0,200:1,900:3" gives
-the village counts the script checks. Waves and tsunamis are logged, not simulated. No game needed.
+the village counts the script checks. Waves and tsunamis drive the edge lines (wave table). No game needed.
 
 Keys
   1 natural   2 height   3 water depth   4 lava temperature   5 sediment   6 flow speed
@@ -24,6 +24,10 @@ Keys
     half-life. A few cells are always left (rounding, the small-vent timing).
   M  switch to the Python model, starting from the state on screen (sources as last found)
   L  switch back to the live game       Space  pause / resume the model
+  Click a totem (model mode) to build / remove its village. Villages count for the level script;
+     repulsion comes from the village's learned songs (repel water: radius 26, repel lava: 23.33), not
+     from the totem; a village keeps the songs it has in the save / live game. Totems: gold = village. --model takes the
+     starting villages and songs from the player's progress save of the level (--progress auto|none|PATH).
   O  overlays on/off: cyan spring, orange lava vent, violet water drain, dark red lava drain, grey = buried
      below 95% strength (labels show the amount applied per cell per tick, with % when reduced), white = RepulseFluid (village outposts: mode -1 pushes water, +1 lava; modelled)
   O  (toggle)          V  flip vertically     R  rotate 90 degrees
@@ -87,6 +91,55 @@ def state_to_grid(G, like=None):
     grid[4] = F[0] | (F[1] << 16)
     grid[5] = F[2] | (F[3] << 16)
     return grid
+
+
+# Fluid repulsion at villages comes from the village's learned songs, not from the totem: a "repel water"
+# object (entity 0x20400009) adds RepulseFluid mode -1 with radius trunc(40 x 2/3) = 26, a "repel lava"
+# object (0x2040000A) mode +1 with radius 35 x 2/3 = 23.33, every tick (dustai 0x10134AC0 / 0x10135210).
+# A village can have none, one or both. Totem dicts carry built, water, lava (radius, 0 = no song).
+SONG_RADIUS = {'water': 26.0, 'lava': 35 * 2 / 3}
+SONG_MODE = {'water': -1, 'lava': +1}
+
+
+def totem_repulsors(totems, extra=()):
+    """RepulseFluid entries for the built totems' songs, plus `extra` entries that belong to no totem."""
+    out = [dict(e) for e in extra]
+    for t in totems:
+        if not t.get('built'):
+            continue
+        for kind in ('water', 'lava'):
+            if t.get(kind):
+                out.append(dict(type=1, col=t['col'], row=t['row'], radius=t[kind], amount=1.0,
+                                f5=SONG_MODE[kind], totem=t['id']))
+    return out
+
+
+def songs_from_modifiers(totems, entries, reach=8, mark_built=False):
+    """Give each totem the repel songs seen in a live modifier list (type-1 entries within `reach` cells
+    of it). mark_built: a totem with a song has a village (the song objects only exist for villages).
+    Returns the type-1 entries that belong to no totem."""
+    left = []
+    for t in totems:
+        t.setdefault('water', 0.0)
+        t.setdefault('lava', 0.0)
+    for e in entries:
+        if e.get('type') != 1:
+            continue
+        near = [t for t in totems if (e['col'] - t['col']) ** 2 + (e['row'] - t['row']) ** 2 <= reach ** 2]
+        if not near:
+            left.append(e)
+            continue
+        t = min(near, key=lambda t: (e['col'] - t['col']) ** 2 + (e['row'] - t['row']) ** 2)
+        t['water' if e['f5'] < 0 else 'lava'] = e['radius']
+        if mark_built:
+            t['built'] = True
+    return left
+
+
+def totem_label(t):
+    songs = '+'.join(k for k in ('water', 'lava') if t.get(k))
+    return 'totem p%d%s%s' % (t.get('power', -1), ' village' if t.get('built') else '',
+                              (' repels ' + songs) if t.get('built') and songs else '')
 
 
 class Source:
@@ -242,6 +295,10 @@ class LiveGame(Source):
                 delta = live_generators.dustai_delta(self.p) if delta is None else delta
                 gens = live_generators.generators(self.p, delta)
                 self.gen_addrs = [int(g['address'], 16) for g in gens]
+                try:
+                    self.totems = live_generators.totems(self.p, delta)
+                except Exception:
+                    pass
                 if getattr(self, 'vec', None) is None:
                     self.source_note = 'looking for the source list...'
                     self.vec = live_generators.find_modifier_list(self.p, gens)
@@ -301,7 +358,7 @@ class ModelSource(Source):
     """The Python model (dustsim.tick) stepping in a background thread as fast as it can."""
     name = 'python model'
 
-    def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None):
+    def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None, totems=None):
         self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(params, np.float32))}
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
@@ -318,6 +375,13 @@ class ModelSource(Source):
         self.times = []
         self.lock = threading.Lock()
         self.schedule = schedule                 # level_schedule.LevelSchedule: script-driven sources + tide
+        self.totems = [dict(t) for t in totems] if totems else []
+        self.loose_repulsors = []                # live repulsors that belong to no totem: kept as they are
+        if self.totems:                          # villages + their songs define the repulsors and the village count
+            self.loose_repulsors = songs_from_modifiers(self.totems, self.other_modifiers, mark_built=True)
+            self.other_modifiers = totem_repulsors(self.totems, self.loose_repulsors)
+        if schedule is not None:
+            schedule.villages = lambda t: sum(1 for x in self.totems if x.get('built'))
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
@@ -332,6 +396,8 @@ class ModelSource(Source):
             G = dustsim.tick(self.G, self.P, self.sources, self.other_modifiers)
             if sch is not None:
                 sch.write_back(self.sources)
+                if sch.profiles:
+                    dustsim.apply_edges(G, sch.border_level, sch.profiles)
             with self.lock:
                 self.G, self.tick = G, self.tick + 1
                 now = time.time()
@@ -352,15 +418,27 @@ class ModelSource(Source):
             sch = self.schedule
             last = sch.events[-1] if sch.events else None
             extra = ' | level time %.0fs, border %.2f%s' % (sch.time, sch.border_level, (' | last script event at %.0fs: %s' % (last[0], last[1][:70])) if last else '')
-        return '%s%s | %s | %d sources, %d repulsors%s' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers), extra)
+        note = getattr(self, 'progress_note', '')
+        vil = (' | villages %d/%d%s (click a totem: village on/off)' % (sum(1 for t in self.totems if t.get('built')), len(self.totems),
+                                                               (', from ' + note) if note else '')) if self.totems else ''
+        return '%s%s | %s | %d sources, %d repulsors%s%s' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers), vil, extra)
 
     def stop(self):
         self.running = False
 
+    def toggle_totem(self, t):
+        """Build / remove the village at totem t. Its songs (from the save or the live game) are kept and
+        only act while the village exists."""
+        t['built'] = not t.get('built')
+        self.other_modifiers = totem_repulsors(self.totems, self.loose_repulsors)
 
-def model_from_map(name, villages=None):
+
+def model_from_map(name, villages=None, progress='auto'):
     """ModelSource for a map's .sav: its start grids, border values and the generators that are on at
-    the start (mode 1 or 2). Parameters are the game's normal set (galileo.fluid_params)."""
+    the start (mode 1 or 2). Parameters are the game's normal set (galileo.fluid_params).
+    progress: 'auto' = take which totems have a village and which villages know a repel song from the
+    player's progress save of this level (found by totem positions), a path = that save, 'none' = no
+    villages. Only villages and songs are taken from it; the grid still comes from the level file."""
     import compare_sim, sav, sav_sources
     T, So, W, C3, border = compare_sim.load_map(name)
     grid = np.zeros((8, N, N), np.uint32)
@@ -369,7 +447,24 @@ def model_from_map(name, villages=None):
     _, u = sav.read_sav(os.path.join(compare_sim.SAVES, name + '.sav'))
     import level_schedule
     sch = level_schedule.LevelSchedule(name, villages=villages, border_level=border[0])
-    return ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, name, schedule=sch)
+    st = sav_sources.statues(u)
+    tot = {t['index']: dict(id=t['id'], col=t['col'], row=t['row'], power=t['power'], built=False, water=0.0, lava=0.0)
+           for t in st}
+    note = ''
+    path = sav_sources.find_progress_save(st) if progress == 'auto' else (None if progress in (None, 'none') else progress)
+    if path:
+        _, pu = sav.read_sav(path)
+        for i, d in sav_sources.progress_totems(pu).items():
+            if i in tot:
+                tot[i].update(d)
+        note = '%s (%s)' % (os.path.basename(path), time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(path))))
+        print('villages and songs from', path, flush=True)
+    ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, name, schedule=sch,
+                     totems=list(tot.values()))
+    ms.progress_note = note
+    if villages is not None:                     # an explicit --villages schedule overrides the totem count
+        sch.villages = villages
+    return ms
 
 
 # ---------------------------------------------------------------- rendering
@@ -465,6 +560,7 @@ class App:
         root.bind('<Key>', self.on_key)
         self.canvas.bind('<Motion>', self.on_move)
         self.canvas.bind('<Leave>', lambda e: self.set_mouse(None))
+        self.canvas.bind('<Button-1>', self.on_click)
         self._make_index()
         self.tick()
 
@@ -511,7 +607,7 @@ class App:
                 self.info.configure(text='sources not found yet (the search takes a few seconds); press M again shortly')
                 return
             self.src = ModelSource(fr.grid, fr.params, srcs, fr.tick, 'from live tick %d' % fr.tick,
-                                   getattr(self.src, 'other_modifiers', []))
+                                   getattr(self.src, 'other_modifiers', []), totems=getattr(self.src, 'totems', None))
         elif k == 'l' and isinstance(self.src, ModelSource):
             self.src.stop()
             try:
@@ -528,6 +624,17 @@ class App:
 
     def on_move(self, e):
         self.set_mouse((min(N - 1, max(0, e.y // self.scale)), min(N - 1, max(0, e.x // self.scale))))
+
+    def on_click(self, e):
+        """Model mode: clicking within 8 cells of a totem builds / removes its village (songs unchanged)."""
+        if not isinstance(self.src, ModelSource) or not self.src.totems:
+            return
+        y, x = min(N - 1, max(0, e.y // self.scale)), min(N - 1, max(0, e.x // self.scale))
+        r, c = self.idx_r[y, x], self.idx_c[y, x]
+        best = min(self.src.totems, key=lambda t: (t['row'] - r) ** 2 + (t['col'] - c) ** 2)
+        if (best['row'] - r) ** 2 + (best['col'] - c) ** 2 <= 64:
+            self.src.toggle_totem(best)
+            self.dirty = True
 
     def set_mouse(self, m):
         self.mouse = m
@@ -574,6 +681,17 @@ class App:
                 dr.line([cx - r, cy, cx + r, cy], fill=colour, width=2)
                 dr.line([cx, cy - r, cx, cy + r], fill=colour, width=2)
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=1)
+        tots = getattr(self.src, 'totems', None) if self.overlay else None
+        if tots and not isinstance(self.src, ModelSource):      # live: songs from the game's modifier list
+            tots = songs_from_modifiers([dict(t) for t in tots], getattr(self.src, 'other_modifiers', []))
+        if tots:
+            dr = ImageDraw.Draw(img)
+            for t in tots:
+                y, x = self.cell_to_disp[int(t['row']), int(t['col'])]
+                cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, 4 * self.scale
+                colour = (255, 205, 60) if t.get('built') else (150, 150, 150)
+                dr.rectangle([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
+                dr.text((cx + r + 2, cy + 2), totem_label(t), fill=colour)
         others = getattr(self.src, 'other_modifiers', []) if self.overlay else []
         if others:
             dr = ImageDraw.Draw(img)
@@ -634,8 +752,9 @@ class App:
                 cur = self.acc.get(k, np.zeros((N, N), np.float32)) * decay
                 self.acc[k] = np.maximum(cur, f(new)) if new is not None else cur
             self.dirty = self.dirty or new is not None or any(a.max() > 1e-3 for a in self.acc.values())
-        if id(getattr(self.src, 'sources', None)) != getattr(self, '_drawn_sources', None):
-            self._drawn_sources = id(getattr(self.src, 'sources', None))
+        sig = tuple(id(getattr(self.src, k, None)) for k in ('sources', 'totems', 'other_modifiers'))
+        if sig != getattr(self, '_drawn_sources', None):
+            self._drawn_sources = sig
             self.dirty = True
         if self.frame is not None and self.dirty:
             self.draw()
@@ -653,11 +772,13 @@ def main():
     ap.add_argument('--rotate', type=int, default=0, help='rotate by N x 90 degrees')
     ap.add_argument('--model', metavar='MAP', help='run the Python model from this map file instead of reading the game')
     ap.add_argument('--villages', metavar='T:N,...', help='with --model: villages built over time for the level script, e.g. "0:0,200:1,900:3"')
+    ap.add_argument('--progress', default='auto', metavar='auto|none|PATH',
+                    help="with --model: which totems have villages / repel songs: from the player's progress save of this level (auto), none, or a given save")
     a = ap.parse_args()
     root = tk.Tk()
     import level_schedule
     vil = level_schedule.parse_villages(a.villages) if a.villages else None
-    App(root, model_from_map(a.model, vil) if a.model else LiveGame(), a.scale, a.flip, a.rotate)
+    App(root, model_from_map(a.model, vil, a.progress) if a.model else LiveGame(), a.scale, a.flip, a.rotate)
     root.mainloop()
 
 

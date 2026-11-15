@@ -6,12 +6,14 @@ What is modelled:
 - rule lists (the level's top list and every Sequence, with their own clocks and looping); a rule arms
   once its clock passes Start, fires when all its conditions hold while clock < Start + Duration
   (Duration < 0: no deadline), once per run of its list;
-- conditions: CreatedVillagesCount (needs the player's village count over time: `villages`),
-  RandomTime (random wait MinTime..MaxTime, seeded); every other condition is False unless given in
-  `conditions` (name -> function(t) or bool);
+- conditions: CreatedVillagesCount (`villages` over time), Population / PopulationUnder (`population`:
+  number of humans), CheckVegetationNumberOnce (`vegetation`: cells covered by the counted species),
+  RandomTime (random wait MinTime..MaxTime, seeded); every other condition (statue/village specific,
+  knowledge, cinematics, ...) is False unless given in `conditions` (name -> function(t) or bool);
 - effects: FluidGenerator (Type 1 changes generator #index, Type 0 spawns a new one; switches it on
   with the settings, moves it if a cell is given; after Duration >= 0 seconds switches it off), Tide
-  (the border sea level cycle), Sequence; Wave / Tsunami / everything else are logged as events only;
+  (the border sea level cycle), Wave and Tsunami (edge profiles from the wave table, applied to the grid
+  with dustsim.apply_edges), Sequence; everything else is logged as an event only;
 - generators: mode 0 off, 1/2 on, 3 sphere-power only (off here); a generator switched on fades in over
   100 ticks; stored height and height mode are carried for the bury rule (dustsim.bury_activity); a
   script move of a height-mode-0 generator resets its stored height to the ground there (if `ground`
@@ -32,6 +34,28 @@ INGAME = os.path.join(ss.INSTALL, 'DUST', 'DustSave', 'Ingame')
 TYPETEST = {'<=': lambda a, b: a <= b, '<': lambda a, b: a < b, '==': lambda a, b: a == b,
             '>': lambda a, b: a > b, '>=': lambda a, b: a >= b}
 FADE_TICKS = 100
+SIDE = {2: 0, 4: 1, 6: 2, 8: 3}                          # effect Direction -> wave manager edge (dustai jump tables)
+_WAVE_TABLE = None
+
+
+def wave_table():
+    """The 32 x 512 wave table (wave_A.tga in Wor_BD00993D.lin.bf; the only wave template, TemplateID 0):
+    value = grey / 255, rows = animation frames. Frame order assumed top row first (the TGA is stored
+    bottom-up; which way the engine reads it is not traced)."""
+    global _WAVE_TABLE
+    if _WAVE_TABLE is None:
+        import numpy as np
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'waves', 'wave_A.tga')
+        if not os.path.exists(p):
+            import bf
+            arc = os.path.join(ss.INSTALL, 'BinPC', 'Wor_BD00993D.lin.bf')
+            e = [x for x in bf.read_index(arc) if x['name'] == 'wave_A.tga'][0]
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, 'wb').write(open(arc, 'rb').read()[e['offset']:e['offset'] + e['size']])
+        b = open(p, 'rb').read()
+        px = np.frombuffer(b[18:18 + 512 * 32 * 4], np.uint8).reshape(32, 512, 4)[::-1, :, 2]
+        _WAVE_TABLE = px.astype(np.float32) / np.float32(255)
+    return _WAVE_TABLE
 
 
 class Generator:
@@ -72,13 +96,15 @@ class RuleList:
 
 
 class LevelSchedule:
-    def __init__(self, level, villages=None, conditions=None, seed=1, border_level=None):
+    def __init__(self, level, villages=None, conditions=None, seed=1, border_level=None, population=None, vegetation=None):
         path = level if level.lower().endswith('.sav') else os.path.join(INGAME, level + '.sav')
         _, u = sav.read_sav(path)
         self.gens = {g['index']: Generator(g) for g in ss.generators(u)}
         self.spawned = []                                 # generators spawned by Type-0 effects
         self.root = RuleList(ss.find_root(u), playing=True)
         self.villages = villages or (lambda t: 0)
+        self.population = population or (lambda t: 0)      # number of humans (dustai counts type 0x10080001)
+        self.vegetation = vegetation or (lambda t: 0)      # cells covered by the counted plant species
         self.conditions = conditions or {}
         self.rng = random.Random(seed)
         self.time = 0.0
@@ -90,6 +116,8 @@ class LevelSchedule:
             border_level = float(lay(0)[5, 5] + lay(1)[5, 5])
         self.border_level = border_level
         self.tide = None
+        self.waves = []                                   # active Wave / Tsunami objects
+        self.profiles = {}                                # this tick's edge profiles {side: 512 floats}
         self.lists = [self.root]
 
     # ---------------------------------------------------------------- conditions
@@ -108,6 +136,12 @@ class LevelSchedule:
         if name == 'RandomTime':
             st['t'] += dt
             return st['t'] > st['wait']
+        if name == 'CheckVegetationNumberOnce' and 'cells' in c:
+            return self.vegetation(t) >= c['cells']
+        if name == 'Population' and 'population' in c:
+            return self.population(t) >= c['population']
+        if name == 'PopulationUnder' and 'population' in c:
+            return self.population(t) < c['population']
         v = self.conditions.get(name, False)
         return bool(v(t) if callable(v) else v)
 
@@ -160,7 +194,16 @@ class LevelSchedule:
             self._log('Tide starts: -%g over %gs, low %gs, rise %gs, high %gs' % (e['amplitude'], e['transition_duration'], e['low_duration'],
                                                                                   e['transition_duration'], e['high_duration']))
             return
-        self._log('%s (not simulated)%s' % (ss.describe_effect(e, []), ''))
+        if name == 'Wave' and e.get('direction') in SIDE:
+            self.waves.append(dict(kind='wave', side=SIDE[e['direction']], amp=e['amplitude'], dur=e['cycle_duration'],
+                                   cycle=e['cycle'], t=0.0, life=e['duration'], age=0.0))
+            self._log(ss.describe_effect(e, []))
+            return
+        if name in ('Tsunami', 'RandomTsunami') and e.get('direction') in SIDE:
+            self.waves.append(dict(kind='tsunami', side=SIDE[e['direction']], amp=e['amplitude'], dur=e['duration'], t=0.0))
+            self._log(ss.describe_effect(e, []))
+            return
+        self._log('%s (not simulated)' % ss.describe_effect(e, []))
 
     def _tick_effects(self, dt):
         keep = []
@@ -230,6 +273,7 @@ class LevelSchedule:
         self.lists = [l for l in self.lists if l.playing or l is self.root]
         self._tick_effects(dt)
         self._tick_tide(dt)
+        self._tick_waves(dt)
         for g in list(self.gens.values()) + self.spawned:
             if g.on() and g.fade < FADE_TICKS:
                 g.fade += 1
@@ -242,6 +286,38 @@ class LevelSchedule:
             g = by.get(s.get('index'))
             if g is not None and 'z' in s:
                 g.z = s['z']
+
+    def _tick_waves(self, dt):
+        """Advance waves / tsunamis and build this tick's edge profiles (dustai 0x10110E40 / 0x10110B40):
+        phase = t / duration x 32, frame = min(int(phase), 30), buffer[j] += A x lerp(row f, row f+1,
+        phase - f)[j + 33] for j < 446; waves loop (t -= duration when Cycle), tsunamis play once."""
+        import numpy as np
+        self.profiles = {}
+        if not self.waves:
+            return
+        tab = wave_table()
+        keep = []
+        for w in self.waves:
+            if w['kind'] == 'wave':
+                if w['life'] >= 0 and w['age'] >= w['life']:
+                    continue
+                w['age'] += dt
+                if w['t'] >= w['dur']:
+                    if not w['cycle']:
+                        continue
+                    w['t'] -= w['cycle'] * w['dur']
+            elif w['t'] >= w['dur']:
+                self._log('tsunami on edge %d ended' % w['side'])
+                continue
+            ph = w['t'] / w['dur'] * 32
+            f = min(int(ph), 30)
+            fr = np.float32(ph - f)
+            row = tab[f, 33:479] + (tab[f + 1, 33:479] - tab[f, 33:479]) * fr
+            buf = self.profiles.setdefault(w['side'], np.zeros(512, np.float32))
+            buf[:446] += np.float32(w['amp']) * row
+            w['t'] += dt
+            keep.append(w)
+        self.waves = keep
 
     def sources(self):
         return [g.as_source() for g in list(self.gens.values()) + self.spawned if g.on() and g.rate != 0]

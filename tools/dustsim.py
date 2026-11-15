@@ -379,3 +379,29 @@ def repulse_fluid(G, col, row, radius, amount, mode, skip=SKIP):
     new = np.where(tot > cap, new * (cap / np.where(tot > 0, tot, 1)), new)
     region = F[:, r0:r1 + 1, c0:c1 + 1]
     region[:, inside] = np.rint(new[:, inside]).astype(region.dtype)
+
+
+EDGE_LINE = (36, 476)      # the wave manager writes the line 36 cells in from each edge, cells 36..475
+
+
+def edge_cells(side):
+    """(ys, xs) of the 440 cells the wave manager walks on edge `side`, in buffer order i = 36..475
+    (dustai 0x10111351..): 0 = column 36 (y = i), 1 = row 476 (x = i), 2 = column 476 (y = 512 - i),
+    3 = row 36 (x = 512 - i)."""
+    i = np.arange(36, 476)
+    if side == 0:
+        return i, np.full_like(i, 36)
+    if side == 1:
+        return np.full_like(i, 476), i
+    if side == 2:
+        return 512 - i, np.full_like(i, 476)
+    return np.full_like(i, 36), 512 - i
+
+
+def apply_edges(G, border_level, profiles):
+    """Waves / tsunamis (dustai wave manager 0x10111250): for every edge with an active wave, set the fluid
+    of its line cells to max(border level - ground, 0) + profile[i]. profiles: {side: 512 floats}."""
+    W, T = G['W'], G['T']
+    for side, prof in profiles.items():
+        ys, xs = edge_cells(side)
+        W[ys, xs] = (np.maximum(np.float32(border_level) - T[ys, xs], 0) + prof[36:476]).astype(np.float32)

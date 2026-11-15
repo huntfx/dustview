@@ -125,6 +125,36 @@ def read_modifier_list(p, vec, settle=0.03):
     return out
 
 
+# ---------------------------------------------------------------- totems (DustAi::Statue / DustAi::Village)
+STATUE_VTABLES = (0x1015B470, 0x1015B460)     # +0, +4 of a Statue object (preferred VAs)
+VILLAGE_VTABLES = (0x1015BEE0, 0x1015BED0)    # +0, +4 of a Village object
+
+
+def totems(p, delta=None):
+    """Live totems: statue objects (+0x54 handle ID, +0x144/+0x148 grid cell, +0x1B0 power index) and
+    their Village objects (+0x238 statue handle; +0x2C4 = 1 on the one totem without a built village on
+    Map 12, so built = (+0x2C4 == 0): inferred from one level). The class-default object is skipped."""
+    delta = dustai_delta(p) if delta is None else delta
+    out = {}
+    for a in p.find(struct.pack('<2I', STATUE_VTABLES[0] + delta, STATUE_VTABLES[1] + delta)):
+        raw = p.read(a, 0x228)
+        if raw is None:
+            continue
+        hid = struct.unpack_from('<I', raw, 0x54)[0]
+        col, row = struct.unpack_from('<2I', raw, 0x144)
+        if hid in (0xFFFFFFFE, 0xFFFFFFFF) or not (0 < col < 512 and 0 < row < 512):
+            continue
+        out[hid] = dict(id='%X' % hid, col=col, row=row, power=struct.unpack_from('<I', raw, 0x1B0)[0], built=False)
+    for a in p.find(struct.pack('<2I', VILLAGE_VTABLES[0] + delta, VILLAGE_VTABLES[1] + delta)):
+        raw = p.read(a, 0x2C8)
+        if raw is None:
+            continue
+        sid = struct.unpack_from('<I', raw, 0x238)[0]
+        if sid in out:
+            out[sid]['built'] = struct.unpack_from('<I', raw, 0x2C4)[0] == 0
+    return list(out.values())
+
+
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
     p = memscan.Proc()

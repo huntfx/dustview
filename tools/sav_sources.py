@@ -132,6 +132,157 @@ def _generator_entries(u, items):
     return out
 
 
+STATUE_MANAGER = re.compile(re.escape(struct.pack('>2I', 0x10200007, 28) + BEG + bytes(4)) + b'....' +
+                            re.escape(struct.pack('>I', 511)), re.S)
+
+
+def statues(u):
+    """The level's totems (dustai DustAi::Statue; manager tag 0x10200007, entries 0x20200007, 552 bytes):
+    handle (class, index, serial: the ID the script's statue conditions use, e.g. "110804AC"), world
+    position -> grid cell, and the words after the 5 slot blocks: u32 1026, u32 `power`, u32 ?, f32
+    height (meaning of `power` inferred: it differs per statue, and each totem grants a power)."""
+    m = STATUE_MANAGER.search(u)
+    if not m:
+        return []
+    _, _, p = block(u, m.start() + 4)
+    items = None
+    for k in range(p, p + 0x800, 4):                        # the list follows a run of per-manager words
+        try:
+            c, e, _ = block(u, k)
+            cand = counted(u, c + 8)[0]
+        except (ValueError, struct.error):
+            continue
+        if cand and all(u32(u, block(u, a)[0]) == 0x20200007 for a, b in cand):
+            items = cand
+            break
+    out = []
+    for oc, oe in items or []:
+        ic, ie, _ = block(u, oc)
+        hc, _, q = block(u, ic + 4)
+        _, cls, index, serial = struct.unpack_from('>4I', u, hc)
+        pc, _, q = block(u, q)
+        x, y, z = struct.unpack_from('>3f', u, pc)
+        for _ in range(4):                                  # rotation/scale-like blocks and two handles
+            _, _, q = block(u, q)
+        q += 4                                              # u32 0
+        _, _, q = block(u, q)                               # the 5 slots
+        _, _, q = block(u, q)                               # [0]
+        w1026, power, w3 = struct.unpack_from('>3I', u, q)
+        height = f32(u, q + 12)
+        out.append(dict(index=index, cls=cls, id=handle_id(cls, index, serial), world=(x, y, z),
+                        col=int(256 + x * 2 / 3), row=int(256 + y * 2 / 3), height=height, power=power,
+                        w1026=w1026, w3=w3))
+    return out
+
+
+
+# ---------------------------------------------------------------- villages and their repel songs (progress saves)
+# Level files have none of these; a player's progress save (Documents\Dust\DustSave\profile_NN\ingame# MAP_xx.SAV, xx = story level - 1) has one village entry per built totem and one entry per learned song.
+VILLAGE_TAG, REPEL_WATER_TAG, REPEL_LAVA_TAG = 0x20800001, 0x20400009, 0x2040000A
+PROGRESS_DIR = os.path.expanduser(r'~\Documents\Dust\DustSave')
+
+
+def _entry_start(u, tag):
+    """Offsets just after each entry tag (the handle block follows)."""
+    return [m.start() + 4 for m in re.finditer(re.escape(struct.pack('>I', tag)), u)]
+
+
+def villages(u):
+    """Built villages (DustAi::Village, manager 0x10800001, entries 0x20800001): handle index, grid cell,
+    building and human counts, and the index of the statue (totem) they belong to. The class-default
+    entry (statue index 511, no buildings) is skipped."""
+    out = []
+    for p in _entry_start(u, VILLAGE_TAG):
+        try:
+            hc, _, p = block(u, p)
+            index = u32(u, hc + 8)
+            pc, _, p = block(u, p)
+            x, y, _z = struct.unpack_from('>3f', u, pc)
+            for _ in range(4):                                  # direction, ?, two handles
+                _, _, p = block(u, p)
+            p += 4                                              # u32 0
+            _, _, p = block(u, p)                               # 5 slots
+            _, _, p = block(u, p)                               # [0]
+            p += 12                                             # 3 words (18, 0, 0x41980000)
+            bc, _, p = block(u, p)
+            buildings = u32(u, bc)
+            p += 8                                              # f32 timer, u32 80
+            sc, _, p = block(u, p)
+            statue = u32(u, sc + 8)
+            _, _, p = block(u, p)                               # [0]
+            mc, _, p = block(u, p)
+            humans = u32(u, mc)
+        except (ValueError, struct.error):
+            continue
+        if statue == 511:
+            continue
+        out.append(dict(index=index, col=int(256 + x * 2 / 3), row=int(256 + y * 2 / 3), statue=statue,
+                        buildings=buildings, humans=humans))
+    return out
+
+
+def repel_songs(u):
+    """Learned repel songs (entities 0x20400009 = repels water, 0x2040000A = repels lava): grid cell,
+    f32 size (40 water / 35 lava seen) and the index of the village holding it. In the game each one adds
+    a RepulseFluid modifier at its cell every tick (dustai 0x10134AC0 / 0x10135210): water radius =
+    trunc(size x 2/3) (26), lava radius = size x 2/3 (23.33). Class-default entries are skipped."""
+    out = []
+    for tag, kind in ((REPEL_WATER_TAG, 'water'), (REPEL_LAVA_TAG, 'lava')):
+        for p in _entry_start(u, tag):
+            try:
+                _, _, p = block(u, p)
+                pc, _, p = block(u, p)
+                x, y, _z = struct.unpack_from('>3f', u, pc)
+                for _ in range(4):
+                    _, _, p = block(u, p)
+                p += 4
+                _, _, p = block(u, p)                           # [0]
+                _, _, p = block(u, p)                           # list of cells
+                size = f32(u, p + 12)
+                vc, _, p = block(u, p + 24)
+                village = u32(u, vc + 8)
+            except (ValueError, struct.error):
+                continue
+            if village == 511:
+                continue
+            out.append(dict(kind=kind, col=int(256 + x * 2 / 3), row=int(256 + y * 2 / 3), size=size, village=village))
+    return out
+
+
+def song_radius(kind, size):
+    return float(int(size * 2 / 3)) if kind == 'water' else size * 2 / 3
+
+
+def progress_totems(u):
+    """Per totem of a progress save: statue index -> dict(built, water, lava) with the repel radii (0 = none)."""
+    vil = {v['index']: v for v in villages(u)}
+    out = {t['index']: dict(built=False, water=0.0, lava=0.0) for t in statues(u)}
+    for v in vil.values():
+        out.setdefault(v['statue'], dict(built=False, water=0.0, lava=0.0))['built'] = True
+    for s in repel_songs(u):
+        v = vil.get(s['village'])
+        if v is not None:
+            out[v['statue']][s['kind']] = song_radius(s['kind'], s['size'])
+    return out
+
+
+def find_progress_save(level_statues, root=PROGRESS_DIR):
+    """The player's progress save for the level whose totems are `level_statues` (matched by totem
+    positions), newest first if several profiles match; None if there is none."""
+    import glob
+    key = sorted((t['col'], t['row']) for t in level_statues)
+    if not key:
+        return None
+    hits = []
+    for path in glob.glob(os.path.join(root, 'profile_*', 'ingame', 'MAP_*.SAV')):
+        try:
+            _, u = sav.read_sav(path)
+        except Exception:
+            continue
+        if sorted((t['col'], t['row']) for t in statues(u)) == key:
+            hits.append((os.path.getmtime(path), path))
+    return max(hits)[1] if hits else None
+
 def sources(u):
     """Backwards-compatible name: the generator list."""
     return generators(u)
@@ -188,6 +339,10 @@ def condition(u, a, b):
         d.update(villages=u32(u, q + 8), test=TYPETEST.get(i32(u, q + 12), i32(u, q + 12)))
     elif name == 'RandomTime' and b - q >= 28:
         d.update(min_time=f32(u, q + 20), max_time=f32(u, q + 24))
+    elif name == 'CheckVegetationNumberOnce' and b - q >= 16:
+        d.update(cells=u32(u, q + 8), keep_evaluated=u32(u, q + 12))
+    elif name in ('Population', 'PopulationUnder') and b - q >= 12:
+        d.update(population=u32(u, q + 8))
     return d
 
 
@@ -245,6 +400,12 @@ def describe_conditions(r):
             out.append('villages built %s %d' % (c['test'], c['villages']))
         elif 'min_time' in c:
             out.append('random wait %g-%gs' % (c['min_time'], c['max_time']))
+        elif 'cells' in c:
+            out.append('vegetation covers >= %d cells' % c['cells'])
+        elif c['name'] == 'Population' and 'population' in c:
+            out.append('population >= %d' % c['population'])
+        elif c['name'] == 'PopulationUnder' and 'population' in c:
+            out.append('population < %d' % c['population'])
         else:
             out.append(c['name'])
     return out
@@ -315,6 +476,10 @@ def main():
         print('  #%-2d %-5s col %3d row %3d radius %4.1f rate %7.4f sediment %.2f temperature %6.2f | mode %d (%s) | height mode %d (%s) | f10 %g flag11 %d | id %s | words %s' % (
             g['index'], g['kind'], g['col'], g['row'], g['radius'], g['rate'], g['sediment'], g['temperature'],
             g['mode'], MODES.get(g['mode'], '?'), g['height_mode'], HEIGHT_MODES.get(g['height_mode'], '?'), g['f10'], g['flag11'], g['id'], g['words']))
+    sts = statues(u)
+    print('%d totems (statues):' % len(sts))
+    for t in sts:
+        print('  #%-2d col %3d row %3d | power %d | id %s | words %d %d height %.2f' % (t['index'], t['col'], t['row'], t['power'], t['id'], t['w1026'], t['w3'], t['height']))
     root = find_root(u)
     if not root:
         print('no level script found')
