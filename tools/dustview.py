@@ -21,9 +21,11 @@ tabs Map (pick a level, then start it fresh or load one of its saves from any pr
 speed, villages) and View (views, overlays, flip / rotate, zoom, screenshot). Without a running game the
 viewer opens empty. The keys below do the same; the panel follows them.
 
-Keys
-  1 natural   2 height   3 water depth   4 lava temperature   5 sediment   6 flow speed   8 flow texture inputs
-  7 unexplained changes (live only): a background thread takes two consecutive game states, runs the
+Views (panel only): natural, height, water depth, lava temperature, sediment, flow speed, unexplained
+  changes, engine texture (a dropdown of the engine's map-sized textures: the per-frame water upload,
+  WaterParams with / without the edge fade, UV drag, edge masks, the level's colmap, grid layers incl. the
+  raw vegetation / fire components; tools/engine_textures.py).
+  Unexplained changes (live only): a background thread takes two consecutive game states, runs the
     game's own step (DLL via the simstep helper; Python if that fails) plus the known sources on the
     first and subtracts the result from the game's second state. What is left was done outside the
     simulation (creatures, volcanoes, waves, powers, script changes, unknown sources). Cyan = fluid
@@ -45,7 +47,6 @@ Keys
   F  flow texture on/off (natural view): the game's water rendering rules and constants as logged from
      the running game (tools/flowtex.py): ripple + foam textures dragged along the net outflow, foam =
      blurred 2 x |velocity|.
-  8  flow texture inputs; press 8 again to cycle: foam factor / velocity (hue = direction) / texture drag
   D  terrain-change markers on/off (live only): terrain that changes in dry areas between frames,
      i.e. not caused by the simulation (moving dips, scripted terrain, powers). Magenta = lowered,
      yellow = raised; markers fade over 8 s; every spot is also logged to data/live/terrain_events_*.log
@@ -706,8 +707,9 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
 
 # ---------------------------------------------------------------- rendering
 LIGHT = np.array([-0.6, -0.6, 0.55]) / np.linalg.norm([-0.6, -0.6, 0.55])
-VIEWS = {'1': 'natural', '2': 'height', '3': 'water depth', '4': 'lava temperature', '5': 'sediment', '6': 'flow speed',
-         '7': 'unexplained changes', '8': 'flow texture inputs'}
+VIEWS = ('natural', 'height', 'water depth', 'lava temperature', 'sediment', 'flow speed', 'unexplained changes',
+         'engine texture')                      # engine texture: one of engine_textures.ENTRIES (App.texture)
+FLOW_TEXTURES = ('wp_velocity', 'wp_foam', 'uv_drag')   # engine textures that need the running flow layer
 
 
 def ramp_colours(x, stops):
@@ -815,7 +817,7 @@ class App:
         self.view, self.overlay = 'natural', True
         self.flow_on, self.flow, self.flow_drawn = True, None, 0.0
         self.flow_time, self.flow_clock = 0.0, time.time()   # flow texture time: runs with the simulation
-        self.flow_debug = 0
+        self.texture, self.tex_read = 'wp_foam_nofade', None   # engine texture view: entry, cell readout
         self.show_events, self.events = True, []        # (time, row, col, cells, total)
         self.acc, self.acc_time, self.acc_tick = {}, time.time(), None   # view 7 accumulators
         self.frame = None
@@ -871,15 +873,18 @@ class App:
         return isinstance(self.src, ModelSource)
 
     def set_view(self, view):
-        if view == 'flow texture inputs' and self.view == view:
-            self.flow_debug = (self.flow_debug + 1) % 3      # 8 again: next input
         self.view = view
         if view == 'unexplained changes':
             if hasattr(self.src, 'enable_explain'):
                 self.src.enable_explain()
             else:
-                self.say('view 7 needs the live game (it compares the game with its own step)')
+                self.say('the unexplained-changes view needs the live game (it compares the game with its own step)')
         self.dirty = True
+
+    def set_texture(self, key):
+        """Show one of the engine's map-sized textures (engine_textures.ENTRIES)."""
+        self.texture = key
+        self.set_view('engine texture')
 
     def set_flip(self, flip):
         self.flip = flip; self._make_index(); self.dirty = True
@@ -973,9 +978,7 @@ class App:
         if e.widget.winfo_class() in ('TCombobox', 'Entry', 'TEntry', 'Listbox'):
             return                                       # typing into a panel field
         k = e.keysym.lower()
-        if e.char in VIEWS:
-            self.set_view(VIEWS[e.char])
-        elif k == 'o':
+        if k == 'o':
             self.overlay = not self.overlay
         elif k == 'f':
             self.flow_on = not self.flow_on
@@ -1052,15 +1055,18 @@ class App:
 
     def draw(self):
         fr = self.frame
-        if self.view in ('natural', 'flow texture inputs') and (self.flow is None or self.flow.s != self.scale):
+        flow_tex = self.view == 'engine texture' and self.texture in FLOW_TEXTURES
+        if (self.view == 'natural' or flow_tex) and (self.flow is None or self.flow.s != self.scale):
             import flowtex
             self.flow = flowtex.FlowLayer(N, self.scale)
         if self.flow is not None:
             self.flow.set_level(level_number(self.src))
-        if self.view == 'flow texture inputs':
-            self.flow.update(fr.water, fr.flux, self.flow_time, fr.lava)
-            rgb = self.flow.debug_image(self.flow.DEBUG_MODES[getattr(self, 'flow_debug', 0)], fr.water)
-            self.flow_drawn = time.time()
+        if self.view == 'engine texture':
+            import engine_textures
+            if flow_tex:
+                self.flow.update(fr.water, fr.flux, self.flow_time, fr.lava)
+                self.flow_drawn = time.time()
+            rgb, self.tex_read = engine_textures.image(self.texture, fr, self.flow if flow_tex else None, level_number(self.src))
         else:
             rgb = render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else render(fr, self.view)
         if self.flow_on and self.view == 'natural':
@@ -1143,12 +1149,9 @@ class App:
             fps = len(self.fps) / max(self.fps[-1] - self.fps[0], 1e-6) if len(self.fps) > 1 else 0
             border = fr.params[31] if fr.params is not None else float('nan')
             recent = [e for e in self.events if time.time() - e[0] < 8]
-            if self.view == 'flow texture inputs' and self.flow is not None:
-                mode = self.flow.DEBUG_MODES[getattr(self, 'flow_debug', 0)]
-                lines.append('flow texture input (8 again = next): %s | %s' % (mode, {
-                    'foam': 'foam factor 0..1, black -> white (x the foam texture = the foam you see)',
-                    'velocity': 'colour = direction, brightness = speed (full at ~11 cells/s)',
-                    'drag': 'how far the texture has been dragged (white >= 60 cells); grows over 10 s, resets per layer'}[mode]))
+            if self.view == 'engine texture':
+                import engine_textures
+                lines.append('engine texture: %s' % engine_textures.LABELS.get(self.texture, self.texture))
             lines.append('tick %d | viewer %.1f fps | border water level %.2f | water %.0f, lava %.0f in total | terrain changes outside the sim (8 s): %d lowered, %d raised (D)' % (
                 fr.tick, fps, border, fr.water.sum(), fr.lava.sum(), sum(e[4] < 0 for e in recent), sum(e[4] > 0 for e in recent)))
             if self.mouse is not None:
@@ -1161,6 +1164,8 @@ class App:
                     fluid = 'dry'
                 lines.append('col %d row %d | ground %.2f (soft %.2f, hard %.2f) | %s | outflow L %.2f R %.2f U %.2f D %.2f' % (
                     c, r, fr.ground[r, c], fr.soft[r, c], fr.ground[r, c] - fr.soft[r, c], fluid, *fr.flux[:, r, c]))
+                if self.view == 'engine texture' and self.tex_read is not None:
+                    lines.append('texture here: ' + self.tex_read(r, c))
                 ex = getattr(self.src, 'explained', None)
                 if self.view == 'unexplained changes' and ex is not None:
                     lines.append('unexplained at this cell (tick %d): ground %+.4f, fluid %+.4f' % (ex['tick'], ex['dT'][r, c], ex['dF'][r, c]))
@@ -1214,7 +1219,7 @@ class App:
         rate = self.flow_rate()
         self.flow_time += min(now - self.flow_clock, 0.25) * rate
         self.flow_clock = now
-        if rate and ((self.flow_on and self.view == 'natural') or self.view == 'flow texture inputs') and now - self.flow_drawn > self.FRAME * 0.9:
+        if rate and ((self.flow_on and self.view == 'natural') or (self.view == 'engine texture' and self.texture in FLOW_TEXTURES))                 and now - self.flow_drawn > self.FRAME * 0.9:
             self.dirty = True                    # keep the flow texture moving (not while paused)
         sig = tuple(id(getattr(self.src, k, None)) for k in ('sources', 'totems', 'other_modifiers'))
         if sig != getattr(self, '_drawn_sources', None):

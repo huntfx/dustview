@@ -198,6 +198,61 @@ def _blur(a, passes=6):
 
 
 _COLMAP_CACHE = {}
+_TEX_ARCHIVE = {}
+_TEX_CACHE = {}
+
+
+def level_texture_archive(level):
+    """The level's texture archive BinPC/Tex_<id>.lin.bf (the Tex_ twin of the Wor_<id> archive holding
+    NN.wor), or None. level = story level number (1-13; no NN.wor exists for 7, nor for challenge maps)."""
+    if level not in _TEX_ARCHIVE:
+        out = None
+        try:
+            import glob
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import bf
+            binpc = os.path.dirname(TEX_BF)
+            for wor in glob.glob(os.path.join(binpc, 'Wor_*.lin.bf')):
+                if '%02d.wor' % level in [e['name'] for e in bf.read_index(wor)]:
+                    tex = os.path.join(binpc, os.path.basename(wor).replace('Wor_', 'Tex_'))
+                    out = tex if os.path.exists(tex) else None
+                    break
+        except Exception:
+            out = None
+        _TEX_ARCHIVE[level] = out
+    return _TEX_ARCHIVE[level]
+
+
+def level_texture_names(level):
+    """Names of the level's textures (*.PC.tdt, archive order, duplicates dropped); [] if none."""
+    tex = level_texture_archive(level) if level else None
+    if not tex:
+        return []
+    import bf
+    out = []
+    for e in bf.read_index(tex):
+        if e['name'].endswith('.PC.tdt') and e['name'] not in out:
+            out.append(e['name'])
+    return out
+
+
+def level_texture(level, name):
+    """One of the level's textures as RGBA uint8 (h, w, 4) (top mip), or None. Cached."""
+    key = (level, name)
+    if key not in _TEX_CACHE:
+        tex = level_texture_archive(level) if level else None
+        out = None
+        if tex:
+            try:
+                import bf, tdt
+                px, _ = tdt.decode(bf.read_entry(tex, name))
+                out = px[0]
+            except Exception:
+                out = None
+        if len(_TEX_CACHE) > 8:
+            _TEX_CACHE.clear()
+        _TEX_CACHE[key] = out
+    return _TEX_CACHE[key]
 
 
 def level_colmap(level):
@@ -206,26 +261,12 @@ def level_colmap(level):
     if level in _COLMAP_CACHE:
         return _COLMAP_CACHE[level]
     out = None
-    try:
-        import glob
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import bf, tdt
-        binpc = os.path.dirname(TEX_BF)
-        for wor in glob.glob(os.path.join(binpc, 'Wor_*.lin.bf')):
-            names = [e['name'] for e in bf.read_index(wor)]
-            if '%02d.wor' % level not in names:
-                continue
-            tex = os.path.join(binpc, os.path.basename(wor).replace('Wor_', 'Tex_'))
-            if not os.path.exists(tex):
-                continue
-            for e in bf.read_index(tex):
-                if e['name'].lower().startswith('colmap') and e['name'].endswith('.PC.tdt'):
-                    px, _ = tdt.decode(bf.read_entry(tex, e['name']))
-                    out = np.ascontiguousarray(px[0][..., 2].astype(np.float32) / 255)
-                    break
+    for name in level_texture_names(level):
+        if name.lower().startswith('colmap'):
+            px = level_texture(level, name)
+            if px is not None:
+                out = np.ascontiguousarray(px[..., 2].astype(np.float32) / 255)
             break
-    except Exception:
-        out = None
     _COLMAP_CACHE[level] = out
     return out
 

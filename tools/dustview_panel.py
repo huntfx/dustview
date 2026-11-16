@@ -3,19 +3,19 @@
 Everything here calls the same App actions as the keyboard shortcuts (shown in brackets), and `sync()`
 (called every frame) copies the App's state back into the widgets, so keys and panel never disagree.
 Layout: what is shown (live game or the Python model) and the live / takeover buttons always at the top,
-then tabs: Map (pick a level, then start it fresh or load one of its saves, all profiles), Model (pause, step, speed,
-villages), View (views, overlays, display).
+then tabs: Map (pick a level, then its empty map or one of its saves, all profiles), Model (pause, step, speed,
+villages), View (views incl. the engine-texture dropdown, overlays, display).
 """
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog
 import level_names
+import engine_textures
 
-VIEW_LABELS = (('1', 'natural', 'Natural'), ('2', 'height', 'Height'), ('3', 'water depth', 'Water depth'),
-               ('4', 'lava temperature', 'Lava temperature'), ('5', 'sediment', 'Sediment'),
-               ('6', 'flow speed', 'Flow speed'), ('7', 'unexplained changes', 'Unexplained changes (live)'),
-               ('8', 'flow texture inputs', 'Flow texture inputs'))
-FLOW_INPUTS = ('foam', 'velocity', 'drag')
+VIEW_LABELS = (('natural', 'Natural'), ('height', 'Height'), ('water depth', 'Water depth'),
+               ('lava temperature', 'Lava temperature'), ('sediment', 'Sediment'), ('flow speed', 'Flow speed'),
+               ('unexplained changes', 'Unexplained changes (live)'), ('engine texture', 'Engine texture:'))
+EMPTY_MAP = 'New (the level as shipped, no villages)'
 SPEED_LABELS = ((1, '1x'), (2, '2x'), (4, '4x'), (0, 'max'))
 
 
@@ -41,28 +41,28 @@ class ControlPanel:
         tab_map, tab_model, tab_view = (self._tab(t) for t in ('Map', 'Model', 'View'))
         self.tabs.bind('<<NotebookTabChanged>>', lambda e: self.root.focus_set())
 
-        # ---- map: pick a level, then start it fresh or load one of its saves
-        box = self._section('Level', tab_map)
+        # ---- map: pick a level, then its empty map or one of its saves
+        box = self._section('Map', tab_map)
         self.levels = dv.level_names()
         self.saves = dv.player_saves()
         self.level_labels = {}                       # shown text -> file name
         for n in self.levels:
-            k = sum(1 for d in self.saves if d['level'] == n)
-            self.level_labels[level_names.label(n) + ('   [%d save%s]' % (k, 's' * (k != 1)) if k else '')] = n
+            self.level_labels[level_names.label(n)] = n
+        row = ttk.Frame(box); row.pack(fill='x')
+        ttk.Label(row, text='Level:').pack(side='left')
         self.level = tk.StringVar(value=self._level_label(self._default_level()))
-        self._combo(box, self.level, list(self.level_labels), self._show_saves, width=40).pack(fill='x')
-        self._button(box, 'Start fresh (as shipped, no villages)', self._start_fresh).pack(anchor='w', pady=(4, 0))
-        ttk.Label(box, text='Saves of this level (all profiles, newest first):').pack(anchor='w', pady=(8, 0))
-        self.save_list = tk.Listbox(box, height=5, activestyle='none', exportselection=False, takefocus=0)
+        self._combo(row, self.level, list(self.level_labels), self._show_saves, width=32).pack(side='left', padx=(4, 0), fill='x', expand=True)
+        ttk.Label(box, text='Saves').pack(anchor='w', pady=(8, 0))
+        self.save_list = tk.Listbox(box, height=7, activestyle='none', exportselection=False, takefocus=0)
         self.save_list.pack(fill='x')
-        self.save_list.bind('<Double-Button-1>', lambda e: self._load_save())
+        self.save_list.bind('<Double-Button-1>', lambda e: self._load_selected())
         self.save_list.bind('<<ListboxSelect>>', lambda e: self.root.focus_set())
         row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
-        self.load_btn = self._button(row, 'Load save', self._load_save)
-        self.load_btn.pack(side='left')
+        self._button(row, 'Load', self._load_selected).pack(side='left')
         self._button(row, 'Open file...', self._open_file).pack(side='left', padx=(4, 0))
-        ttk.Label(box, text="A save is the map as it was left (terrain, water, lava, villages). Sources and the "
-                            "level script come from the level file; the script starts again from 0 s.",
+        ttk.Label(box, text="Saves of the chosen level from every profile, newest at the top; New = the level as shipped (double-click loads). A save "
+                            "is the map as it was left (terrain, water, lava, villages); sources and the level script "
+                            "come from the level file, and the script starts again from 0 s.",
                   wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
         self.shown_saves = []
         self._show_saves()
@@ -88,13 +88,12 @@ class ControlPanel:
         # ---- view
         box = self._section('Map view', tab_view)
         self.view = tk.StringVar(value=app.view)
-        for key, view, text in VIEW_LABELS:
-            self._radio(box, '%s  %s' % (key, text), self.view, view, lambda: app.set_view(self.view.get())).pack(anchor='w')
-        row = ttk.Frame(box); row.pack(fill='x', padx=(18, 0))
-        ttk.Label(row, text='input:').pack(side='left')
-        self.flow_input = tk.StringVar(value=FLOW_INPUTS[0])
-        self.flow_combo = self._combo(row, self.flow_input, FLOW_INPUTS, self._set_flow_input, width=10)
-        self.flow_combo.pack(side='left', padx=(4, 0))
+        for view, text in VIEW_LABELS:
+            self._radio(box, text, self.view, view, lambda: app.set_view(self.view.get())).pack(anchor='w')
+        self.tex_labels = [label for _, label in engine_textures.ENTRIES]
+        self.texture = tk.StringVar(value=engine_textures.LABELS[app.texture])
+        self.tex_combo = self._combo(box, self.texture, self.tex_labels, self._set_texture, width=40)
+        self.tex_combo.pack(fill='x', padx=(18, 0))
 
         # ---- overlays
         box = self._section('Show', tab_view)
@@ -159,10 +158,11 @@ class ControlPanel:
         setattr(self.app, attr, self.checks[attr].get())
         self.app.dirty = True
 
-    def _set_flow_input(self):
-        self.app.flow_debug = FLOW_INPUTS.index(self.flow_input.get())
-        self.app.set_view('flow texture inputs') if self.app.view != 'flow texture inputs' else None
-        self.app.dirty = True
+    def _set_texture(self):
+        i = self.tex_labels.index(self.texture.get())
+        while engine_textures.ENTRIES[i][0] == '--':          # a group header: take the first entry below it
+            i += 1
+        self.app.set_texture(engine_textures.ENTRIES[i][0])
 
     def _level_label(self, name):
         return next((k for k, v in self.level_labels.items() if v == name), name)
@@ -170,26 +170,24 @@ class ControlPanel:
     def _current_level(self):
         return self.level_labels.get(self.level.get(), self.level.get())
 
-    def _start_fresh(self):
-        self.app.load_level(self._current_level())
-
     def _show_saves(self):
-        """List the saves of the chosen level (all profiles)."""
+        """List the chosen level's saves (all profiles, newest at the top), then New (the empty map).
+        The newest save is selected (New when there are none)."""
         name = self._current_level()
         self.shown_saves = [d for d in self.saves if d['level'] == name]
         self.save_list.delete(0, 'end')
         for d in self.shown_saves:
             self.save_list.insert('end', d['label'])
-        if self.shown_saves:
-            self.save_list.selection_set(0)
-        else:
-            self.save_list.insert('end', '(no saves of this level)')
-        self._enable(self.load_btn, bool(self.shown_saves))
+        self.save_list.insert('end', EMPTY_MAP)
+        self.save_list.selection_set(0)
 
-    def _load_save(self):
+    def _load_selected(self):
         sel = self.save_list.curselection()
-        if self.shown_saves and sel and sel[0] < len(self.shown_saves):
-            self.app.load_save(self.shown_saves[sel[0]]['path'])
+        i = sel[0] if sel else len(self.shown_saves)
+        if i < len(self.shown_saves):
+            self.app.load_save(self.shown_saves[i]['path'])
+        else:
+            self.app.load_level(self._current_level())
 
     def _open_file(self):
         import sav_sources, compare_sim
@@ -233,8 +231,7 @@ class ControlPanel:
                 self.pause_btn.configure(text=label)
             self._put(self.speed, src.speed)
         self._put(self.view, app.view)
-        self._enable(self.flow_combo, app.view == 'flow texture inputs', readonly=True)
-        self._put(self.flow_input, FLOW_INPUTS[app.flow_debug % 3])
+        self._put(self.texture, engine_textures.LABELS.get(app.texture, app.texture))
         for attr, v in self.checks.items():
             self._put(v, bool(getattr(app, attr)))
         self._put(self.flip, bool(app.flip))
