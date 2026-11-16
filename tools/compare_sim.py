@@ -18,7 +18,13 @@ SAVES = os.path.join(g.INSTALL, 'DUST', 'DustSave', 'Ingame')
 
 
 def load_map(name):
-    _, u = sav.read_sav(os.path.join(SAVES, name + '.sav'))
+    return load_sav_grids(os.path.join(SAVES, name + '.sav'))
+
+
+def load_sav_grids(path):
+    """Ground, soft ground, fluid, sediment/temperature and the border values from any .sav (level
+    start file or a player's save: same layout)."""
+    _, u = sav.read_sav(path)
     layer = lambda k: np.frombuffer(u[0x80 + k * 0x100000:0x80 + (k + 1) * 0x100000], np.float32).reshape(512, 512).copy()
     T, W, So, C3 = layer(0), layer(1), layer(2), layer(3)      # .sav blocks: terrain, fluid, soft, temp/sediment
     border = (float(T[5, 5] + W[5, 5]), float(T[5, 5]), float(So[5, 5]))

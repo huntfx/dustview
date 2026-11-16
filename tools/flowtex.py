@@ -185,7 +185,13 @@ def _shade_uv(base, depth, lava, min_depth, s, D, strength, foamk, frame, foam, 
 
 
 def _blur(a, passes=6):
-    """The game's WaterParams blur as fitted: passes of a 4-neighbour average."""
+    """The game's WaterParams blur as fitted: passes of a 4-neighbour average (wrapping at the edges,
+    where the fields are faded to 0 anyway). Compiled in viewfast.blur (same sums in the same order)."""
+    try:
+        import viewfast
+        return viewfast.blur(a, passes)
+    except ImportError:
+        pass
     for _ in range(passes):
         a = 0.25 * (np.roll(a, 1, 0) + np.roll(a, -1, 0) + np.roll(a, 1, 1) + np.roll(a, -1, 1))
     return a

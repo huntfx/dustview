@@ -53,7 +53,7 @@ def _ramp(x, c, i):
     return c[i + 2] + t * c[i + 3]
 
 
-@numba.njit(parallel=True, cache=True)
+@numba.njit(parallel=True, nogil=True, cache=True)     # nogil: DustView's window keeps drawing meanwhile
 def _step(T0, So0, W0, sed0, F, c):
     N, M = T0.shape
     z, one = f32(0), f32(1)

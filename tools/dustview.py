@@ -16,6 +16,11 @@ bottom), which matches the game according to play; --no-flip shows grid row 0 at
 (tools/level_schedule.py: sources switching on/off/moving, the tide); --villages "0:0,200:1,900:3" gives
 the village counts the script checks. Waves and tsunamis drive the edge lines (wave table). No game needed.
 
+Control panel (right; tools/dustview_panel.py): source status with Live game / Continue in model, then
+tabs Map (start a level file, load one of the player's saves or open a .sav), Model (pause, step,
+speed, villages) and View (views, overlays, flip / rotate, zoom, screenshot). Without a running game the
+viewer opens empty. The keys below do the same; the panel follows them.
+
 Keys
   1 natural   2 height   3 water depth   4 lava temperature   5 sediment   6 flow speed   8 flow texture inputs
   7 unexplained changes (live only): a background thread takes two consecutive game states, runs the
@@ -25,14 +30,15 @@ Keys
     gained, orange = fluid lost, yellow = ground raised, magenta = ground lowered; fades with a 1.5 s
     half-life. A few cells are always left (rounding, the small-vent timing).
   M  switch to the Python model, starting from the state on screen (sources as last found)
-  L  switch back to the live game       Space  pause / resume the model
+  L  switch to the live game (found afresh)    Space  pause / resume the model    N  one model tick
   T  model speed: 1x the game's 31 ticks/s (default), 2x, 4x, as fast as possible (the level script's
      clock runs per tick, so tides and events speed up with it). The model step is compiled with numba
      (tools/dustsim_nb.py, bit-identical to dustsim.step_numpy): a tick takes ~7-11 ms.
   Click a totem (model mode) to build / remove its village. Villages count for the level script;
      repulsion comes from the village's learned songs (repel water: radius 26, repel lava: 23.33), not
-     from the totem; a village keeps the songs it has in the save / live game. Totems: gold = village. --model takes the
-     starting villages and songs from the player's progress save of the level (--progress auto|none|PATH).
+     from the totem; a village keeps the songs it has in the save / live game. Totems: gold = village. A level started with
+     --model or from the panel has no villages (as shipped); --progress auto|PATH takes them from a save.
+     Live: songs come from the song objects (the per-tick list has a song only while fluid is near it).
   O  overlays on/off: cyan spring, orange lava vent, violet water drain, dark red lava drain, grey = buried
      below 95% strength (labels show the amount applied per cell per tick, with % when reduced), white = RepulseFluid (village outposts: mode -1 pushes water, +1 lava; modelled)
   O  (toggle)          V  flip vertically     R  rotate 90 degrees
@@ -62,6 +68,10 @@ from PIL import Image, ImageTk, ImageDraw
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import memscan, galileo, live_check, live_generators, dustsim  # noqa: E402
 from live_sources import regions  # noqa: E402
+try:
+    import viewfast                     # compiled redraw helpers (numba)
+except ImportError:
+    viewfast = None
 
 N = 512
 GRID_BYTES = 8 * N * N * 4
@@ -77,14 +87,18 @@ class Frame:
         self.tick = tick
         self.ground = f(0)              # surface height including soft ground
         self.soft = f(1)                # soft ground thickness
-        fluid = f(2)
-        self.water = np.maximum(fluid, 0)
-        self.lava = np.maximum(-fluid, 0)
-        extra = f(3)
-        self.sediment = np.where(fluid > 0, extra, 0)
-        self.temperature = np.where(fluid < 0, extra, 0)
-        lr, ud = grid[4], grid[5]
-        self.flux = np.stack([lr & 0xFFFF, lr >> 16, ud & 0xFFFF, ud >> 16]).astype(np.float32) / 256
+        if viewfast is not None:        # water, lava, sediment, temperature, flux in one compiled pass
+            self.water, self.lava, self.sediment, self.temperature, self.flux = viewfast.frame_fields(
+                np.ascontiguousarray(grid, np.uint32))
+        else:
+            fluid = f(2)
+            self.water = np.maximum(fluid, 0)
+            self.lava = np.maximum(-fluid, 0)
+            extra = f(3)
+            self.sediment = np.where(fluid > 0, extra, 0)
+            self.temperature = np.where(fluid < 0, extra, 0)
+            lr, ud = grid[4], grid[5]
+            self.flux = np.stack([lr & 0xFFFF, lr >> 16, ud & 0xFFFF, ud >> 16]).astype(np.float32) / 256
         self.params = params
         self.terrain_events = []        # (row, col, cells, total change) for terrain changed outside the sim
         self.sources = list(sources)    # dicts with col, row, radius, rate, sediment, temperature
@@ -94,6 +108,10 @@ class Frame:
 def state_to_grid(G, like=None):
     """dustsim state dict -> (8, 512, 512) uint32 grid (components 6/7 copied from `like`)."""
     grid = np.zeros((8, N, N), np.uint32) if like is None else like.copy()
+    if viewfast is not None:
+        a = lambda k: np.ascontiguousarray(G[k], np.float32)
+        viewfast.pack_grid(a('T'), a('soft'), a('W'), a('sed'), np.ascontiguousarray(G['F'], np.int32), grid)
+        return grid
     for c, k in enumerate(('T', 'soft', 'W', 'sed')):
         grid[c] = np.asarray(G[k], np.float32).view(np.uint32)
     F = G['F'].astype(np.uint32)
@@ -102,12 +120,25 @@ def state_to_grid(G, like=None):
     return grid
 
 
-# Fluid repulsion at villages comes from the village's learned songs, not from the totem: a "repel water"
-# object (entity 0x20400009) adds RepulseFluid mode -1 with radius trunc(40 x 2/3) = 26, a "repel lava"
-# object (0x2040000A) mode +1 with radius 35 x 2/3 = 23.33, every tick (dustai 0x10134AC0 / 0x10135210).
-# A village can have none, one or both. Totem dicts carry built, water, lava (radius, 0 = no song).
+# Fluid repulsion at villages comes from the village's knowledge, not from the totem: a "repel water"
+# object (entity 0x20400009 ENTITY_KNOWLEDGE_I) adds RepulseFluid mode -1 with radius trunc(40 x 2/3) = 26,
+# a "repel lava" object (0x2040000A ENTITY_KNOWLEDGE_J) mode +1 with radius 35 x 2/3 = 23.33 (dustai
+# 0x10134AC0 / 0x10135210). The object exists only while fluid threatens the village (logged live: it
+# appears when water arrives, with a pulse, and is gone once the water is diverted), so saves and the live
+# song scan only show the ones active at that moment. Assumed: every village repels water (seen on every
+# village of Maps 3 and 10; possibly not on Map 2, not checked further); repel lava is per village. Totem
+# dicts carry built, water, lava (radius, 0 = none).
+# The model applies a known repel every tick: the same as the game's on-demand one except for the short
+# window before it triggers and the pulse (TODO in findings/water-lava-sim.md).
 SONG_RADIUS = {'water': 26.0, 'lava': 35 * 2 / 3}
 SONG_MODE = {'water': -1, 'lava': +1}
+def with_knowledge(totems, level=None):
+    """Give every totem the repel-water knowledge (assumption: all villages repel water; the exact rule
+    is in the game code, not read yet). Lava repel stays as found. Returns the totems (changed in place)."""
+    for t in totems:
+        if not t.get('water'):
+            t['water'] = SONG_RADIUS['water']
+    return totems
 
 
 def totem_repulsors(totems, extra=()):
@@ -146,6 +177,25 @@ def songs_from_modifiers(totems, entries, reach=8, mark_built=False):
 
 
 _LEVEL_TOTEMS = None
+
+
+def live_repulsors(src):
+    """A live game's RepulseFluid entries: the village song objects, every repel entry seen in the per-tick
+    list since connecting (LiveGame.seen_repulsors), and the list's other type-1 entries, without
+    duplicates. The game lists a repel only while fluid is near it (seen in play: a village repels water
+    only while water touches it), so the current list alone makes repels blink in and out; and the song
+    reader does not find every repel (Map 10: only p0's lava song, while p1 repels water in the list)."""
+    cands = [dict(s) for s in (getattr(src, 'songs', None) or [])]
+    cands += [dict(e) for e in (getattr(src, 'seen_repulsors', None) or {}).values()]
+    cands += [dict(e) for e in (getattr(src, 'other_modifiers', None) or [])]
+    same = lambda a, b: (abs(a['col'] - b['col']) < 1.5 and abs(a['row'] - b['row']) < 1.5
+                         and (a['f5'] < 0) == (b['f5'] < 0))
+    out = []
+    for e in cands:
+        if e.get('type') == 1 and any(o.get('type') == 1 and same(o, e) for o in out):
+            continue
+        out.append(e)
+    return out
 
 
 def level_number(src):
@@ -202,7 +252,11 @@ class LiveGame(Source):
         self.sources = []
         self.source_note = 'looking for sources...'
         self.paused = False
+        self.running = True
         threading.Thread(target=self._source_loop, daemon=True).start()
+
+    def stop(self):
+        self.running = False
 
     def _counter(self):
         return struct.unpack('<I', self.p.read(self.base + 0x92C, 4))[0]
@@ -270,7 +324,7 @@ class LiveGame(Source):
 
     def _explain_loop(self):
         times = []
-        while True:
+        while self.running:
             try:
                 cap = live_check.capture_pair(self.p, self.base)
             except SystemExit:
@@ -327,7 +381,7 @@ class LiveGame(Source):
         addresses. The list itself is read every frame (refresh_sources), so script switches, burying,
         fade-in and Jellify show up at once."""
         delta = None
-        while True:
+        while self.running:
             try:
                 delta = live_generators.dustai_delta(self.p) if delta is None else delta
                 gens = live_generators.generators(self.p, delta)
@@ -383,6 +437,10 @@ class LiveGame(Source):
                            z=g['stored_z'], bury_threshold=g['bury_threshold'])
             out.append(src)
         self.sources, self.other_modifiers, self.entries = out, other, entries
+        seen = self.__dict__.setdefault('seen_repulsors', {})   # repels stay known once seen (live_repulsors)
+        for e in other:
+            if e.get('type') == 1:
+                seen[(round(e['col']), round(e['row']), e['f5'] < 0)] = dict(e)
         self.source_note = '%d sources, %d other modifiers (live list)' % (len(out), len(other))
 
     def applied_sources(self):
@@ -394,6 +452,20 @@ class LiveGame(Source):
         state = 'paused' if self.paused else '%.0f ticks/s' % self.ticks_per_second()
         extra = (' | ' + self.explain_note) if getattr(self, '_explain_on', False) else ''
         return '%s | %s | %s%s' % (self.name, state, self.source_note, extra)
+
+
+class NoSource(Source):
+    """Nothing loaded yet (no game running): pick a map in the control panel."""
+    name = 'nothing loaded'
+
+    def __init__(self, note=''):
+        self.note = note
+
+    def read(self):
+        return None
+
+    def status(self):
+        return 'nothing loaded%s: start a level or a save from the panel' % (' (%s)' % self.note if self.note else '')
 
 
 class ModelSource(Source):
@@ -421,6 +493,7 @@ class ModelSource(Source):
         self.loose_repulsors = list(self.other_modifiers)   # repulsors that belong to no totem: kept as they are
         if self.totems:                          # villages + their songs define the repulsors and the village count
             self.loose_repulsors = songs_from_modifiers(self.totems, self.other_modifiers, mark_built=True)
+            with_knowledge(self.totems, level_number(self))
             self.other_modifiers = totem_repulsors(self.totems, self.loose_repulsors)
         if schedule is not None:
             schedule.villages = lambda t: sum(1 for x in self.totems if x.get('built'))
@@ -429,31 +502,40 @@ class ModelSource(Source):
     GAME_RATE = 31.0                             # the game's ticks per second
     SPEEDS = (1, 2, 4, 0)                        # key T cycles; 0 = as fast as possible
     speed = 1
+    step_req = 0                                 # ticks to run while paused (key N / Step button)
 
     def _loop(self):
         due = time.perf_counter()
         while self.running:
-            if self.paused:
-                time.sleep(0.05); due = time.perf_counter(); continue
-            if self.speed:                           # pace to speed x the game's rate
+            if self.paused and not self.step_req:
+                time.sleep(0.02); due = time.perf_counter(); continue
+            speed = self.speed                       # read once: the UI thread can change it meanwhile
+            if self.paused:                          # single step while paused (no pacing)
+                self.step_req -= 1
+            elif speed:                              # pace to speed x the game's rate
                 now = time.perf_counter()
                 if due - now > 0:
                     time.sleep(due - now)
-                due = max(due, time.perf_counter() - 0.25) + 1 / (self.GAME_RATE * self.speed)
+                due = max(due, time.perf_counter() - 0.25) + 1 / (self.GAME_RATE * speed)
             sch = self.schedule
+            srcs = self.sources
             if sch is not None:
                 sch.tick(1 / 31, ground=self.G['T'])
-                self.sources = sch.sources()
-                self.P['BorderWaterSurfaceHeight'] = sch.border_level
-            G = dustsim.tick(self.G, self.P, self.sources, self.other_modifiers)
+                srcs = sch.sources()                 # fresh dicts: 'activity' (burial) is set by the tick,
+                self.P['BorderWaterSurfaceHeight'] = sch.border_level   # so publish them only after it
+            G = dustsim.tick(self.G, self.P, srcs, self.other_modifiers)
             if sch is not None:
-                sch.write_back(self.sources)
+                sch.write_back(srcs)
                 if sch.profiles:
                     dustsim.apply_edges(G, sch.border_level, sch.profiles)
             with self.lock:
-                self.G, self.tick = G, self.tick + 1
+                self.G, self.tick, self.sources = G, self.tick + 1, srcs
                 now = time.time()
                 self.times = [t for t in self.times if now - t < 3] + [now]
+
+    def ticks_per_second(self):
+        times = self.times
+        return (len(times) - 1) / max(times[-1] - times[0], 1e-6) if len(times) > 1 else 0.0
 
     def read(self):
         with self.lock:
@@ -483,6 +565,7 @@ class ModelSource(Source):
         """Totems that arrived after the takeover (the live totem search finished later)."""
         self.totems = [dict(t) for t in totems]
         self.loose_repulsors = songs_from_modifiers(self.totems, self.loose_repulsors, mark_built=True)
+        with_knowledge(self.totems, level_number(self))
         self.other_modifiers = totem_repulsors(self.totems, self.loose_repulsors)
         if self.schedule is not None:
             self.schedule.villages = lambda t: sum(1 for x in self.totems if x.get('built'))
@@ -494,25 +577,95 @@ class ModelSource(Source):
         self.other_modifiers = totem_repulsors(self.totems, self.loose_repulsors)
 
 
-def model_from_map(name, villages=None, progress='auto'):
+def level_names():
+    """Level files in the game's DustSave/Ingame folder (story maps first, then the challenge maps)."""
+    import compare_sim, re
+    names = [f[:-4] for f in os.listdir(compare_sim.SAVES) if f.lower().endswith('.sav')]
+    def key(n):
+        m = re.match(r'ALPHA_Map(\d+)_', n)
+        return (0, int(m.group(1)), n) if m else (1, 0, n)
+    return sorted(names, key=key)
+
+
+def player_saves():
+    """The player's progress saves (Documents/Dust/DustSave/profile_*/ingame/MAP_nn.SAV, nn = story map
+    - 1): list of (path, label)."""
+    import glob, re, sav_sources
+    names = level_names()
+    out = []
+    for p in sorted(glob.glob(os.path.join(sav_sources.PROGRESS_DIR, 'profile_*', 'ingame', 'MAP_*.SAV'))):
+        m = re.match(r'MAP_(\d+)\.SAV$', os.path.basename(p), re.I)
+        lvl = [n for n in names if m and n.startswith('ALPHA_Map%d_' % (int(m.group(1)) + 1)) and 'Demo' not in n]
+        out.append((p, '%s  %s  %s  (%s)' % (os.path.basename(p)[:-4], lvl[0][6:] if lvl else '?',
+                                             time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(p))),
+                                             os.path.basename(os.path.dirname(os.path.dirname(p))))))
+    return out
+
+
+def level_for_save(path):
+    """The level file a player's save belongs to (its script, sources and border): MAP_nn = story map
+    nn+1; where several level files have that number (the Map2/Map3 demos share totem IDs and border
+    with the real levels) or the file is not named MAP_nn, the one whose hard ground (ground - soft)
+    matches the save in the most cells (play changes soft ground, water and lava, rarely hard ground:
+    MAP_02 matches Map3_Vallee in 97% of cells, Map3_Demo in 77%)."""
+    import re, compare_sim
+    names = level_names()
+    m = re.match(r'MAP_(\d+)\.SAV$', os.path.basename(path), re.I)
+    cands = [n for n in names if n.startswith('ALPHA_Map%d_' % (int(m.group(1)) + 1))] if m else names
+    if len(cands) == 1:
+        return cands[0]
+    T, So = compare_sim.load_sav_grids(path)[:2]
+    score = {}
+    for n in cands:
+        T2, So2 = compare_sim.load_map(n)[:2]
+        score[n] = float((np.abs((T - So) - (T2 - So2)) < 0.01).mean())
+    best = max(score, key=score.get) if score else None
+    if best is None or score[best] < 0.5:
+        raise ValueError('no level file matches %s (hard ground differs from every level)' % os.path.basename(path))
+    return best
+
+
+def progress_save_for(name):
+    """The player's newest save of story level `name` (MAP_nn.SAV, nn = map number - 1, checked with
+    level_for_save so the Map2/Map3 demo files get none). Totem positions are not used: totems can move
+    in play (Map 6's did), so sav_sources.find_progress_save's position match misses those saves."""
+    import re
+    m = re.match(r'ALPHA_Map(\d+)_', name)
+    if not m:
+        return None
+    want = 'MAP_%02d.SAV' % (int(m.group(1)) - 1)
+    hits = [p for p, _ in player_saves() if os.path.basename(p).upper() == want and level_for_save(p) == name]
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def model_from_save(path, villages=None):
+    """ModelSource starting from a player's save: its grids (terrain, water, lava as saved) and its
+    villages and songs, with the sources and script of the level it belongs to. The level script starts
+    from its beginning (the save's script state and the sources it had switched on are not read)."""
+    return model_from_map(level_for_save(path), villages, progress=path, grid_path=path)
+
+
+def model_from_map(name, villages=None, progress='none', grid_path=None):
     """ModelSource for a map's .sav: its start grids, border values and the generators that are on at
     the start (mode 1 or 2). Parameters are the game's normal set (galileo.fluid_params).
     progress: 'auto' = take which totems have a village and which villages know a repel song from the
     player's progress save of this level (found by totem positions), a path = that save, 'none' = no
-    villages. Only villages and songs are taken from it; the grid still comes from the level file."""
+    villages. Only villages and songs are taken from it; the grid comes from the level file, or from
+    grid_path (a player's save) if given."""
     import compare_sim, sav, sav_sources
-    T, So, W, C3, border = compare_sim.load_map(name)
+    T, So, W, C3, border = compare_sim.load_sav_grids(grid_path or os.path.join(compare_sim.SAVES, name + '.sav'))
     grid = np.zeros((8, N, N), np.uint32)
     for c, a in enumerate((T, So, W, C3)):
         grid[c] = a.astype(np.float32).view(np.uint32)
     _, u = sav.read_sav(os.path.join(compare_sim.SAVES, name + '.sav'))
     import level_schedule
     sch = level_schedule.LevelSchedule(name, villages=villages, border_level=border[0])
-    st = sav_sources.statues(u)
+    st = sav_sources.statues(sav.read_sav(grid_path)[1] if grid_path else u)   # a save: totems where they are now
     tot = {t['index']: dict(id=t['id'], col=t['col'], row=t['row'], power=t['power'], built=False, water=0.0, lava=0.0)
            for t in st}
     note = ''
-    path = sav_sources.find_progress_save(st) if progress == 'auto' else (None if progress in (None, 'none') else progress)
+    path = (progress_save_for(name) or sav_sources.find_progress_save(st)) if progress == 'auto' else \
+        (None if progress in (None, 'none') else progress)
     if path:
         _, pu = sav.read_sav(path)
         for i, d in sav_sources.progress_totems(pu).items():
@@ -520,9 +673,11 @@ def model_from_map(name, villages=None, progress='auto'):
                 tot[i].update(d)
         note = '%s (%s)' % (os.path.basename(path), time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(path))))
         print('villages and songs from', path, flush=True)
-    ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, name, schedule=sch,
+    label = name + (' from %s (script restarted)' % os.path.basename(grid_path) if grid_path else '')
+    ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, label, schedule=sch,
                      totems=list(tot.values()))
     ms.progress_note = note
+    ms.level_name = name
     if villages is not None:                     # an explicit --villages schedule overrides the totem count
         sch.villages = villages
     return ms
@@ -553,7 +708,16 @@ def shade(height):
 LAVA_STOPS = [(0, (40, 25, 20)), (12.5, (90, 20, 10)), (40, (170, 30, 10)), (90, (235, 90, 15)), (150, (255, 170, 40)), (255, (255, 245, 170))]
 
 
+_LAVA_XS = np.array([s[0] for s in LAVA_STOPS], np.float32)
+_LAVA_CS = np.array([s[1] for s in LAVA_STOPS], np.float32)
+
+
 def render(fr, view):
+    if view == 'natural' and viewfast is not None:
+        out = np.empty((N, N, 3), np.uint8)
+        viewfast.render_natural(fr.ground, fr.soft, fr.water, fr.lava, fr.sediment, fr.temperature,
+                                LIGHT, _LAVA_XS, _LAVA_CS, out)
+        return out
     if view == 'natural':
         rock = np.array([118, 108, 98], np.float32); sand = np.array([214, 188, 138], np.float32)
         s = np.clip(fr.soft / 1.5, 0, 1)[..., None]
@@ -600,25 +764,57 @@ def render_unexplained(fr, acc):
     return np.clip(col, 0, 255).astype(np.uint8)
 
 
+_TEXT_MASKS = {}
+
+
+def draw_text(img, xy, text, colour):
+    """ImageDraw.text(xy, text, fill=colour) with the rendered text cached per string (rendering the
+    font is the slow part when many labels are drawn every frame)."""
+    m = _TEXT_MASKS.get(text)
+    if m is None:
+        if len(_TEXT_MASKS) > 5000:
+            _TEXT_MASKS.clear()
+        probe = ImageDraw.Draw(Image.new('L', (1, 1)))
+        l, t, r, b = probe.textbbox((0, 0), text)
+        m = Image.new('L', (max(1, int(np.ceil(r))), max(1, int(np.ceil(b)))))
+        ImageDraw.Draw(m).text((0, 0), text, fill=255)
+        _TEXT_MASKS[text] = m
+    x, y = int(np.floor(xy[0] + 0.5)), int(np.floor(xy[1] + 0.5))   # as Pillow places it (at exact
+    img.paste(colour, (x, y, x + m.width, y + m.height), m)        # .5 positions it can be 1 px off)
+
+
 # ---------------------------------------------------------------- window
 class App:
+    INFO_LINES = {1: 12, 2: 7}                   # info text height per zoom (lines wrap at the map's width)
+
     def __init__(self, root, source, scale, flip, rotate):
         self.root, self.src, self.scale = root, source, scale
         self.live = source if isinstance(source, LiveGame) else None
         self.flip, self.rotate = flip, rotate % 4
         self.view, self.overlay = 'natural', True
-        self.flow_on, self.flow, self.flow_t0, self.flow_drawn = True, None, time.time(), 0.0
+        self.flow_on, self.flow, self.flow_drawn = True, None, 0.0
+        self.flow_time, self.flow_clock = 0.0, time.time()   # flow texture time: runs with the simulation
+        self.flow_debug = 0
         self.show_events, self.events = True, []        # (time, row, col, cells, total)
         self.acc, self.acc_time, self.acc_tick = {}, time.time(), None   # view 7 accumulators
         self.frame = None
         self.dirty = True
         self.mouse = None
         self.fps = []
+        self.loading, self.loaded = None, None           # background load: label, result
+        self.message = None                              # (time, text): shown in the info line for a while
         root.title('DustView')
-        self.canvas = tk.Label(root, bg='black')
-        self.canvas.pack()
-        self.info = tk.Label(root, anchor='w', justify='left', font=('Consolas', 9), bg='#202020', fg='#e0e0e0')
-        self.info.pack(fill='x')
+        root.configure(bg='#202020')
+        self.photo = ImageTk.PhotoImage(Image.new('RGB', (N * scale, N * scale)))
+        self.canvas = tk.Label(root, bg='black', image=self.photo, borderwidth=0)
+        self.canvas.grid(row=0, column=0, sticky='nw')
+        self.info = tk.Label(root, anchor='nw', justify='left', font=('Consolas', 9), bg='#202020', fg='#e0e0e0',
+                             wraplength=N * scale, height=self.INFO_LINES.get(scale, 6))   # fixed: no window resizing
+        self.info.grid(row=1, column=0, sticky='new')
+        root.rowconfigure(1, weight=1)                   # spare height (panel taller than the map) goes below the info
+        import dustview_panel
+        self.panel = dustview_panel.ControlPanel(root, self, sys.modules[__name__])   # this module, also when run as a script
+        self.panel.frame.grid(row=0, column=1, rowspan=2, sticky='ns')
         root.bind('<Key>', self.on_key)
         self.canvas.bind('<Motion>', self.on_move)
         self.canvas.bind('<Leave>', lambda e: self.set_mouse(None))
@@ -646,14 +842,118 @@ class App:
         srcs = getattr(self.src, 'sources', None)
         return list(srcs) if srcs is not None else (list(self.frame.sources) if self.frame is not None else [])
 
+    # ---- actions (keys and the control panel both call these)
+    def say(self, text):
+        self.message = (time.time(), text)
+
+    def is_model(self):
+        return isinstance(self.src, ModelSource)
+
+    def set_view(self, view):
+        if view == 'flow texture inputs' and self.view == view:
+            self.flow_debug = (self.flow_debug + 1) % 3      # 8 again: next input
+        self.view = view
+        if view == 'unexplained changes':
+            if hasattr(self.src, 'enable_explain'):
+                self.src.enable_explain()
+            else:
+                self.say('view 7 needs the live game (it compares the game with its own step)')
+        self.dirty = True
+
+    def set_flip(self, flip):
+        self.flip = flip; self._make_index(); self.dirty = True
+
+    def rotate_view(self):
+        self.rotate = (self.rotate + 1) % 4; self._make_index(); self.dirty = True
+
+    def set_scale(self, scale):
+        if scale != self.scale:
+            self.scale = scale
+            self.info.configure(wraplength=N * scale, height=self.INFO_LINES.get(scale, 6))
+            self.dirty = True
+
+    def toggle_pause(self):
+        if self.is_model():
+            self.src.paused = not self.src.paused
+
+    def set_speed(self, speed):
+        if self.is_model():
+            self.src.speed = speed
+
+    def step_model(self, n=1):
+        """One tick (or n) of the paused model."""
+        if self.is_model():
+            self.src.paused = True
+            self.src.step_req += n
+
+    def flow_rate(self):
+        """How fast the flow texture's clock runs: 0 while the game or the model is paused (the game's
+        own water texture stops too), the model's speed (measured when flat out), 1 for the live game."""
+        src = self.src
+        if self.frame is None or getattr(src, 'paused', False):
+            return 0.0
+        if isinstance(src, ModelSource):
+            return float(src.speed) if src.speed else src.ticks_per_second() / ModelSource.GAME_RATE
+        return 1.0 if isinstance(src, LiveGame) else 0.0
+
+    def take_over(self):
+        """M: continue in the Python model from the live state on screen."""
+        if self.frame is not None and isinstance(self.src, LiveGame):
+            self.pending_takeover = time.time()          # switch now if ready, else as soon as it is (tick)
+            self.try_takeover()
+
+    def load(self, label, make):
+        """Build a new source in the background (reading a map or finding the game can take seconds) and
+        switch to it when ready (tick)."""
+        if self.loading:
+            self.say('still loading %s' % self.loading)
+            return
+        self.loading = label
+
+        def run():
+            try:
+                res = make()
+            except BaseException as e:               # SystemExit from the memory reader included
+                res = e
+            self.loaded = res
+        threading.Thread(target=run, daemon=True).start()
+
+    def load_level(self, name, progress='none'):
+        self.load(name, lambda: model_from_map(name, progress=progress))
+
+    def load_save(self, path):
+        self.load(os.path.basename(path), lambda: model_from_save(path))
+
+    def connect_live(self):
+        """L: read the running game (found afresh: the level may have changed)."""
+        self.load('the live game', LiveGame)
+
+    def set_source(self, new):
+        old = self.src
+        if old is not new and isinstance(old, ModelSource):
+            old.stop()
+        if isinstance(new, LiveGame):
+            if self.live is not None and self.live is not new:
+                self.live.stop()
+            self.live = new
+        self.src = new
+        self.frame, self.events, self.acc, self.acc_tick = None, [], {}, None
+        self.pending_takeover = None
+        if self.view == 'unexplained changes' and hasattr(new, 'enable_explain'):
+            new.enable_explain()
+        self.dirty = True
+
+    def toggle_totem(self, t):
+        if self.is_model():
+            self.src.toggle_totem(t)
+            self.dirty = True
+
     def on_key(self, e):
+        if e.widget.winfo_class() in ('TCombobox', 'Entry', 'TEntry', 'Listbox'):
+            return                                       # typing into a panel field
         k = e.keysym.lower()
         if e.char in VIEWS:
-            if VIEWS[e.char] == 'flow texture inputs' and self.view == 'flow texture inputs':
-                self.flow_debug = (getattr(self, 'flow_debug', 0) + 1) % 3     # 8 again: next input
-            self.view = VIEWS[e.char]
-            if self.view == 'unexplained changes' and hasattr(self.src, 'enable_explain'):
-                self.src.enable_explain()
+            self.set_view(VIEWS[e.char])
         elif k == 'o':
             self.overlay = not self.overlay
         elif k == 'f':
@@ -661,25 +961,20 @@ class App:
         elif k == 'd':
             self.show_events = not self.show_events
         elif k == 'v':
-            self.flip = not self.flip; self._make_index()
+            self.set_flip(not self.flip)
         elif k == 'r':
-            self.rotate = (self.rotate + 1) % 4; self._make_index()
+            self.rotate_view()
         elif k == 's':
             self.screenshot()
-        elif k == 'm' and self.frame is not None and not isinstance(self.src, ModelSource):
-            self.pending_takeover = time.time()          # switch now if ready, else as soon as it is (tick)
-            self.try_takeover()
-        elif k == 'l' and isinstance(self.src, ModelSource):
-            self.src.stop()
-            try:
-                self.live = self.live or LiveGame()
-                self.src = self.live
-                self.live.last_tick = None
-            except SystemExit as e:
-                self.info.configure(text=str(e))
-        elif k == 'space' and isinstance(self.src, ModelSource):
-            self.src.paused = not self.src.paused
-        elif k == 't' and isinstance(self.src, ModelSource):
+        elif k == 'm':
+            self.take_over()
+        elif k == 'l':
+            self.connect_live()
+        elif k == 'space':
+            self.toggle_pause()
+        elif k == 'n':
+            self.step_model()
+        elif k == 't' and self.is_model():
             sp = ModelSource.SPEEDS
             self.src.speed = sp[(sp.index(self.src.speed) + 1) % len(sp)]
         elif k == 'escape':
@@ -699,12 +994,12 @@ class App:
             self.pending_takeover = None
             return
         if not self.takeover_ready():
-            self.info.configure(text='waiting for the live sources / totems; switching to the model once ready...')
+            self.say('waiting for the live sources / totems; switching to the model once ready...')
             return
         self.pending_takeover = None
         fr = self.frame
         self.src = ModelSource(fr.grid, fr.params, self.current_sources(), fr.tick, 'from live tick %d' % fr.tick,
-                               getattr(self.src, 'other_modifiers', []), totems=getattr(self.src, 'totems', None))
+                               live_repulsors(self.src), totems=getattr(self.src, 'totems', None))
         self.dirty = True
 
     def on_move(self, e):
@@ -714,7 +1009,7 @@ class App:
         """Model mode: clicking within 8 cells of a totem builds / removes its village (songs unchanged)."""
         if not isinstance(self.src, ModelSource):
             if getattr(self.src, 'totems', None):
-                self.info.configure(text='totems can be toggled in model mode: press M first')
+                self.say('totems can be toggled in model mode: press M (or "Continue in model") first')
             return
         if not self.src.totems:
             return
@@ -722,8 +1017,7 @@ class App:
         r, c = self.idx_r[y, x], self.idx_c[y, x]
         best = min(self.src.totems, key=lambda t: (t['row'] - r) ** 2 + (t['col'] - c) ** 2)
         if (best['row'] - r) ** 2 + (best['col'] - c) ** 2 <= 64:
-            self.src.toggle_totem(best)
-            self.dirty = True
+            self.toggle_totem(best)
 
     def set_mouse(self, m):
         self.mouse = m
@@ -743,13 +1037,13 @@ class App:
         if self.flow is not None:
             self.flow.set_level(level_number(self.src))
         if self.view == 'flow texture inputs':
-            self.flow.update(fr.water, fr.flux, time.time() - self.flow_t0, fr.lava)
+            self.flow.update(fr.water, fr.flux, self.flow_time, fr.lava)
             rgb = self.flow.debug_image(self.flow.DEBUG_MODES[getattr(self, 'flow_debug', 0)], fr.water)
             self.flow_drawn = time.time()
         else:
             rgb = render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else render(fr, self.view)
         if self.flow_on and self.view == 'natural':
-            hi = self.flow.shade(rgb, fr.water, fr.flux, time.time() - self.flow_t0, fr.lava, sediment=fr.sediment)
+            hi = self.flow.shade(rgb, fr.water, fr.flux, self.flow_time, fr.lava, sediment=fr.sediment)
             img = Image.fromarray(np.ascontiguousarray(self.orient(hi)), 'RGB')
             self.flow_drawn = time.time()
         else:
@@ -758,7 +1052,7 @@ class App:
                 img = img.resize((N * self.scale, N * self.scale), Image.NEAREST)
         sources = self.current_sources()
         if self.overlay and sources:
-            dr = ImageDraw.Draw(img)
+            marks = []
             for s in sources:
                 y, x = self.cell_to_disp[int(s['row']), int(s['col'])]
                 cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, max(3, (s['radius'] + 1.5) * self.scale)
@@ -771,8 +1065,11 @@ class App:
                     colour = (150, 150, 150)
                 amount = s.get('amount', s['rate'] * act)
                 label = '%+.2f' % amount + (' (%d%%)' % round(act * 100) if act < 0.99 else '')
+                marks.append((cx, cy, r, colour, label))
+            dr = ImageDraw.Draw(img)
+            for cx, cy, r, colour, label in marks:
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
-                dr.text((cx + r + 2, cy - 6), label, fill=colour)
+                draw_text(img, (cx + r + 2, cy - 6), label, colour)
         if self.show_events and self.events:
             dr = ImageDraw.Draw(img)
             now = time.time()
@@ -788,7 +1085,8 @@ class App:
         tots = getattr(self.src, 'totems', None) if self.overlay else None
         if tots and not isinstance(self.src, ModelSource):      # live: songs from the game's modifier list
             tots = [dict(t) for t in tots]
-            songs_from_modifiers(tots, getattr(self.src, 'other_modifiers', []))   # adds water / lava in place
+            songs_from_modifiers(tots, live_repulsors(self.src))   # adds water / lava in place
+            with_knowledge(tots, level_number(self.src))
         if tots:
             dr = ImageDraw.Draw(img)
             for t in tots:
@@ -797,7 +1095,7 @@ class App:
                 colour = (255, 205, 60) if t.get('built') else (150, 150, 150)
                 dr.rectangle([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
                 dr.text((cx + r + 2, cy + 2), totem_label(t), fill=colour)
-        others = getattr(self.src, 'other_modifiers', []) if self.overlay else []
+        others = (getattr(self.src, 'other_modifiers', []) if self.is_model() else live_repulsors(self.src)) if self.overlay else []
         if others:
             dr = ImageDraw.Draw(img)
             for e in others:
@@ -806,12 +1104,20 @@ class App:
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(235, 235, 235), width=1)
                 dr.text((cx + r + 2, cy - 6), 'mod %+g/%+g' % (e['amount'], e['f5']), fill=(235, 235, 235))
         self.last_image = img
-        self.photo = ImageTk.PhotoImage(img)
-        self.canvas.configure(image=self.photo)
+        ph = getattr(self, 'photo', None)
+        if ph is not None and (ph.width(), ph.height()) == img.size:
+            ph.paste(img)                        # reuse the Tk image (cheaper than a new one each frame)
+        else:
+            self.photo = ImageTk.PhotoImage(img)
+            self.canvas.configure(image=self.photo)
 
     def update_info(self):
         fr = self.frame
-        lines = ['%s | view: %s (1-6)   M model  L live  O overlay  V flip  R rotate  S screenshot' % (self.src.status(), self.view)]
+        lines = ['%s | view: %s' % (self.src.status(), self.view)]
+        if self.loading:
+            lines.append('loading %s ...' % self.loading)
+        if self.message and time.time() - self.message[0] < 6:
+            lines.append(self.message[1])
         if fr is not None:
             fps = len(self.fps) / max(self.fps[-1] - self.fps[0], 1e-6) if len(self.fps) > 1 else 0
             border = fr.params[31] if fr.params is not None else float('nan')
@@ -837,9 +1143,22 @@ class App:
                 ex = getattr(self.src, 'explained', None)
                 if self.view == 'unexplained changes' and ex is not None:
                     lines.append('unexplained at this cell (tick %d): ground %+.4f, fluid %+.4f' % (ex['tick'], ex['dT'][r, c], ex['dF'][r, c]))
-        self.info.configure(text='\n'.join(lines))
+        text = '\n'.join(lines)
+        if text != self.info.cget('text'):
+            self.info.configure(text=text)
+
+    FRAME = 1 / 30                               # target redraw interval (the model ticks 31 times a second)
 
     def tick(self):
+        t_start = time.perf_counter()
+        res, self.loaded = self.loaded, None
+        if res is not None:                      # a background load finished
+            label, self.loading = self.loading, None
+            if isinstance(res, BaseException):
+                self.say('could not load %s: %s' % (label, res))
+            else:
+                self.set_source(res)
+                self.say('loaded %s' % label)
         if getattr(self, 'pending_takeover', None):
             self.try_takeover()
         src = self.src
@@ -851,7 +1170,7 @@ class App:
             fr = self.src.read()
         except Exception as e:
             fr = None
-            self.info.configure(text='read failed: %s' % e)
+            self.say('read failed: %s' % e)
         if fr is not None:
             self.frame, self.dirty = fr, True
             now = time.time()
@@ -870,8 +1189,12 @@ class App:
                 cur = self.acc.get(k, np.zeros((N, N), np.float32)) * decay
                 self.acc[k] = np.maximum(cur, f(new)) if new is not None else cur
             self.dirty = self.dirty or new is not None or any(a.max() > 1e-3 for a in self.acc.values())
-        if ((self.flow_on and self.view == 'natural') or self.view == 'flow texture inputs') and time.time() - self.flow_drawn > 1 / 25:
-            self.dirty = True                    # keep the flow texture moving (also while paused)
+        now = time.time()
+        rate = self.flow_rate()
+        self.flow_time += min(now - self.flow_clock, 0.25) * rate
+        self.flow_clock = now
+        if rate and ((self.flow_on and self.view == 'natural') or self.view == 'flow texture inputs') and now - self.flow_drawn > self.FRAME * 0.9:
+            self.dirty = True                    # keep the flow texture moving (not while paused)
         sig = tuple(id(getattr(self.src, k, None)) for k in ('sources', 'totems', 'other_modifiers'))
         if sig != getattr(self, '_drawn_sources', None):
             self._drawn_sources = sig
@@ -881,8 +1204,10 @@ class App:
             self.dirty = False
             now = time.time()
             self.fps = [t for t in self.fps if now - t < 2] + [now]
+        self.panel.sync()
         self.update_info()
-        self.root.after(40, self.tick)
+        spent = time.perf_counter() - t_start      # next frame FRAME after this one started
+        self.root.after(max(1, int(1000 * (self.FRAME - spent))), self.tick)
 
 
 def main():
@@ -893,13 +1218,20 @@ def main():
     ap.add_argument('--rotate', type=int, default=0, help='rotate by N x 90 degrees')
     ap.add_argument('--model', metavar='MAP', help='run the Python model from this map file instead of reading the game')
     ap.add_argument('--villages', metavar='T:N,...', help='with --model: villages built over time for the level script, e.g. "0:0,200:1,900:3"')
-    ap.add_argument('--progress', default='auto', metavar='auto|none|PATH',
-                    help="with --model: which totems have villages / repel songs: from the player's progress save of this level (auto), none, or a given save")
+    ap.add_argument('--progress', default='none', metavar='none|auto|PATH',
+                    help="with --model: which totems have villages / repel songs: none (default, the level as shipped), from the player's save of this level (auto), or a given save")
     a = ap.parse_args()
     root = tk.Tk()
     import level_schedule
     vil = level_schedule.parse_villages(a.villages) if a.villages else None
-    App(root, model_from_map(a.model, vil, a.progress) if a.model else LiveGame(), a.scale, a.flip, a.rotate)
+    if a.model:
+        src = model_from_map(a.model, vil, a.progress)
+    else:
+        try:
+            src = LiveGame()
+        except SystemExit as e:                  # no game / no level: start empty, load from the panel
+            src = NoSource(str(e))
+    App(root, src, a.scale, a.flip, a.rotate)
     root.mainloop()
 
 
