@@ -15,7 +15,7 @@ Per cell (once per simulation frame):
 Per frame (fxcache 107 / 117):
   two UV-offset layers are dragged along v (look upstream, bilinear) at 22.4 cells/s per unit of v
   (512 x 0.5 x UVScrollParams.y 0.00293 per frame x 30 frames/s; GroundParamsUVScroll.x = 0 over
-  water), |v| < 0.01 does not move; each layer restarts every 10 s (half a cycle apart), blended so a
+  water), |v| < 0.01 does not move; each layer restarts every 1.11 s (phase +0.03 per frame at 30 fps; half a cycle apart), blended so a
   layer is invisible when it restarts; no relaxation
   detail texture tiled 12 x across the map: ripple normal strip WaterSeqNM128 read as 8 frames of
   256 x 128 (shown square), foam Foam_D 512 x 512; final foam = saturate(foam texture x 1 x foam factor)
@@ -32,7 +32,7 @@ import numba
 TEX_BF = r'D:\Games\Steam\steamapps\common\From Dust\BinPC\Tex_BD00993D.lin.bf'
 LIGHT = np.array([-0.55, -0.55, 0.63]) / np.linalg.norm([-0.55, -0.55, 0.63])
 SPEED = 512 * 0.5 * 0.00293 * 30          # cells per second per unit of normalised velocity (22.5)
-LAYER_PERIOD = 10.0                        # s
+LAYER_PERIOD = 1 / (0.03 * 30)             # s: the game's layer phase (WaterTime.y) steps +0.03 per frame, 1.11 s at 30 fps
 TILES = 12.0                               # detail texture repeats across the map
 
 
@@ -267,9 +267,9 @@ def _shade_window(b0, b1, b2, wet, gy0, gx0, k, D, strength, foamk, frame, foam,
 
 
 # ---- textured terrain (natural view): the game's ground textures, after terrain shader fxcache 96
-GROUND_TILES = 16.0        # shader 96 multiplies the ground UV by 16 (map-wide UV assumed: 16 repeats per map)
-RAMP_V_HARD, RAMP_V_SOFT = 0.90, 0.55   # af4_TerrainRampUV .y / .z not read: chosen on the ramp's rock / sand bands
-RAMP_U = 0.5               # ramp U = GroundParams.w - distance term (not read): the middle column
+GROUND_TILES = 16.0        # shader 96: ground UV = world x 1/768 + 0.5 (c131.z / .w, logged; map ~768 units) x 16
+RAMP_V_HARD, RAMP_V_SOFT = 0.375, 0.625  # af4_TerrainRampUV c59 .z / .y as logged from the game (rock / sand)
+RAMP_U = 0.5               # ramp U = GroundParams.w (logged 0.75-1.0) - |view depth| x 0.0035: camera-dependent, chosen
 BUMP = 0.6                 # strength of the textures' normal perturbation against the cell slope (chosen)
 GROUND_GAIN = 1.35         # brightness (the game's light intensities are not modelled)
 _GROUND = None
@@ -630,7 +630,7 @@ class FlowLayer:
         foam: the foam factor 0..1 as black -> white (the game multiplies the foam texture by it).
         velocity: hue = direction, brightness = |v| (full at |v| = 0.5, i.e. ~11 cells/s).
         drag: how far the texture coordinates have been dragged, blended like the layers (black 0,
-        white >= 60 cells); it grows during a layer's 10 s life and drops when the visible layer restarts."""
+        white >= 60 cells); it grows during a layer's 1.11 s life and drops when the visible layer restarts."""
         vx, vy, strength, foamk = self.fields
         wet = (depth > 0.02)[..., None]
         if mode == 'foam':

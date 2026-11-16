@@ -11,6 +11,8 @@
 //   - for a draw with such a shader: the constant registers c36-c42 last set (WaterTime, SedimentColor,
 //     UVScrollParams, ?, WaterNormalmapParams, ?, WaterDetailParams) and the textures bound to stages
 //     0-15 (format, size, pool, usage)
+//   - the terrain shader (fxcache 96, CTAB name af4_TerrainRampUV): constants c55-c70 and c128-c135 plus its
+//     textures, same rate (c59 = terrain ramp rows, c131 = ground tiling / ramp distance term)
 // F3 (in the game window): dump the textures bound to the next draw of each water pass to
 //   dustdump_<pass>_s<stage>.bin next to the DLL (header: u32 width, height, format, pitch; then rows),
 //   if they can be read (managed / system-memory / dynamic textures by LockRect, render targets by
@@ -52,8 +54,8 @@ static IDirect3DPixelShader9 *g_curPS;
 static DWORD g_frame;
 
 // water pass kinds, recognised by names in the shader's constant table
-enum { K_NONE = 0, K_UVSCROLL, K_WATER, K_FOAMPACK, K_PARAMS, K_OTHERWATER, K_CONVERT, K_COUNT };
-static const char *kKindName[K_COUNT] = { "none", "uvscroll", "water", "foampack", "params", "otherwater", "convert" };
+enum { K_NONE = 0, K_UVSCROLL, K_WATER, K_FOAMPACK, K_PARAMS, K_OTHERWATER, K_CONVERT, K_TERRAIN, K_COUNT };
+static const char *kKindName[K_COUNT] = { "none", "uvscroll", "water", "foampack", "params", "otherwater", "convert", "terrain" };
 struct ShaderKind { IDirect3DPixelShader9 *ps; int kind; };
 static ShaderKind g_kinds[512];
 static int g_nkinds;
@@ -77,7 +79,8 @@ static int Classify(IDirect3DPixelShader9 *ps) {
         BYTE *buf = (BYTE *)malloc(n);
         if (buf && SUCCEEDED(ps->GetFunction(buf, &n))) {
             UINT m = n < 4096 ? n : 4096;
-            if (Has(buf, m, "samp_MatWeigthTex")) kind = K_CONVERT;          // fxcache 105 / 343: builds WaterParams
+            if (Has(buf, m, "af4_TerrainRampUV")) kind = K_TERRAIN;            // fxcache 96: sand / rock terrain
+            else if (Has(buf, m, "samp_MatWeigthTex")) kind = K_CONVERT;          // fxcache 105 / 343: builds WaterParams
             else if (Has(buf, m, "g_SamplerPreviousUV")) kind = K_UVSCROLL;
             else if (Has(buf, m, "g_SamplerWaterFoam")) kind = K_FOAMPACK;
             else if (Has(buf, m, "PS_f4_UVScrollParams") && Has(buf, m, "g_SamplerWaterParams")) kind = K_WATER;
@@ -189,8 +192,14 @@ static void OnDraw(IDirect3DDevice9 *dev) {
         if (!dump && now - g_lastLog[kind] < 10000) return;
         g_lastLog[kind] = now;
         Log("d3d: frame %u draw with %s shader %p", g_frame, kKindName[kind], g_curPS);
+        if (kind == K_TERRAIN) {                      // terrain shader: c55-c70 (c59 = af4_TerrainRampUV, c67 detail) and c128-c135 (c131 tiling)
+            for (int r = 55; r <= 70; r++)
+                Log("d3d:    c%d %12.6f %12.6f %12.6f %12.6f", r, g_psConst[r][0], g_psConst[r][1], g_psConst[r][2], g_psConst[r][3]);
+            for (int r = 128; r <= 135; r++)
+                Log("d3d:    c%d %12.6f %12.6f %12.6f %12.6f", r, g_psConst[r][0], g_psConst[r][1], g_psConst[r][2], g_psConst[r][3]);
+        }
         static const char *cname[7] = { "WaterTime", "SedimentColor", "UVScrollParams", "c39", "WaterNormalmapParams", "c41", "WaterDetailParams" };
-        for (int r = 36; r <= 42; r++)
+        for (int r = 36; r <= 42 && kind != K_TERRAIN; r++)
             Log("d3d:    c%d %-20s %10.5f %10.5f %10.5f %10.5f", r, cname[r - 36], g_psConst[r][0], g_psConst[r][1], g_psConst[r][2], g_psConst[r][3]);
         for (int s = 0; s < 16; s++) {
             char desc[160]; IDirect3DTexture9 *tx;
