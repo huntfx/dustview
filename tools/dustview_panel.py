@@ -134,6 +134,7 @@ class ControlPanel:
         box = self._section('Show', tab_view)
         self.checks = {}
         for attr, text in (('overlay', 'Sources, totems, repulsors (O)'), ('flow_on', 'Flow texture, natural view (F)'),
+                           ('ground_tex', 'Sand / rock textures, natural view'),
                            ('show_events', 'Terrain-change markers, live (D)')):
             v = self.checks[attr] = tk.BooleanVar(value=getattr(app, attr))
             self._check(box, text, v, lambda a=attr: self._set_flag(a)).pack(anchor='w')
@@ -151,6 +152,9 @@ class ControlPanel:
         self._button(row, 'Whole map', lambda: app.set_zoom(1)).pack(side='left', padx=(4, 0))
         self.zoom_text = tk.StringVar()
         ttk.Label(row, textvariable=self.zoom_text).pack(side='left', padx=(6, 0))
+        self.smooth = tk.BooleanVar(value=app.smooth)
+        self._check(box, 'Smooth when zoomed (off: crisp cells)', self.smooth,
+                    lambda: (setattr(app, 'smooth', self.smooth.get()), setattr(app, 'dirty', True))).pack(anchor='w')
         ttk.Label(box, text='Mouse wheel zooms at the cursor; middle-drag pans (or left-drag with the Inspect tool).',
                   wraplength=250, foreground='#666').pack(fill='x')
         row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
@@ -282,6 +286,7 @@ class ControlPanel:
         self._put(self.strength_text, '%.1f/s' % app.brush_strength)
         self._put(self.temp_text, '%.0f' % app.lava_temperature)
         self._put(self.zoom_text, '%gx' % app.zoom)
+        self._put(self.smooth, bool(app.smooth))
         for attr, v in self.checks.items():
             self._put(v, bool(getattr(app, attr)))
         self._put(self.flip, bool(app.flip))

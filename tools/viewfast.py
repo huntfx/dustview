@@ -114,6 +114,59 @@ def render_natural(ground, soft, water, lava, sed, temp, light, lava_xs, lava_cs
 
 
 @numba.njit(parallel=True, nogil=True, cache=True)
+def natural_layers(ground, soft, water, lava, sed, temp, lava_xs, lava_cs, gx_out, gy_out, s_out, o_out, a_out):
+    """The parts of render_natural, per cell, for the textured terrain (flowtex.shade_textured): surface
+    gradient (gx, gy as np.gradient of ground + water + lava), sand fraction s = soft / 1.5 clamped, and the
+    water + lava layer over the ground as one colour o (n, n, 3) and opacity a: render_natural's
+    c += (w - c) * aw; c += (lava - c) * al  ==  c * (1 - a) + o * a."""
+    n = ground.shape[0]
+    for r in numba.prange(n):
+        for c in range(n):
+            if r == 0:
+                gy = (ground[1, c] + water[1, c] + lava[1, c]) - (ground[0, c] + water[0, c] + lava[0, c])
+            elif r == n - 1:
+                gy = (ground[r, c] + water[r, c] + lava[r, c]) - (ground[r - 1, c] + water[r - 1, c] + lava[r - 1, c])
+            else:
+                gy = ((ground[r + 1, c] + water[r + 1, c] + lava[r + 1, c]) - (ground[r - 1, c] + water[r - 1, c] + lava[r - 1, c])) * 0.5
+            if c == 0:
+                gx = (ground[r, 1] + water[r, 1] + lava[r, 1]) - (ground[r, 0] + water[r, 0] + lava[r, 0])
+            elif c == n - 1:
+                gx = (ground[r, c] + water[r, c] + lava[r, c]) - (ground[r, c - 1] + water[r, c - 1] + lava[r, c - 1])
+            else:
+                gx = ((ground[r, c + 1] + water[r, c + 1] + lava[r, c + 1]) - (ground[r, c - 1] + water[r, c - 1] + lava[r, c - 1])) * 0.5
+            gx_out[r, c] = gx
+            gy_out[r, c] = gy
+            s_out[r, c] = min(max(soft[r, c] / 1.5, 0.0), 1.0)
+            aw = 0.0
+            w0 = 0.0
+            w1 = 0.0
+            w2 = 0.0
+            d = water[r, c]
+            if d > 0:
+                t = np.exp(-d / 10.0)
+                w0 = 18 * (1 - t) + 70 * t
+                w1 = 52 * (1 - t) + 150 * t
+                w2 = 105 * (1 - t) + 185 * t
+                mud = min(max(sed[r, c] / (0.02 * d + 1e-6), 0.0), 1.0) * 0.6
+                w0 += (150 - w0) * mud
+                w1 += (118 - w1) * mud
+                w2 += (80 - w2) * mud
+                aw = 1 - np.exp(-d / 2.0)
+            al = 1 - np.exp(-lava[r, c] / 0.5)
+            a = 1 - (1 - aw) * (1 - al)
+            a_out[r, c] = a
+            if a > 0:
+                tm = temp[r, c]
+                o_out[r, c, 0] = (w0 * aw * (1 - al) + _interp(tm, lava_xs, lava_cs, 0) * al) / a
+                o_out[r, c, 1] = (w1 * aw * (1 - al) + _interp(tm, lava_xs, lava_cs, 1) * al) / a
+                o_out[r, c, 2] = (w2 * aw * (1 - al) + _interp(tm, lava_xs, lava_cs, 2) * al) / a
+            else:
+                o_out[r, c, 0] = 0.0
+                o_out[r, c, 1] = 0.0
+                o_out[r, c, 2] = 0.0
+
+
+@numba.njit(parallel=True, nogil=True, cache=True)
 def _blur_pass(a, out):
     n, m = a.shape
     q = f32(0.25)

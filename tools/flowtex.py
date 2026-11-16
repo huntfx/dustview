@@ -184,6 +184,250 @@ def _shade_uv(base, depth, lava, min_depth, s, D, strength, foamk, frame, foam, 
                     out[R, C, 2] = np.uint8(min(max(c2, np.float32(0)), np.float32(255)))
 
 
+@numba.njit(fastmath=True, inline='always')
+def _bilin(a, y, x):
+    """Bilinear sample of a 2-D field at cell-centre coordinates (y, x) (cell i's centre at i), clamped."""
+    n = a.shape[0]
+    y = min(max(y, np.float32(0)), np.float32(n - 1))
+    x = min(max(x, np.float32(0)), np.float32(n - 1))
+    y0 = int(y)
+    x0 = int(x)
+    y1 = min(y0 + 1, n - 1)
+    x1 = min(x0 + 1, n - 1)
+    fy = y - y0
+    fx = x - x0
+    a0 = a[y0, x0] + (a[y0, x1] - a[y0, x0]) * fx
+    b0 = a[y1, x0] + (a[y1, x1] - a[y1, x0]) * fx
+    return a0 + (b0 - a0) * fy
+
+
+@numba.njit(fastmath=True, inline='always')
+def _wrap2(t, u, v):
+    """Bilinear, wrapping sample of a 2-D texture t at texel coordinates (u, v) (texel centres at +0.5)."""
+    h, w = t.shape
+    u = u - np.float32(0.5)
+    v = v - np.float32(0.5)
+    x0f = np.floor(u)
+    y0f = np.floor(v)
+    fx = u - x0f
+    fy = v - y0f
+    x0 = np.int64(x0f) % w
+    y0 = np.int64(y0f) % h
+    x1 = (x0 + 1) % w
+    y1 = (y0 + 1) % h
+    a0 = t[y0, x0] + (t[y0, x1] - t[y0, x0]) * fx
+    b0 = t[y1, x0] + (t[y1, x1] - t[y1, x0]) * fx
+    return a0 + (b0 - a0) * fy
+
+
+@numba.njit(parallel=True, fastmath=True, cache=True)
+def _shade_window(b0, b1, b2, wet, gy0, gx0, k, D, strength, foamk, frame, foam, wt, kr, kf, out):
+    """Like _shade_uv for a window of the grid: output pixel (i, j) shows grid point
+    (gy0 + (i + 0.5) / k, gx0 + (j + 0.5) / k). Terrain / water colour (b0-b2), the water fraction, ripple
+    strength and foam factor are interpolated between cell centres; the ripple and foam textures are
+    sampled per pixel, so zooming in shows them at full detail instead of enlarged pixels."""
+    H, W = out.shape[0], out.shape[1]
+    fh, fw = frame.shape
+    gh, gw = foam.shape
+    half = np.float32(0.5)
+    for i in numba.prange(H):
+        y = gy0 + (np.float32(i) + half) / k
+        for j in range(W):
+            x = gx0 + (np.float32(j) + half) / k
+            yc = y - half
+            xc = x - half
+            c0 = _bilin(b0, yc, xc)
+            c1 = _bilin(b1, yc, xc)
+            c2 = _bilin(b2, yc, xc)
+            w = _bilin(wet, yc, xc)
+            if w > 0:
+                st = _bilin(strength, yc, xc)
+                fk = _bilin(foamk, yc, xc)
+                rip = np.float32(0)
+                fo = np.float32(0)
+                for kk in range(2):
+                    ox, oy = _bilinear2(D, kk, yc, xc)
+                    px = x + ox
+                    py = y + oy
+                    rip += wt[kk] * _wrap2(frame, px * kr, py * kr)
+                    if fk > 0:
+                        fo += wt[kk] * _wrap2(foam, px * kf, py * kf)
+                m = 1 + st * rip * w
+                c0 *= m
+                c1 *= m
+                c2 *= m
+                if fk > 0:
+                    fa = min(fo * fk, np.float32(1)) * w
+                    c0 += (235 - c0) * fa
+                    c1 += (240 - c1) * fa
+                    c2 += (245 - c2) * fa
+            out[i, j, 0] = np.uint8(min(max(c0, np.float32(0)), np.float32(255)))
+            out[i, j, 1] = np.uint8(min(max(c1, np.float32(0)), np.float32(255)))
+            out[i, j, 2] = np.uint8(min(max(c2, np.float32(0)), np.float32(255)))
+
+
+# ---- textured terrain (natural view): the game's ground textures, after terrain shader fxcache 96
+GROUND_TILES = 16.0        # shader 96 multiplies the ground UV by 16 (map-wide UV assumed: 16 repeats per map)
+RAMP_V_HARD, RAMP_V_SOFT = 0.90, 0.55   # af4_TerrainRampUV .y / .z not read: chosen on the ramp's rock / sand bands
+RAMP_U = 0.5               # ramp U = GroundParams.w - distance term (not read): the middle column
+BUMP = 0.6                 # strength of the textures' normal perturbation against the cell slope (chosen)
+GROUND_GAIN = 1.35         # brightness (the game's light intensities are not modelled)
+_GROUND = None
+
+
+def load_ground_textures():
+    """(soft mips, hard mips, ramp): SoftGround_2_D / HardGround_2_D (1024 x 1024 RGBA, no stored mips:
+    built here by 2 x 2 averaging) as float32 0..1, and RampeGround_D's column at RAMP_U as (256, 3)."""
+    global _GROUND
+    if _GROUND is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import bf, tdt
+
+        def mips(name):
+            px, _ = tdt.decode(bf.read_entry(TEX_BF, name))
+            a = px[0].astype(np.float32) / 255
+            out = [np.ascontiguousarray(a)]
+            while a.shape[0] > 1:
+                a = 0.25 * (a[0::2, 0::2] + a[1::2, 0::2] + a[0::2, 1::2] + a[1::2, 1::2])
+                out.append(np.ascontiguousarray(a))
+            return out
+        rpx, _ = tdt.decode(bf.read_entry(TEX_BF, 'RampeGround_D.PC.tdt'))
+        col = int(RAMP_U * (rpx[0].shape[1] - 1))
+        ramp = np.ascontiguousarray(rpx[0][:, col, :3].astype(np.float32))
+        _GROUND = (mips('SoftGround_2_D.PC.tdt'), mips('HardGround_2_D.PC.tdt'), ramp)
+    return _GROUND
+
+
+@numba.njit(fastmath=True, inline='always')
+def _tex4(t, u, v, ch):
+    """Bilinear, wrapping sample of channel ch of texture t (h, w, 4) at texel coordinates (u, v)."""
+    h, w = t.shape[0], t.shape[1]
+    u = u - np.float32(0.5)
+    v = v - np.float32(0.5)
+    x0 = np.int64(np.floor(u))
+    y0 = np.int64(np.floor(v))
+    fx = u - x0
+    fy = v - y0
+    xa = x0 % w
+    xb = (x0 + 1) % w
+    ya = y0 % h
+    yb = (y0 + 1) % h
+    a0 = t[ya, xa, ch] + (t[ya, xb, ch] - t[ya, xa, ch]) * fx
+    b0 = t[yb, xa, ch] + (t[yb, xb, ch] - t[yb, xa, ch]) * fx
+    return a0 + (b0 - a0) * fy
+
+
+@numba.njit(fastmath=True, inline='always')
+def _lerp_at(a, y0, x0, y1, x1, fy, fx):
+    t0 = a[y0, x0] + (a[y0, x1] - a[y0, x0]) * fx
+    t1 = a[y1, x0] + (a[y1, x1] - a[y1, x0]) * fx
+    return t0 + (t1 - t0) * fy
+
+
+@numba.njit(fastmath=True, inline='always')
+def _lerp_at3(a, ch, y0, x0, y1, x1, fy, fx):
+    t0 = a[y0, x0, ch] + (a[y0, x1, ch] - a[y0, x0, ch]) * fx
+    t1 = a[y1, x0, ch] + (a[y1, x1, ch] - a[y1, x0, ch]) * fx
+    return t0 + (t1 - t0) * fy
+
+
+@numba.njit(parallel=True, fastmath=True, cache=True)
+def _shade_textured(gxa, gya, sfa, oa, aa, wet, gy0, gx0, k, soft_t, hard_t, tpc, ramp, vh, vs, bump, gain, light,
+                    water_tex, D, strength, foamk, frame, foam, wt, kr, kf, out):
+    """Natural view of a grid window, per pixel: ground = the game's sand / rock textures blended by the sand
+    fraction (shader 96: normal map lerp(hard, soft, s); colour = TerrainRamp at V = lerp(vh, vs, s) +
+    (alpha x 2 - 1) x 0.25), lit with the cell slope + the textures' normals; then the water / lava layer
+    (colour oa, opacity aa, from viewfast.natural_layers); then, if water_tex, the ripple and foam textures as
+    in _shade_window. Everything per cell is interpolated between cell centres (positions computed once per
+    pixel). tpc = texels per cell at the chosen mip level (soft_t and hard_t have the same size)."""
+    H, W = out.shape[0], out.shape[1]
+    n = sfa.shape[0]
+    fh, fw = frame.shape
+    gh, gw = foam.shape
+    th, tw = soft_t.shape[0], soft_t.shape[1]
+    nr = ramp.shape[0]
+    half = np.float32(0.5)
+    one = np.float32(1)
+    two = np.float32(2)
+    L0, L1, L2 = light[0], light[1], light[2]
+    for i in numba.prange(H):
+        y = gy0 + (np.float32(i) + half) / k
+        yc = min(max(y - half, np.float32(0)), np.float32(n - 1))
+        cy0 = int(yc)
+        cy1 = min(cy0 + 1, n - 1)
+        fy = yc - cy0
+        tv = y * tpc - half
+        ty0f = np.floor(tv)
+        tfy = tv - ty0f
+        ty0 = np.int64(ty0f) % th
+        ty1 = (ty0 + 1) % th
+        for j in range(W):
+            x = gx0 + (np.float32(j) + half) / k
+            xc = min(max(x - half, np.float32(0)), np.float32(n - 1))
+            cx0 = int(xc)
+            cx1 = min(cx0 + 1, n - 1)
+            fx = xc - cx0
+            s = _lerp_at(sfa, cy0, cx0, cy1, cx1, fy, fx)
+            tu = x * tpc - half
+            tx0f = np.floor(tu)
+            tfx = tu - tx0f
+            tx0 = np.int64(tx0f) % tw
+            tx1 = (tx0 + 1) % tw
+            nx = _lerp_at3(hard_t, 0, ty0, tx0, ty1, tx1, tfy, tfx)
+            ny = _lerp_at3(hard_t, 1, ty0, tx0, ty1, tx1, tfy, tfx)
+            al = _lerp_at3(hard_t, 3, ty0, tx0, ty1, tx1, tfy, tfx)
+            if s > 0:
+                nx += (_lerp_at3(soft_t, 0, ty0, tx0, ty1, tx1, tfy, tfx) - nx) * s
+                ny += (_lerp_at3(soft_t, 1, ty0, tx0, ty1, tx1, tfy, tfx) - ny) * s
+                al += (_lerp_at3(soft_t, 3, ty0, tx0, ty1, tx1, tfy, tfx) - al) * s
+            rv = vh + (vs - vh) * s + (al * two - one) * np.float32(0.25)
+            rp = min(max(rv * nr - half, np.float32(0)), np.float32(nr - 1))
+            r0 = int(rp)
+            r1 = min(r0 + 1, nr - 1)
+            f = rp - r0
+            c0 = ramp[r0, 0] + (ramp[r1, 0] - ramp[r0, 0]) * f
+            c1 = ramp[r0, 1] + (ramp[r1, 1] - ramp[r0, 1]) * f
+            c2 = ramp[r0, 2] + (ramp[r1, 2] - ramp[r0, 2]) * f
+            px = -_lerp_at(gxa, cy0, cx0, cy1, cx1, fy, fx) + (nx * two - one) * bump
+            py = -_lerp_at(gya, cy0, cx0, cy1, cx1, fy, fx) + (ny * two - one) * bump
+            sh = (px * L0 + py * L1 + L2) / np.sqrt(px * px + py * py + one)
+            g = (min(max(sh, np.float32(0)), one) * np.float32(0.75) + np.float32(0.25)) * gain
+            c0 *= g
+            c1 *= g
+            c2 *= g
+            a = _lerp_at(aa, cy0, cx0, cy1, cx1, fy, fx)
+            if a > 0:
+                c0 += (_lerp_at3(oa, 0, cy0, cx0, cy1, cx1, fy, fx) - c0) * a
+                c1 += (_lerp_at3(oa, 1, cy0, cx0, cy1, cx1, fy, fx) - c1) * a
+                c2 += (_lerp_at3(oa, 2, cy0, cx0, cy1, cx1, fy, fx) - c2) * a
+            if water_tex:
+                w = _lerp_at(wet, cy0, cx0, cy1, cx1, fy, fx)
+                if w > 0:
+                    st = _lerp_at(strength, cy0, cx0, cy1, cx1, fy, fx)
+                    fk = _lerp_at(foamk, cy0, cx0, cy1, cx1, fy, fx)
+                    rip = np.float32(0)
+                    fo = np.float32(0)
+                    for kk in range(2):
+                        ox, oy = _bilinear2(D, kk, yc, xc)
+                        qx = x + ox
+                        qy = y + oy
+                        rip += wt[kk] * _wrap2(frame, qx * kr, qy * kr)
+                        if fk > 0:
+                            fo += wt[kk] * _wrap2(foam, qx * kf, qy * kf)
+                    m = 1 + st * rip * w
+                    c0 *= m
+                    c1 *= m
+                    c2 *= m
+                    if fk > 0:
+                        fa = min(fo * fk, one) * w
+                        c0 += (235 - c0) * fa
+                        c1 += (240 - c1) * fa
+                        c2 += (245 - c2) * fa
+            out[i, j, 0] = np.uint8(min(max(c0, np.float32(0)), np.float32(255)))
+            out[i, j, 1] = np.uint8(min(max(c1, np.float32(0)), np.float32(255)))
+            out[i, j, 2] = np.uint8(min(max(c2, np.float32(0)), np.float32(255)))
+
+
 def _blur(a, passes=6):
     """The game's WaterParams blur as fitted: passes of a 4-neighbour average (wrapping at the edges,
     where the fields are faded to 0 anyway). Compiled in viewfast.blur (same sums in the same order)."""
@@ -336,6 +580,47 @@ class FlowLayer:
         out = np.empty((n * s, n * s, 3), np.uint8)
         _shade_uv(np.ascontiguousarray(base), depth, lv, np.float32(min_depth), s, self.D, strength, foamk,
                   self._frame(t), self.foam, self.wt, np.float32(self.kr), np.float32(self.kf), out)
+        return out
+
+    def shade_window(self, base, depth, flux, t, gy0, gx0, k, size, lava=None, min_depth=0.02):
+        """A zoomed view: (size, size, 3) uint8 of the grid window starting at grid point (gy0, gx0)
+        (top-left, cell units) at k pixels per cell, smooth (see _shade_window). Grid orientation."""
+        depth, lv = self.update(depth, flux, t, lava, min_depth)
+        vx, vy, strength, foamk = self.fields
+        b = np.asarray(base, np.float32)
+        wet = ((depth > min_depth) & (lv <= 0)).astype(np.float32)
+        out = np.empty((size, size, 3), np.uint8)
+        _shade_window(np.ascontiguousarray(b[..., 0]), np.ascontiguousarray(b[..., 1]), np.ascontiguousarray(b[..., 2]),
+                      wet, np.float32(gy0), np.float32(gx0), np.float32(k), self.D, strength, foamk,
+                      self._frame(t), self.foam, self.wt, np.float32(self.kr), np.float32(self.kf), out)
+        return out
+
+    def shade_textured(self, fr, t, gy0, gx0, k, size, light, lava_xs, lava_cs, water_tex=True, min_depth=0.02):
+        """Natural view with the game's sand / rock textures (see _shade_textured) for the grid window at
+        (gy0, gx0), k pixels per cell, (size, size, 3) uint8, grid orientation. fr = dustview.Frame."""
+        import viewfast
+        n = self.n
+        if not hasattr(self, '_layers'):
+            self._layers = (np.empty((n, n), np.float32), np.empty((n, n), np.float32), np.empty((n, n), np.float32),
+                            np.empty((n, n, 3), np.float32), np.empty((n, n), np.float32))
+        gxa, gya, sfa, oa, aa = self._layers
+        viewfast.natural_layers(fr.ground, fr.soft, fr.water, fr.lava, fr.sediment, fr.temperature,
+                                lava_xs, lava_cs, gxa, gya, sfa, oa, aa)
+        if water_tex:
+            depth, lv = self.update(fr.water, fr.flux, t, fr.lava, min_depth)
+        else:
+            depth, lv = np.asarray(fr.water, np.float32), np.asarray(fr.lava, np.float32)
+        vx, vy, strength, foamk = self.fields
+        wet = ((depth > min_depth) & (lv <= 0)).astype(np.float32)
+        soft_m, hard_m, ramp = load_ground_textures()
+        tpc0 = soft_m[0].shape[0] * GROUND_TILES / n          # texels per cell at full resolution (32)
+        level = int(min(max(np.floor(np.log2(max(tpc0 / k, 1.0))), 0), len(soft_m) - 1))   # ~1-2 texels per pixel
+        out = np.empty((size, size, 3), np.uint8)
+        _shade_textured(gxa, gya, sfa, oa, aa, wet, np.float32(gy0), np.float32(gx0), np.float32(k),
+                        soft_m[level], hard_m[level], np.float32(tpc0 / 2 ** level), ramp,
+                        np.float32(RAMP_V_HARD), np.float32(RAMP_V_SOFT), np.float32(BUMP), np.float32(GROUND_GAIN),
+                        np.asarray(light, np.float32), bool(water_tex), self.D, strength, foamk, self._frame(t),
+                        self.foam, self.wt, np.float32(self.kr), np.float32(self.kf), out)
         return out
 
     DEBUG_MODES = ('foam', 'velocity', 'drag')

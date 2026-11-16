@@ -872,6 +872,8 @@ class App:
         self.tool, self.brush_radius, self.brush_strength = 'inspect', 6, 10.0   # editing (model mode)
         self.lava_temperature = LAVA_TEMPERATURE
         self.zoom, self.view_x0, self.view_y0 = 1.0, 0.0, 0.0   # zoom and the top-left display cell shown
+        self.smooth = True                               # interpolate when zoomed (False: crisp cells)
+        self.ground_tex = True                           # natural view: the game's sand / rock textures
         self.drag = None                                 # (x, y, view_x0, view_y0, moved) while panning
         self.painting, self.paint_time = None, None      # +1 add / -1 remove while a mouse button is held
         self.show_events, self.events = True, []        # (time, row, col, cells, total)
@@ -929,6 +931,15 @@ class App:
         """Display cell (y, x) under canvas pixel (ex, ey)."""
         k = self.px_per_cell()
         return (int(min(N - 1, max(0, self.view_y0 + ey / k))), int(min(N - 1, max(0, self.view_x0 + ex / k))))
+
+    def display_to_grid(self, yd, xd):
+        """Continuous display coordinates -> grid (row, col) coordinates (flip / rotation are quarter
+        turns and mirrors, so this is exact and maps rectangles to rectangles)."""
+        r0, c0 = self.idx_r[0, 0], self.idx_c[0, 0]
+        dy = (self.idx_r[1, 0] - r0, self.idx_c[1, 0] - c0)
+        dx = (self.idx_r[0, 1] - r0, self.idx_c[0, 1] - c0)
+        return (r0 + 0.5 + dy[0] * (yd - 0.5) + dx[0] * (xd - 0.5),
+                c0 + 0.5 + dy[1] * (yd - 0.5) + dx[1] * (xd - 0.5))
 
     def _clamp_view(self):
         v = N / self.zoom
@@ -1264,21 +1275,32 @@ class App:
                 self.flow.update(fr.water, fr.flux, self.flow_time, fr.lava)
                 self.flow_drawn = time.time()
             rgb, self.tex_read = engine_textures.image(self.texture, fr, self.flow if flow_tex else None, level_number(self.src))
+        elif self.view == 'natural' and self.ground_tex:
+            rgb = None                                   # drawn per pixel below
         else:
             rgb = render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else render(fr, self.view)
         size, v = N * self.scale, N / self.zoom          # canvas pixels; visible cells across
         x0, y0 = self.view_x0, self.view_y0
-        if self.flow_on and self.view == 'natural':
-            hi = self.flow.shade(rgb, fr.water, fr.flux, self.flow_time, fr.lava, sediment=fr.sediment)
+        if self.view == 'natural' and self.ground_tex:
+            (ra, ca), (rb, cb) = self.display_to_grid(y0, x0), self.display_to_grid(y0 + v, x0 + v)
+            hi = self.flow.shade_textured(fr, self.flow_time, min(ra, rb), min(ca, cb), self.px_per_cell(), size,
+                                          LIGHT, _LAVA_XS, _LAVA_CS, water_tex=self.flow_on)
             img = Image.fromarray(np.ascontiguousarray(self.orient(hi)), 'RGB')
             self.flow_drawn = time.time()
-            if self.zoom != 1:                   # the flow texture is rendered at window resolution: smooth it
-                s_ = self.scale
-                img = img.resize((size, size), Image.BILINEAR, box=(x0 * s_, y0 * s_, (x0 + v) * s_, (y0 + v) * s_))
+        elif self.flow_on and self.view == 'natural':
+            if self.zoom == 1:
+                hi = self.flow.shade(rgb, fr.water, fr.flux, self.flow_time, fr.lava, sediment=fr.sediment)
+            else:                                # render just the visible window at screen resolution
+                (ra, ca), (rb, cb) = self.display_to_grid(y0, x0), self.display_to_grid(y0 + v, x0 + v)
+                hi = self.flow.shade_window(rgb, fr.water, fr.flux, self.flow_time, min(ra, rb), min(ca, cb),
+                                            self.px_per_cell(), size, fr.lava)
+            img = Image.fromarray(np.ascontiguousarray(self.orient(hi)), 'RGB')
+            self.flow_drawn = time.time()
         else:
             img = Image.fromarray(np.ascontiguousarray(self.orient(rgb)), 'RGB')
             if self.scale != 1 or self.zoom != 1:
-                img = img.resize((size, size), Image.NEAREST, box=(x0, y0, x0 + v, y0 + v))
+                smooth = self.smooth and self.zoom != 1
+                img = img.resize((size, size), Image.BILINEAR if smooth else Image.NEAREST, box=(x0, y0, x0 + v, y0 + v))
         k = self.px_per_cell()
         sources = self.current_sources()
         if self.overlay and sources:
