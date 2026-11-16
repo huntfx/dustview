@@ -41,6 +41,17 @@ def read_index(path):
     return out
 
 
+
+def read_entry(path, name):
+    """Bytes of one entry (by exact name), or None."""
+    for e in read_index(path):
+        if e['name'] == name:
+            with open(path, 'rb') as f:
+                f.seek(e['offset'])
+                return f.read(e['size'])
+    return None
+
+
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
     cmd, *args = sys.argv[1:]

@@ -155,6 +155,36 @@ def totems(p, delta=None):
     return list(out.values())
 
 
+
+# ---------------------------------------------------------------- village repel songs
+SONG_VTABLES = {'water': 0x1016C1CC, 'lava': 0x1016C214}     # dustai objects for entities 0x20400009 / 0x2040000A
+
+
+def songs(p, delta=None):
+    """Live repel-song objects: kind ('water' / 'lava'), grid cell (+0x7C / +0x80), size ([+0x74]+0x1EC)
+    and the RepulseFluid entry the game pushes for it every tick (water radius trunc(size x 2/3),
+    lava size x 2/3; mode -1 water / +1 lava; amount 1). Works without the per-tick modifier list (which
+    needs a running generator to be found)."""
+    delta = dustai_delta(p) if delta is None else delta
+    out = []
+    for kind, vt in SONG_VTABLES.items():
+        for a in p.find(struct.pack('<I', vt + delta)):
+            raw = p.read(a, 0x8C)
+            if raw is None:
+                continue
+            col, row = struct.unpack_from('<2I', raw, 0x7C)
+            if not (0 < col < 512 and 0 < row < 512):
+                continue                                      # code bytes that mention the vtable
+            sz = p.read(struct.unpack_from('<I', raw, 0x74)[0] + 0x1EC, 4)
+            size = struct.unpack('<f', sz)[0] if sz else float('nan')
+            if not (1 < size < 200):
+                continue
+            radius = float(int(size * 2 / 3)) if kind == 'water' else size * 2 / 3
+            out.append(dict(kind=kind, col=col, row=row, size=size, type=1, radius=radius, amount=1.0,
+                            f5=-1.0 if kind == 'water' else 1.0, f3=0.0, sediment=0.0, temperature=0.0))
+    return out
+
+
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
     p = memscan.Proc()

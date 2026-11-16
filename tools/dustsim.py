@@ -39,6 +39,14 @@ def ramp(x, x0, x1, y0, y1):
 
 
 def step(G, P):
+    """One full simulation step: the compiled version (dustsim_nb, numba) when available and DEBUG is
+    off, otherwise step_numpy. Both give bit-identical results (checked with tools/check_nb.py)."""
+    if _nb is not None and not DEBUG:
+        return _nb.step(G, P)
+    return step_numpy(G, P)
+
+
+def step_numpy(G, P):
     """One full simulation step (water, sand, sediment and lava). G: dict with
     T (terrain surface), soft (soft ground), W (fluid height; negative = lava),
     sed (sediment for water / temperature for lava), F (int32[4] stored outflows, 1/256 units).
@@ -165,6 +173,12 @@ def step(G, P):
     return out_d
 
 
+try:                                   # compiled step (needs numba, e.g. the FromDust/.venv)
+    import dustsim_nb as _nb
+except ImportError:
+    _nb = None
+
+
 def from_grid(grid):
     """galileo.py grid (8, 512, 512) uint32 -> dict for step()."""
     gf = lambda c: grid[c].view(np.float32).copy()
@@ -192,8 +206,22 @@ def set_border_ring(G, P):
         G['T'][sl], G['soft'][sl], G['W'][sl], G['sed'][sl] = ground, soft, water, 0
 
 
+_DISC_CACHE = {}
+
+
 def disc(col, row, radius):
-    """Cells of a source: dx^2 + dy^2 <= r^2 around the centre cell (as measured in the game)."""
+    """Cells of a source: dx^2 + dy^2 <= r^2 around the centre cell (as measured in the game).
+    Cached (the returned arrays are shared: don't modify them)."""
+    key = (int(col), int(row), float(radius))
+    hit = _DISC_CACHE.get(key)
+    if hit is None:
+        if len(_DISC_CACHE) > 4096:
+            _DISC_CACHE.clear()
+        hit = _DISC_CACHE[key] = _disc(*key)
+    return hit
+
+
+def _disc(col, row, radius):
     r = int(np.ceil(radius))
     dy, dx = np.mgrid[-r:r + 1, -r:r + 1]
     keep = dx * dx + dy * dy <= radius * radius
@@ -332,15 +360,14 @@ def tick(G, P, sources=(), repulsors=()):
     outside the ring is kept unchanged. Not modelled: tides/waves, script changes, player powers."""
     a, b = RING
     set_border_ring(G, P)
-    out = step(G, P)
-    inner = (slice(a, b + 1), slice(a, b + 1))
+    out = step(G, P)                                   # fresh arrays: copy the old band into them
+    band = ((slice(0, a), slice(None)), (slice(b + 1, None), slice(None)),
+            (slice(a, b + 1), slice(0, a)), (slice(a, b + 1), slice(b + 1, None)))
     for k in ('T', 'soft', 'W', 'sed'):
-        keep = G[k].copy()
-        keep[inner] = out[k][inner]
-        out[k] = keep
-    F = G['F'].copy()
-    F[:, inner[0], inner[1]] = out['F'][:, inner[0], inner[1]]
-    out['F'] = F
+        for sl in band:
+            out[k][sl] = G[k][sl]
+    for ys, xs in band:
+        out['F'][:, ys, xs] = G['F'][:, ys, xs]
     apply_sources(out, sources, P)
     for e in repulsors:
         repulse_fluid(out, e['col'], e['row'], e['radius'], e['amount'], e['f5'])

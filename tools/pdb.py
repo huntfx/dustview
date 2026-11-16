@@ -7,6 +7,7 @@ Usage:
   python pdb.py <file.pdb> enum  <substring>      # enums whose name contains substring
   python pdb.py <file.pdb> struct <substring>     # structs/classes/unions (with fields)
   python pdb.py <file.pdb> names                  # all UDT names with sizes
+  python pdb.py <file.pdb> vmethods <substring>   # virtual methods introduced by a class, with vtable slots
   python pdb.py <file.pdb> globals <substring>    # public/global symbol names (+ section:offset)
 
 Format notes (from the LLVM PDB docs): superblock at 0, block size at +0x20, stream
@@ -146,13 +147,21 @@ class Types:
             elif sub == 0x1511:  # LF_ONEMETHOD
                 attr, ty = struct.unpack_from('<HI', p, o + 2)
                 mprop = (attr >> 2) & 7
+                vofs = struct.unpack_from('<I', p, o + 8)[0] if mprop in (4, 6) else None
                 o2 = o + 8 + (4 if mprop in (4, 6) else 0)
                 nm, o2 = cstr(p, o2)
-                out.append(('method', nm, None, ty))
-            elif sub == 0x150f:  # LF_METHOD (overloaded)
+                out.append(('method', nm, vofs, ty))
+            elif sub == 0x150f:  # LF_METHOD (overloaded): entries in an LF_METHODLIST
                 cnt, ml = struct.unpack_from('<HI', p, o + 2)
                 nm, o2 = cstr(p, o + 8)
-                out.append(('method', nm, None, None))
+                mk, mp = self.recs.get(ml, (None, b''))
+                q = 0
+                while q < len(mp):
+                    attr, _, ty = struct.unpack_from('<HHI', mp, q)
+                    mprop = (attr >> 2) & 7
+                    vofs = struct.unpack_from('<I', mp, q + 8)[0] if mprop in (4, 6) else None
+                    q += 8 + (4 if mprop in (4, 6) else 0)
+                    out.append(('method', nm, vofs, ty))
             elif sub == 0x1404:  # LF_INDEX (continuation)
                 ty = struct.unpack_from('<I', p, o + 4)[0]
                 out += self.fields(ty)
@@ -196,6 +205,13 @@ def main():
                 elif k == 'static':
                     print('  static  %-45s %s' % (nm, T.name(ty)))
             print()
+    elif cmd == 'vmethods':                     # introduced virtual methods with their vtable offsets
+        for ti, u in T.find(arg, (0x1504, 0x1505)):
+            ms = [(off, nm) for k, nm, off, ty in T.fields(u['flist']) if k == 'method' and off is not None]
+            if ms:
+                print(u['name'])
+                for off, nm in sorted(ms):
+                    print('  vtable +0x%03x (slot %d)  %s' % (off, off // 4, nm))
     elif cmd == 'names':
         for ti, u in T.find(arg, (0x1504, 0x1505, 0x1506, 0x1507)):
             print('0x%-6x %s' % (u['size'], u['name']))
