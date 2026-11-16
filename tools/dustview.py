@@ -17,7 +17,7 @@ bottom), which matches the game according to play; --no-flip shows grid row 0 at
 the village counts the script checks. Waves and tsunamis drive the edge lines (wave table). No game needed.
 
 Control panel (right; tools/dustview_panel.py): source status with Live game / Continue in model, then
-tabs Map (start a level file, load one of the player's saves or open a .sav), Model (pause, step,
+tabs Map (pick a level, then start it fresh or load one of its saves from any profile, or open a .sav), Model (pause, step,
 speed, villages) and View (views, overlays, flip / rotate, zoom, screenshot). Without a running game the
 viewer opens empty. The keys below do the same; the panel follows them.
 
@@ -265,7 +265,7 @@ class LiveGame(Source):
         for _ in range(4):
             m = self._counter()
             if m == self.last_tick:
-                self.paused = len(self.tick_times) > 1 and time.time() - self.tick_times[-1][1] > 0.5
+                self.paused = bool(self.tick_times) and time.time() - self.tick_times[-1][1] > 0.5   # no new tick for 0.5 s (also when connected to an already paused game: one tick seen)
                 return None
             bufs = struct.unpack('<2I', self.p.read(self.base + 0x950, 8))
             raw = self.p.read(bufs[(m - 1) & 1], GRID_BYTES)
@@ -581,25 +581,46 @@ def level_names():
     """Level files in the game's DustSave/Ingame folder (story maps first, then the challenge maps)."""
     import compare_sim, re
     names = [f[:-4] for f in os.listdir(compare_sim.SAVES) if f.lower().endswith('.sav')]
-    def key(n):
+    import level_names as ln
+    def key(n):                                  # story order, then challenges in the game's order
         m = re.match(r'ALPHA_Map(\d+)_', n)
-        return (0, int(m.group(1)), n) if m else (1, 0, n)
+        return (0, int(m.group(1)), n) if m else (1, ln.CHALLENGE.get(n, (99,))[0], n)
     return sorted(names, key=key)
 
 
+def profile_names():
+    """Player name per profile folder: Documents/Dust/profiles/profile_NN.xml has <PlayerData name="...">."""
+    import glob, re, sav_sources
+    out = {}
+    for x in glob.glob(os.path.join(os.path.dirname(sav_sources.PROGRESS_DIR), 'profiles', 'profile_*.xml')):
+        try:
+            m = re.search(r'<PlayerData\s+name="([^"]*)"', open(x, encoding='utf-8', errors='replace').read())
+        except OSError:
+            continue
+        if m:
+            out[os.path.splitext(os.path.basename(x))[0]] = m.group(1)
+    return out
+
+
 def player_saves():
-    """The player's progress saves (Documents/Dust/DustSave/profile_*/ingame/MAP_nn.SAV, nn = story map
-    - 1): list of (path, label)."""
+    """The player's progress saves, all profiles (Documents/Dust/DustSave/profile_*/ingame/MAP_nn.SAV,
+    nn = story map - 1), newest first: dicts with path, level (level file name, by number; the Map2/Map3
+    demo files get none), profile (folder), player (name from the profile, or the folder), time (mtime)
+    and label."""
     import glob, re, sav_sources
     names = level_names()
+    who = profile_names()
     out = []
-    for p in sorted(glob.glob(os.path.join(sav_sources.PROGRESS_DIR, 'profile_*', 'ingame', 'MAP_*.SAV'))):
+    for p in glob.glob(os.path.join(sav_sources.PROGRESS_DIR, 'profile_*', 'ingame', 'MAP_*.SAV')):
         m = re.match(r'MAP_(\d+)\.SAV$', os.path.basename(p), re.I)
         lvl = [n for n in names if m and n.startswith('ALPHA_Map%d_' % (int(m.group(1)) + 1)) and 'Demo' not in n]
-        out.append((p, '%s  %s  %s  (%s)' % (os.path.basename(p)[:-4], lvl[0][6:] if lvl else '?',
-                                             time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(p))),
-                                             os.path.basename(os.path.dirname(os.path.dirname(p))))))
-    return out
+        prof = os.path.basename(os.path.dirname(os.path.dirname(p)))
+        t = os.path.getmtime(p)
+        player = who.get(prof, prof)
+        out.append(dict(path=p, level=lvl[0] if lvl else None, profile=prof, player=player, time=t,
+                        label='%s  %s  (%s)' % (player, time.strftime('%Y-%m-%d %H:%M', time.localtime(t)),
+                                                os.path.basename(p)[:-4])))
+    return sorted(out, key=lambda d: -d['time'])
 
 
 def level_for_save(path):
@@ -634,7 +655,7 @@ def progress_save_for(name):
     if not m:
         return None
     want = 'MAP_%02d.SAV' % (int(m.group(1)) - 1)
-    hits = [p for p, _ in player_saves() if os.path.basename(p).upper() == want and level_for_save(p) == name]
+    hits = [d['path'] for d in player_saves() if os.path.basename(d['path']).upper() == want and level_for_save(d['path']) == name]
     return max(hits, key=os.path.getmtime) if hits else None
 
 

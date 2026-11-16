@@ -3,12 +3,13 @@
 Everything here calls the same App actions as the keyboard shortcuts (shown in brackets), and `sync()`
 (called every frame) copies the App's state back into the widgets, so keys and panel never disagree.
 Layout: what is shown (live game or the Python model) and the live / takeover buttons always at the top,
-then tabs: Map (start a level file, load one of the player's saves), Model (pause, step, speed,
+then tabs: Map (pick a level, then start it fresh or load one of its saves, all profiles), Model (pause, step, speed,
 villages), View (views, overlays, display).
 """
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog
+import level_names
 
 VIEW_LABELS = (('1', 'natural', 'Natural'), ('2', 'height', 'Height'), ('3', 'water depth', 'Water depth'),
                ('4', 'lava temperature', 'Lava temperature'), ('5', 'sediment', 'Sediment'),
@@ -40,23 +41,31 @@ class ControlPanel:
         tab_map, tab_model, tab_view = (self._tab(t) for t in ('Map', 'Model', 'View'))
         self.tabs.bind('<<NotebookTabChanged>>', lambda e: self.root.focus_set())
 
-        # ---- level files
-        box = self._section('Start a level (fresh map)', tab_map)
+        # ---- map: pick a level, then start it fresh or load one of its saves
+        box = self._section('Level', tab_map)
         self.levels = dv.level_names()
-        self.level = tk.StringVar(value=self._default_level())
-        self._combo(box, self.level, self.levels).pack(fill='x')
-        self._button(box, 'Start level', lambda: app.load_level(self.level.get())).pack(anchor='w', pady=(4, 0))
-
-        # ---- player saves
-        box = self._section('Load my save (map as I left it)', tab_map)
         self.saves = dv.player_saves()
-        self.save = tk.StringVar(value=self.saves[-1][1] if self.saves else '')
-        self._combo(box, self.save, [s[1] for s in self.saves]).pack(fill='x')
+        self.level_labels = {}                       # shown text -> file name
+        for n in self.levels:
+            k = sum(1 for d in self.saves if d['level'] == n)
+            self.level_labels[level_names.label(n) + ('   [%d save%s]' % (k, 's' * (k != 1)) if k else '')] = n
+        self.level = tk.StringVar(value=self._level_label(self._default_level()))
+        self._combo(box, self.level, list(self.level_labels), self._show_saves, width=40).pack(fill='x')
+        self._button(box, 'Start fresh (as shipped, no villages)', self._start_fresh).pack(anchor='w', pady=(4, 0))
+        ttk.Label(box, text='Saves of this level (all profiles, newest first):').pack(anchor='w', pady=(8, 0))
+        self.save_list = tk.Listbox(box, height=5, activestyle='none', exportselection=False, takefocus=0)
+        self.save_list.pack(fill='x')
+        self.save_list.bind('<Double-Button-1>', lambda e: self._load_save())
+        self.save_list.bind('<<ListboxSelect>>', lambda e: self.root.focus_set())
         row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
-        self._button(row, 'Load save', self._load_save).pack(side='left')
+        self.load_btn = self._button(row, 'Load save', self._load_save)
+        self.load_btn.pack(side='left')
         self._button(row, 'Open file...', self._open_file).pack(side='left', padx=(4, 0))
-        ttk.Label(box, text="Sources and the level script come from the level file; the script starts again "
-                            "from 0 s.", wraplength=240, foreground='#666').pack(fill='x', pady=(2, 0))
+        ttk.Label(box, text="A save is the map as it was left (terrain, water, lava, villages). Sources and the "
+                            "level script come from the level file; the script starts again from 0 s.",
+                  wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
+        self.shown_saves = []
+        self._show_saves()
 
         # ---- model
         box = self.model_box = self._section('Run', tab_model)
@@ -155,10 +164,32 @@ class ControlPanel:
         self.app.set_view('flow texture inputs') if self.app.view != 'flow texture inputs' else None
         self.app.dirty = True
 
+    def _level_label(self, name):
+        return next((k for k, v in self.level_labels.items() if v == name), name)
+
+    def _current_level(self):
+        return self.level_labels.get(self.level.get(), self.level.get())
+
+    def _start_fresh(self):
+        self.app.load_level(self._current_level())
+
+    def _show_saves(self):
+        """List the saves of the chosen level (all profiles)."""
+        name = self._current_level()
+        self.shown_saves = [d for d in self.saves if d['level'] == name]
+        self.save_list.delete(0, 'end')
+        for d in self.shown_saves:
+            self.save_list.insert('end', d['label'])
+        if self.shown_saves:
+            self.save_list.selection_set(0)
+        else:
+            self.save_list.insert('end', '(no saves of this level)')
+        self._enable(self.load_btn, bool(self.shown_saves))
+
     def _load_save(self):
-        hit = [p for p, label in self.saves if label == self.save.get()]
-        if hit:
-            self.app.load_save(hit[0])
+        sel = self.save_list.curselection()
+        if self.shown_saves and sel and sel[0] < len(self.shown_saves):
+            self.app.load_save(self.shown_saves[sel[0]]['path'])
 
     def _open_file(self):
         import sav_sources, compare_sim
@@ -184,7 +215,8 @@ class ControlPanel:
         src = app.src
         model = app.is_model()
         if model:
-            what = 'Python model: %s' % (src.label or 'model')
+            t = level_names.title(getattr(src, 'level_name', None))
+            what = 'Python model: %s%s' % ((t + ' | ') if t else '', src.label or 'model')
         elif isinstance(src, dv.LiveGame):
             what = 'Live game (read-only)'
         else:
@@ -211,8 +243,9 @@ class ControlPanel:
         if src is not self._shown_src:              # a new map: point the level list at it
             self._shown_src = src
             name = getattr(src, 'level_name', None)
-            if name in self.levels:
-                self._put(self.level, name)
+            if name in self.levels and self._current_level() != name:
+                self._put(self.level, self._level_label(name))
+                self._show_saves()
 
     @staticmethod
     def _enable(w, on, readonly=False):
