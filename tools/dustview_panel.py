@@ -3,8 +3,9 @@
 Everything here calls the same App actions as the keyboard shortcuts (shown in brackets), and `sync()`
 (called every frame) copies the App's state back into the widgets, so keys and panel never disagree.
 Layout: what is shown (live game or the Python model) and the live / takeover buttons always at the top,
-then tabs: Map (pick a level, then its empty map or one of its saves, all profiles), Model (pause, step, speed,
-villages), View (views incl. the engine-texture dropdown, overlays, display).
+then tabs: Map (pick a level, then one of its saves or New, all profiles), Model (pause, step, speed,
+villages), Edit (paint water / lava / sand / rock with the game's own modifiers, model mode), View (views
+incl. the engine-texture dropdown, overlays, display).
 """
 import os
 import tkinter as tk
@@ -15,6 +16,8 @@ import engine_textures
 VIEW_LABELS = (('natural', 'Natural'), ('height', 'Height'), ('water depth', 'Water depth'),
                ('lava temperature', 'Lava temperature'), ('sediment', 'Sediment'), ('flow speed', 'Flow speed'),
                ('unexplained changes', 'Unexplained changes (live)'), ('engine texture', 'Engine texture:'))
+TOOL_LABELS = (('inspect', 'Inspect (click a totem: village on / off; drag pans)'), ('water', 'Water'), ('lava', 'Lava'),
+               ('sand', 'Sand (soft ground)'), ('rock', 'Rock (hard ground)'))
 EMPTY_MAP = 'New (the level as shipped, no villages)'
 SPEED_LABELS = ((1, '1x'), (2, '2x'), (4, '4x'), (0, 'max'))
 
@@ -38,7 +41,7 @@ class ControlPanel:
         # ---- tabs: Map / Model / View
         self.tabs = ttk.Notebook(f, takefocus=False)
         self.tabs.pack(fill='both', expand=True)
-        tab_map, tab_model, tab_view = (self._tab(t) for t in ('Map', 'Model', 'View'))
+        tab_map, tab_model, tab_edit, tab_view = (self._tab(t) for t in ('Map', 'Model', 'Edit', 'View'))
         self.tabs.bind('<<NotebookTabChanged>>', lambda e: self.root.focus_set())
 
         # ---- map: pick a level, then its empty map or one of its saves
@@ -85,6 +88,38 @@ class ControlPanel:
         self.totem_frame = ttk.Frame(box); self.totem_frame.pack(fill='x')
         self.totem_vars = []
 
+        # ---- edit (model mode): tool, brush size, strength
+        box = self._section('Tool', tab_edit)
+        self.tool = tk.StringVar(value=app.tool)
+        for tool, text in TOOL_LABELS:
+            self._radio(box, text, self.tool, tool, lambda: app.set_tool(self.tool.get())).pack(anchor='w')
+        ttk.Label(box, text='Left button adds, right button removes.', foreground='#666').pack(anchor='w', pady=(4, 0))
+        box = self._section('Brush', tab_edit)
+        self.brush_radius = tk.IntVar(value=app.brush_radius)
+        self.brush_strength = tk.DoubleVar(value=app.brush_strength)
+        self.lava_temperature = tk.DoubleVar(value=app.lava_temperature)
+        self.radius_text, self.strength_text, self.temp_text = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        for label, var, text, lo, hi, cmd in (
+                ('Size ([ ])', self.brush_radius, self.radius_text, dv.BRUSH_MIN, dv.BRUSH_MAX,
+                 lambda v: app.set_brush(radius=round(float(v)))),
+                ('Strength', self.brush_strength, self.strength_text, 1, 60,
+                 lambda v: app.set_brush(strength=round(float(v), 1))),
+                ('Lava heat', self.lava_temperature, self.temp_text, 13, 255,
+                 lambda v: app.set_brush(temperature=round(float(v))))):
+            row = ttk.Frame(box); row.pack(fill='x', pady=(2, 0))
+            ttk.Label(row, text=label, width=10).pack(side='left')
+            ttk.Scale(row, from_=lo, to=hi, variable=var, command=cmd, takefocus=False).pack(side='left', fill='x', expand=True)
+            ttk.Label(row, textvariable=text, width=7).pack(side='left')
+        ttk.Label(box, text='Size = radius in cells. Strength = height added or removed per cell per second '
+                            '(a spring adds ~25). Lava heat: 255 = a vent\'s fresh lava, it hardens at 12.5 (the '
+                            'shipped maps hold 12.5-255). The game\'s own rules: water on lava cools it to rock, lava '
+                            'on water boils it off and hardens; sand and rock raise the ground. The fixed '
+                            'border band is not edited.',
+                  wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
+        ttk.Label(tab_edit, text='Painting works on the Python model (Map tab, or "Continue in model" from the '
+                                 'live game); the game itself is never written to.',
+                  wraplength=260, foreground='#666').pack(fill='x', pady=(4, 0))
+
         # ---- view
         box = self._section('Map view', tab_view)
         self.view = tk.StringVar(value=app.view)
@@ -111,6 +146,15 @@ class ControlPanel:
         self._button(row, 'Rotate (R)', app.rotate_view).pack(side='left', padx=(8, 0))
         row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
         ttk.Label(row, text='Zoom:').pack(side='left')
+        self._button(row, '-', lambda: app.zoom_step(-1)).pack(side='left', padx=(4, 0))
+        self._button(row, '+', lambda: app.zoom_step(1)).pack(side='left', padx=(2, 0))
+        self._button(row, 'Whole map', lambda: app.set_zoom(1)).pack(side='left', padx=(4, 0))
+        self.zoom_text = tk.StringVar()
+        ttk.Label(row, textvariable=self.zoom_text).pack(side='left', padx=(6, 0))
+        ttk.Label(box, text='Mouse wheel zooms at the cursor; middle-drag pans (or left-drag with the Inspect tool).',
+                  wraplength=250, foreground='#666').pack(fill='x')
+        row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
+        ttk.Label(row, text='Window size:').pack(side='left')
         self.scale = tk.IntVar(value=app.scale)
         for s in (1, 2, 3):
             self._radio(row, '%dx' % s, self.scale, s, lambda: app.set_scale(self.scale.get())).pack(side='left', padx=(4, 0))
@@ -232,6 +276,12 @@ class ControlPanel:
             self._put(self.speed, src.speed)
         self._put(self.view, app.view)
         self._put(self.texture, engine_textures.LABELS.get(app.texture, app.texture))
+        self._put(self.tool, app.tool)
+        self._put(self.brush_radius, app.brush_radius)
+        self._put(self.radius_text, '%d' % app.brush_radius)
+        self._put(self.strength_text, '%.1f/s' % app.brush_strength)
+        self._put(self.temp_text, '%.0f' % app.lava_temperature)
+        self._put(self.zoom_text, '%gx' % app.zoom)
         for attr, v in self.checks.items():
             self._put(v, bool(getattr(app, attr)))
         self._put(self.flip, bool(app.flip))

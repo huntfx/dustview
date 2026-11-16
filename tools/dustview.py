@@ -50,7 +50,11 @@ Views (panel only): natural, height, water depth, lava temperature, sediment, fl
   D  terrain-change markers on/off (live only): terrain that changes in dry areas between frames,
      i.e. not caused by the simulation (moving dips, scripted terrain, powers). Magenta = lowered,
      yellow = raised; markers fade over 8 s; every spot is also logged to data/live/terrain_events_*.log
+  Edit tab (model mode): tools inspect (click totems), water, lava, sand, rock; left button adds, right
+     button removes, [ / ] brush size. Uses the game's own modifiers (Add/RemoveWater,
+     Add/RemoveLava at temperature 255, SoftGround, HardGround); the fixed border band is not edited.
   S  save a screenshot to data/live/    Esc quit
+Mouse wheel: zoom (1x-8x) about the cursor. Middle-drag (or left-drag with the inspect tool): pan.
 Mouse: hover for the cell's values (col/row, ground, soft ground, water or lava, sediment/temperature).
 
 Reading the game: the simulator object (ISimulatorWater) is found by its parameter array
@@ -489,6 +493,7 @@ class ModelSource(Source):
         self.published = None
         self.times = []
         self.lock = threading.Lock()
+        self.pending, self.edits = [], 0         # queued edits (functions on the state dict), edits applied
         self.schedule = schedule                 # level_schedule.LevelSchedule: script-driven sources + tide
         self.totems = [dict(t) for t in totems] if totems else []
         self.loose_repulsors = list(self.other_modifiers)   # repulsors that belong to no totem: kept as they are
@@ -508,8 +513,9 @@ class ModelSource(Source):
     def _loop(self):
         due = time.perf_counter()
         while self.running:
+            self._apply_edits()
             if self.paused and not self.step_req:
-                time.sleep(0.02); due = time.perf_counter(); continue
+                time.sleep(0.01); due = time.perf_counter(); continue
             speed = self.speed                       # read once: the UI thread can change it meanwhile
             if self.paused:                          # single step while paused (no pacing)
                 self.step_req -= 1
@@ -534,15 +540,32 @@ class ModelSource(Source):
                 now = time.time()
                 self.times = [t for t in self.times if now - t < 3] + [now]
 
+    def edit(self, fn):
+        """Queue fn(G) (in-place change of the state dict); the model thread applies it before its next
+        tick, or within ~10 ms while paused."""
+        with self.lock:
+            self.pending.append(fn)
+
+    def _apply_edits(self):
+        with self.lock:
+            todo, self.pending = self.pending, []
+        if not todo:
+            return
+        G = {k: v.copy() for k, v in self.G.items()}   # a copy: read() may be converting the old state
+        for fn in todo:
+            fn(G)
+        with self.lock:
+            self.G, self.edits = G, self.edits + 1
+
     def ticks_per_second(self):
         times = self.times
         return (len(times) - 1) / max(times[-1] - times[0], 1e-6) if len(times) > 1 else 0.0
 
     def read(self):
         with self.lock:
-            if self.published == self.tick:
+            if self.published == (self.tick, self.edits):
                 return None
-            self.published, G, t = self.tick, self.G, self.tick
+            self.published, G, t = (self.tick, self.edits), self.G, self.tick
         return Frame(t, state_to_grid(G, self.extra), self.params, self.sources, self.name)
 
     def status(self):
@@ -705,6 +728,33 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
     return ms
 
 
+# ---------------------------------------------------------------- editing (model mode)
+TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock')
+LAVA_TEMPERATURE = 255.0                         # internal units, as the level files' lava vents
+BRUSH_MIN, BRUSH_MAX = 1, 40
+
+
+def brush_edit(tool, col, row, radius, amount, P, temperature=LAVA_TEMPERATURE):
+    """An edit for ModelSource.edit: the game's own modifiers on a disc (dustsim.fluid_modifier =
+    Add/RemoveWater and Add/RemoveLava, dustsim.ground_modifier = SoftGround / HardGround), amount per cell
+    (negative removes). Cells in the fixed border band (dustsim.SKIP) are left alone."""
+    ys, xs = dustsim.disc(col, row, radius)
+    lo, hi = dustsim.RING[0] + 1, dustsim.RING[1] - 1
+    keep = (ys >= lo) & (ys <= hi) & (xs >= lo) & (xs <= hi)
+    ys, xs = ys[keep], xs[keep]
+
+    def fn(G):
+        if not len(ys):
+            return
+        if tool == 'water':
+            dustsim.fluid_modifier(G, ys, xs, amount, 0.0, 0.0, P)
+        elif tool == 'lava':
+            dustsim.fluid_modifier(G, ys, xs, amount, 0.0, temperature, P)
+        elif tool in ('sand', 'rock'):
+            dustsim.ground_modifier(G, ys, xs, amount, soft=(tool == 'sand'))
+    return fn
+
+
 # ---------------------------------------------------------------- rendering
 LIGHT = np.array([-0.6, -0.6, 0.55]) / np.linalg.norm([-0.6, -0.6, 0.55])
 VIEWS = ('natural', 'height', 'water depth', 'lava temperature', 'sediment', 'flow speed', 'unexplained changes',
@@ -728,7 +778,8 @@ def shade(height):
     return np.clip((-gx * L[0] - gy * L[1] + L[2]) / np.sqrt(gx * gx + gy * gy + 1.0), 0, 1) * 0.75 + 0.25
 
 
-LAVA_STOPS = [(0, (40, 25, 20)), (12.5, (90, 20, 10)), (40, (170, 30, 10)), (90, (235, 90, 15)), (150, (255, 170, 40)), (255, (255, 245, 170))]
+LAVA_STOPS = [(0, (40, 25, 20)), (12.5, (90, 20, 10)), (40, (170, 30, 10)), (90, (225, 70, 10)), (150, (250, 120, 20)), (255, (255, 180, 50))]
+# DustView's own lava colours by temperature (the game's lava shader is not decoded); 255 = a vent's fresh lava
 
 
 _LAVA_XS = np.array([s[0] for s in LAVA_STOPS], np.float32)
@@ -818,6 +869,11 @@ class App:
         self.flow_on, self.flow, self.flow_drawn = True, None, 0.0
         self.flow_time, self.flow_clock = 0.0, time.time()   # flow texture time: runs with the simulation
         self.texture, self.tex_read = 'wp_foam_nofade', None   # engine texture view: entry, cell readout
+        self.tool, self.brush_radius, self.brush_strength = 'inspect', 6, 10.0   # editing (model mode)
+        self.lava_temperature = LAVA_TEMPERATURE
+        self.zoom, self.view_x0, self.view_y0 = 1.0, 0.0, 0.0   # zoom and the top-left display cell shown
+        self.drag = None                                 # (x, y, view_x0, view_y0, moved) while panning
+        self.painting, self.paint_time = None, None      # +1 add / -1 remove while a mouse button is held
         self.show_events, self.events = True, []        # (time, row, col, cells, total)
         self.acc, self.acc_time, self.acc_tick = {}, time.time(), None   # view 7 accumulators
         self.frame = None
@@ -841,7 +897,16 @@ class App:
         root.bind('<Key>', self.on_key)
         self.canvas.bind('<Motion>', self.on_move)
         self.canvas.bind('<Leave>', lambda e: self.set_mouse(None))
-        self.canvas.bind('<Button-1>', self.on_click)
+        self.canvas.bind('<Button-1>', self.on_press)
+        self.canvas.bind('<B1-Motion>', self.on_b1_motion)
+        self.canvas.bind('<ButtonRelease-1>', self.on_release)
+        self.canvas.bind('<Button-3>', lambda e: self.start_paint(e, -1))
+        self.canvas.bind('<B3-Motion>', self.on_move)
+        self.canvas.bind('<ButtonRelease-3>', lambda e: self.stop_paint())
+        self.canvas.bind('<Button-2>', self.start_drag)
+        self.canvas.bind('<B2-Motion>', self.on_drag)
+        self.canvas.bind('<ButtonRelease-2>', lambda e: self.end_drag())
+        root.bind('<MouseWheel>', self.on_wheel)        # Windows sends the wheel to the focused widget
         self._make_index()
         self.tick()
 
@@ -849,6 +914,71 @@ class App:
     def orient(self, a):
         a = np.rot90(a, self.rotate)
         return a[::-1] if self.flip else a
+
+    ZOOMS = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+
+    def px_per_cell(self):
+        return self.scale * self.zoom
+
+    def to_px(self, y, x):
+        """Canvas pixel (x, y) of the centre of display cell (y, x)."""
+        k = self.px_per_cell()
+        return (x + 0.5 - self.view_x0) * k, (y + 0.5 - self.view_y0) * k
+
+    def cell_at(self, ex, ey):
+        """Display cell (y, x) under canvas pixel (ex, ey)."""
+        k = self.px_per_cell()
+        return (int(min(N - 1, max(0, self.view_y0 + ey / k))), int(min(N - 1, max(0, self.view_x0 + ex / k))))
+
+    def _clamp_view(self):
+        v = N / self.zoom
+        self.view_x0 = min(max(self.view_x0, 0.0), N - v)
+        self.view_y0 = min(max(self.view_y0, 0.0), N - v)
+
+    def set_zoom(self, zoom, ex=None, ey=None):
+        """Zoom about canvas pixel (ex, ey) (default: the centre); the cell there stays put."""
+        size = N * self.scale
+        ex = size / 2 if ex is None else ex
+        ey = size / 2 if ey is None else ey
+        k = self.px_per_cell()
+        cx, cy = self.view_x0 + ex / k, self.view_y0 + ey / k
+        self.zoom = float(min(max(zoom, self.ZOOMS[0]), self.ZOOMS[-1]))
+        k = self.px_per_cell()
+        self.view_x0, self.view_y0 = cx - ex / k, cy - ey / k
+        self._clamp_view()
+        self.dirty = True
+
+    def zoom_step(self, d, ex=None, ey=None):
+        i = min(range(len(self.ZOOMS)), key=lambda j: abs(self.ZOOMS[j] - self.zoom))
+        self.set_zoom(self.ZOOMS[min(max(i + d, 0), len(self.ZOOMS) - 1)], ex, ey)
+
+    def on_wheel(self, e):
+        if self.root.winfo_containing(e.x_root, e.y_root) is not self.canvas:
+            return                                   # wheel over the panel (lists): not a zoom
+        ex, ey = e.x_root - self.canvas.winfo_rootx(), e.y_root - self.canvas.winfo_rooty()
+        self.zoom_step(1 if e.delta > 0 else -1, ex, ey)
+
+    def start_drag(self, e):
+        self.drag = (e.x, e.y, self.view_x0, self.view_y0, False)
+
+    def on_drag(self, e):
+        if self.drag is None:
+            return
+        x, y, x0, y0, moved = self.drag
+        if abs(e.x - x) + abs(e.y - y) > 3:
+            moved = True
+        k = self.px_per_cell()
+        self.view_x0, self.view_y0 = x0 - (e.x - x) / k, y0 - (e.y - y) / k
+        self._clamp_view()
+        self.drag = (x, y, x0, y0, moved)
+        self.dirty = True
+        self.on_move(e)
+
+    def end_drag(self):
+        """Returns True if the mouse moved (a pan, not a click)."""
+        moved = self.drag is not None and self.drag[4]
+        self.drag = None
+        return moved
 
     def _make_index(self):
         r, c = np.mgrid[0:N, 0:N]
@@ -886,6 +1016,46 @@ class App:
         self.texture = key
         self.set_view('engine texture')
 
+    def set_tool(self, tool):
+        self.tool = tool
+        if tool != 'inspect' and not self.is_model():
+            self.say('painting works on the Python model: press M (Continue in model) or load a map first')
+        self.dirty = True
+
+    def set_brush(self, radius=None, strength=None, temperature=None):
+        if temperature is not None:
+            self.lava_temperature = float(min(255.0, max(13.0, temperature)))
+        if radius is not None:
+            self.brush_radius = int(min(BRUSH_MAX, max(BRUSH_MIN, radius)))
+        if strength is not None:
+            self.brush_strength = float(strength)
+        self.dirty = True
+
+    def start_paint(self, e, sign):
+        if self.tool == 'inspect':
+            return
+        if not self.is_model():
+            self.say('painting works on the Python model: press M (Continue in model) or load a map first')
+            return
+        self.on_move(e)
+        self.painting, self.paint_time = sign, None
+        self.paint()
+
+    def stop_paint(self):
+        self.painting = None
+
+    def paint(self):
+        """Apply the brush at the mouse for the time since the last call (strength = amount per cell per
+        second; the first call of a stroke applies one 30 fps frame's worth)."""
+        if not self.painting or self.mouse is None or not self.is_model():
+            return
+        now = time.time()
+        dt = self.FRAME if self.paint_time is None else min(now - self.paint_time, 0.1)
+        self.paint_time = now
+        r, c = self.idx_r[self.mouse], self.idx_c[self.mouse]
+        self.src.edit(brush_edit(self.tool, int(c), int(r), self.brush_radius,
+                                 self.painting * self.brush_strength * dt, self.src.P, self.lava_temperature))
+
     def set_flip(self, flip):
         self.flip = flip; self._make_index(); self.dirty = True
 
@@ -896,6 +1066,7 @@ class App:
         if scale != self.scale:
             self.scale = scale
             self.info.configure(wraplength=N * scale, height=self.INFO_LINES.get(scale, 6))
+            self._clamp_view()
             self.dirty = True
 
     def toggle_pause(self):
@@ -978,7 +1149,11 @@ class App:
         if e.widget.winfo_class() in ('TCombobox', 'Entry', 'TEntry', 'Listbox'):
             return                                       # typing into a panel field
         k = e.keysym.lower()
-        if k == 'o':
+        if k == 'bracketleft':
+            self.set_brush(radius=self.brush_radius - 1)
+        elif k == 'bracketright':
+            self.set_brush(radius=self.brush_radius + 1)
+        elif k == 'o':
             self.overlay = not self.overlay
         elif k == 'f':
             self.flow_on = not self.flow_on
@@ -1027,17 +1202,39 @@ class App:
         self.dirty = True
 
     def on_move(self, e):
-        self.set_mouse((min(N - 1, max(0, e.y // self.scale)), min(N - 1, max(0, e.x // self.scale))))
+        self.set_mouse(self.cell_at(e.x, e.y))
+        if self.tool != 'inspect':
+            self.dirty = True                    # move the brush outline
+
+    def on_press(self, e):
+        """Left button: paint (edit tools) or start a pan / click (inspect)."""
+        if self.tool != 'inspect':
+            self.start_paint(e, +1)
+        else:
+            self.start_drag(e)
+
+    def on_b1_motion(self, e):
+        if self.tool != 'inspect':
+            self.on_move(e)
+        else:
+            self.on_drag(e)
+
+    def on_release(self, e):
+        if self.tool != 'inspect':
+            self.stop_paint()
+        elif not self.end_drag():
+            self.on_click(e)                     # a click, not a pan
 
     def on_click(self, e):
-        """Model mode: clicking within 8 cells of a totem builds / removes its village (songs unchanged)."""
+        """Inspect tool, model mode: clicking within 8 cells of a totem builds / removes its village (songs
+        unchanged)."""
         if not isinstance(self.src, ModelSource):
             if getattr(self.src, 'totems', None):
                 self.say('totems can be toggled in model mode: press M (or "Continue in model") first')
             return
         if not self.src.totems:
             return
-        y, x = min(N - 1, max(0, e.y // self.scale)), min(N - 1, max(0, e.x // self.scale))
+        y, x = self.cell_at(e.x, e.y)
         r, c = self.idx_r[y, x], self.idx_c[y, x]
         best = min(self.src.totems, key=lambda t: (t['row'] - r) ** 2 + (t['col'] - c) ** 2)
         if (best['row'] - r) ** 2 + (best['col'] - c) ** 2 <= 64:
@@ -1069,20 +1266,26 @@ class App:
             rgb, self.tex_read = engine_textures.image(self.texture, fr, self.flow if flow_tex else None, level_number(self.src))
         else:
             rgb = render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else render(fr, self.view)
+        size, v = N * self.scale, N / self.zoom          # canvas pixels; visible cells across
+        x0, y0 = self.view_x0, self.view_y0
         if self.flow_on and self.view == 'natural':
             hi = self.flow.shade(rgb, fr.water, fr.flux, self.flow_time, fr.lava, sediment=fr.sediment)
             img = Image.fromarray(np.ascontiguousarray(self.orient(hi)), 'RGB')
             self.flow_drawn = time.time()
+            if self.zoom != 1:                   # the flow texture is rendered at window resolution: smooth it
+                s_ = self.scale
+                img = img.resize((size, size), Image.BILINEAR, box=(x0 * s_, y0 * s_, (x0 + v) * s_, (y0 + v) * s_))
         else:
             img = Image.fromarray(np.ascontiguousarray(self.orient(rgb)), 'RGB')
-            if self.scale != 1:
-                img = img.resize((N * self.scale, N * self.scale), Image.NEAREST)
+            if self.scale != 1 or self.zoom != 1:
+                img = img.resize((size, size), Image.NEAREST, box=(x0, y0, x0 + v, y0 + v))
+        k = self.px_per_cell()
         sources = self.current_sources()
         if self.overlay and sources:
             marks = []
             for s in sources:
                 y, x = self.cell_to_disp[int(s['row']), int(s['col'])]
-                cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, max(3, (s['radius'] + 1.5) * self.scale)
+                cx, cy, r = *self.to_px(y, x), max(3, (s['radius'] + 1.5) * k)
                 if s['rate'] < 0:          # drains: dark red = lava drain, violet = water drain
                     colour = (200, 40, 60) if s['temperature'] else (170, 90, 255)
                 else:                      # orange = lava vent, cyan = spring
@@ -1102,7 +1305,7 @@ class App:
             now = time.time()
             for t, row, col, n, tot in self.events:
                 y, x = self.cell_to_disp[int(round(row)), int(round(col))]
-                cx, cy = (x + 0.5) * self.scale, (y + 0.5) * self.scale
+                cx, cy = self.to_px(y, x)
                 f = max(0.25, 1 - (now - t) / 8)
                 colour = tuple(int(v * f) for v in ((255, 0, 255) if tot < 0 else (255, 230, 0)))
                 r = 4 * self.scale + n ** 0.5 * self.scale
@@ -1118,7 +1321,7 @@ class App:
             dr = ImageDraw.Draw(img)
             for t in tots:
                 y, x = self.cell_to_disp[int(t['row']), int(t['col'])]
-                cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, 4 * self.scale
+                cx, cy, r = *self.to_px(y, x), 4 * self.scale
                 colour = (255, 205, 60) if t.get('built') else (150, 150, 150)
                 dr.rectangle([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
                 dr.text((cx + r + 2, cy + 2), totem_label(t), fill=colour)
@@ -1127,9 +1330,14 @@ class App:
             dr = ImageDraw.Draw(img)
             for e in others:
                 y, x = self.cell_to_disp[int(e['row']), int(e['col'])]
-                cx, cy, r = (x + 0.5) * self.scale, (y + 0.5) * self.scale, e['radius'] * self.scale
+                cx, cy, r = *self.to_px(y, x), e['radius'] * k
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(235, 235, 235), width=1)
                 dr.text((cx + r + 2, cy - 6), 'mod %+g/%+g' % (e['amount'], e['f5']), fill=(235, 235, 235))
+        if self.tool != 'inspect' and self.mouse is not None:
+            y, x = self.mouse
+            cx, cy, r = *self.to_px(y, x), (self.brush_radius + 0.5) * k
+            colour = {'water': (120, 200, 255), 'lava': (255, 120, 40), 'sand': (240, 210, 140), 'rock': (200, 200, 200)}[self.tool]
+            ImageDraw.Draw(img).ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=1)
         self.last_image = img
         ph = getattr(self, 'photo', None)
         if ph is not None and (ph.width(), ph.height()) == img.size:
@@ -1187,6 +1395,7 @@ class App:
                 self.say('loaded %s' % label)
         if getattr(self, 'pending_takeover', None):
             self.try_takeover()
+        self.paint()
         src = self.src
         if isinstance(src, ModelSource) and not src.totems and src.label.startswith('from live') \
                 and self.live is not None and getattr(self.live, 'totems', None):

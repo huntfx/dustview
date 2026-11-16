@@ -10,10 +10,11 @@ Each entry turns one per-cell layer into an image plus a readout for the cell un
 - Edge masks: the velocity edge fade (geometric), the foam edge fade used for this level, and the
   level's colmap texture (the only map-sized texture in a level's Tex_ archive; story levels with border
   water have one).
-- Grid: hard / soft ground and the raw bytes of components 6 (kRandomGanja: random + vegetation, low
-  nibble indexes ErosionBlocking) and 7 (kGanjaTimeFire: vegetation timer + fire). Components 6 / 7 are
-  filled only when reading the live game (and carried into the model at takeover); a model started from a
-  .sav has them at 0 (the save's blocks are not mapped to them).
+- Vegetation / fire: the fields of grid components 6 (kRandomGanja) and 7 (kGanjaTimeFire), decoded by
+  tools/ganja.py (findings/vegetation-fire-layers.md), plus their raw bytes (fixed 0-255 scale).
+  Components 6 / 7 are filled only when reading the live game (and carried into the model at takeover);
+  a model started from a .sav has them at 0 (the save's blocks are not mapped to them).
+- Grid: hard / soft ground.
 Images are in grid layout ([row, col]); DustView orients them like every other view.
 """
 import numpy as np
@@ -44,13 +45,29 @@ ENTRIES = (
     ('colmap_g', 'Level colmap: green'),
     ('colmap_b', 'Level colmap: blue (= foam edge fade)'),
     ('colmap_a', 'Level colmap: alpha'),
+    ('--', '-- Vegetation / fire (live)'),
+    ('v_type', 'Vegetation type (0-15, colours)'),
+    ('v_status', 'Vegetation status (young / 2 / flowering)'),
+    ('v_fire', 'Burning now'),
+    ('v_burned', 'Burned'),
+    ('v_grow_time', 'Vegetation time (age counter)'),
+    ('v_fire_time', 'Fire time'),
+    ('v_random', 'Random nibble'),
+    ('v_die', 'Die bit'),
+    ('v_static', 'Static bit'),
+    ('v_index', 'Index (0-3)'),
+    ('v_time_anim_a', 'TimeAnim a'),
+    ('v_time_anim_b', 'TimeAnim b'),
     ('--', '-- Grid layers'),
     ('hard', 'Hard ground (rock) height'),
     ('soft', 'Soft ground (sand) thickness'),
-) + tuple(('g%d_b%d' % (c, b), 'Component %d byte %d (%s, live)' % (c, b, 'vegetation' if c == 6 else 'veg. timer / fire'))
-          for c in (6, 7) for b in range(4))
+) + tuple(('g%d_b%d' % (c, b), 'Component %d raw byte %d' % (c, b)) for c in (6, 7) for b in range(4))
 
 LABELS = dict(ENTRIES)
+TYPE_COLOURS = np.array([(25, 25, 25), (70, 170, 60), (60, 120, 220), (200, 200, 60), (160, 90, 40), (40, 200, 160),
+                         (120, 120, 255), (230, 140, 200), (150, 150, 150), (255, 110, 30), (255, 40, 40), (120, 220, 90),
+                         (90, 220, 255), (200, 100, 255), (255, 255, 255), (130, 80, 160)], np.float32)
+STATUS_COLOURS = np.array([(25, 25, 25), (120, 220, 90), (40, 140, 40), (255, 140, 220)], np.float32)   # 0, young, 2, flowering
 KEYS = [k for k, _ in ENTRIES if k != '--']
 DEFAULT = 'wp_foam_nofade'
 
@@ -177,12 +194,32 @@ def render(key, fr, flow=None, level=None):
     if key == 'soft':
         s = fr.soft
         return _grey(s, 0, max(float(np.percentile(s, 99.5)), 1e-3)), lambda r, c: 'soft ground %.2f' % s[r, c]
+    if key.startswith('v_'):
+        import ganja
+        name = key[2:]
+        spec = {n: (6, s, b) for n, s, b in ganja.C6_FIELDS}
+        spec.update({n: (7, s, b) for n, s, b in ganja.C7_FIELDS})
+        comp, shift, bits = spec[name]
+        v = ganja.field(fr.grid[comp], shift, bits)
+        g6, g7 = fr.grid[6], fr.grid[7]
+
+        def read(r, c):
+            f = {n: int(ganja.field(g6[r, c], s, b)) for n, s, b in ganja.C6_FIELDS}
+            f.update({n: int(ganja.field(g7[r, c], s, b)) for n, s, b in ganja.C7_FIELDS})
+            return '%s = %d | type %d, status %d, fire %d, burned %d, time %d, fire time %d, random %d, die %d, static %d, index %d, anim %d/%d' % (
+                name, f[name], f['type'], f['status'], f['fire'], f['burned'], f['grow_time'], f['fire_time'],
+                f['random'], f['die'], f['static'], f['index'], f['time_anim_a'], f['time_anim_b'])
+        if name == 'type':
+            return TYPE_COLOURS[v], read
+        if name == 'status':
+            return STATUS_COLOURS[v], read
+        top = {'grow_time': 1024, 'fire_time': 1024}.get(name, (1 << bits) - 1)
+        return _grey(v, 0, top), read
     if key.startswith('g') and '_b' in key:
         comp, byte = int(key[1]), int(key[-1])
         b = ((fr.grid[comp] >> (8 * byte)) & 0xFF).astype(np.float32)
         word = fr.grid[comp]
-        return _grey(b, 0, max(float(b.max()), 1)), lambda r, c: 'component %d = 0x%08X, byte %d = %d (low nibble %d)' % (
-            comp, word[r, c], byte, b[r, c], int(b[r, c]) & 15)
+        return _grey(b, 0, 255), lambda r, c: 'component %d = 0x%08X, byte %d = %d' % (comp, word[r, c], byte, b[r, c])
     return np.full((N, N, 3), BG, np.uint8), lambda r, c: ''
 
 
