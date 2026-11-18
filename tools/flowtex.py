@@ -15,7 +15,7 @@ Per cell (once per simulation frame):
 Per frame (fxcache 107 / 117):
   two UV-offset layers are dragged along v (look upstream, bilinear) at 22.4 cells/s per unit of v
   (512 x 0.5 x UVScrollParams.y 0.00293 per frame x 30 frames/s; GroundParamsUVScroll.x = 0 over
-  water), |v| < 0.01 does not move; each layer restarts every 1.11 s (phase +0.03 per frame at 30 fps; half a cycle apart), blended so a
+  water), |v| < 0.01 does not move; each layer restarts every 2.22 s (phase a triangle wave 0 -> 1 -> 0 at 0.03 per frame, 30 fps; half a cycle apart), blended so a
   layer is invisible when it restarts; no relaxation
   detail texture tiled 12 x across the map: ripple normal strip WaterSeqNM128 read as 8 frames of
   256 x 128 (shown square), foam Foam_D 512 x 512; final foam = saturate(foam texture x 1 x foam factor)
@@ -32,7 +32,8 @@ import numba
 TEX_BF = r'D:\Games\Steam\steamapps\common\From Dust\BinPC\Tex_BD00993D.lin.bf'
 LIGHT = np.array([-0.55, -0.55, 0.63]) / np.linalg.norm([-0.55, -0.55, 0.63])
 SPEED = 512 * 0.5 * 0.00293 * 30          # cells per second per unit of normalised velocity (22.5)
-LAYER_PERIOD = 1 / (0.03 * 30)             # s: the game's layer phase (WaterTime.y) steps +0.03 per frame, 1.11 s at 30 fps
+LAYER_PERIOD = 2 / (0.03 * 30)             # s: the game's layer phase (WaterTime.y) is a triangle wave 0 -> 1 -> 0 at 0.03 per frame,
+                                           # each layer reset at the end where its weight is 0: a layer lives 2.22 s at 30 fps
 TILES = 12.0                               # detail texture repeats across the map
 
 
@@ -80,14 +81,20 @@ def _cell_fields(depth, flux, lava, min_depth, border, vx, vy, strength, foamk):
             dc = np.float32(min(c, n - 1 - c))
             fv = min(max((dr - 36) / 34, np.float32(0)), np.float32(1)) * min(max((dc - 36) / 34, np.float32(0)), np.float32(1))
             ff = border[r, c] if border[0, 0] >= 0 else fv            # level texture (343) or geometric (105)
-            if not (d > min_depth and lava[r, c] <= 0):
+            water = d > min_depth and lava[r, c] <= 0
+            if not (water or lava[r, c] > 0):                # dry: no flux, so no velocity / foam
                 continue
+            # net outflow, also over lava (logged: the upload's velocity bytes over lava = net outflow, same scale)
             nx = min(max((flux[1, r, c] - flux[0, r, c]) * np.float32(30.7 / 127.5), np.float32(-1)), np.float32(1))
             ny = min(max((flux[2, r, c] - flux[3, r, c]) * np.float32(28.7 / 127.5), np.float32(-1)), np.float32(1))
-            vx[r, c] = nx * fv
-            vy[r, c] = ny * fv
-            dw = min(d * np.float32(64.0 / 255.0), np.float32(1))
-            strength[r, c] = np.float32(0.05) + np.float32(0.15) * np.sqrt(dw)
+            sp = fv
+            if not water:                                    # lava: GroundParamsUVScroll.x ~0.92 (dump), scroll factor
+                sp *= np.float32(LAVA_SCROLL)                # lerp(0.5 x c38.y, c36.x, x) instead of 0.5 x c38.y
+            vx[r, c] = nx * sp
+            vy[r, c] = ny * sp
+            if water:
+                dw = min(d * np.float32(64.0 / 255.0), np.float32(1))
+                strength[r, c] = np.float32(0.05) + np.float32(0.15) * np.sqrt(dw)
             z = np.float32(2) * np.sqrt(nx * nx + ny * ny) - np.float32(1.0 / 255.0)
             foamk[r, c] = min(max(z, np.float32(0)), np.float32(1)) * ff
 
@@ -272,6 +279,31 @@ RAMP_V_HARD, RAMP_V_SOFT = 0.375, 0.625  # af4_TerrainRampUV c59 .z / .y as logg
 RAMP_U = 0.5               # ramp U = GroundParams.w (logged 0.75-1.0) - |view depth| x 0.0035: camera-dependent, chosen
 BUMP = 0.6                 # strength of the textures' normal perturbation against the cell slope (chosen)
 GROUND_GAIN = 1.35         # brightness (the game's light intensities are not modelled)
+LAVA_V = 0.125             # af4_TerrainRampUV .w (logged): the ramp's lava row; V above it is orange -> red
+LAVA_SCROLL = 1 + 0.92 * (0.0032 / (0.5 * 0.00293) - 1)   # lava's flow-texture speed vs water's (2.09): see _cell_fields
+LAVA_FADE = 0.3            # s: lava mask eases towards its new value (game fades cells in / out; time constant chosen)
+LAVA_MASK_BLUR = 1         # passes of the 4-neighbour blur on the lava mask (chosen by eye, see shade_textured)
+LAVA_TILES = 8.0           # shader 97: flow-layer UV x 8 for LavaGround_D
+LAVA_CLOCK = 1.543         # c68.x per second (0.0514 per frame at 30 fps, logged); weights c69 = 0.5 + 0.5 cos(clock - phase)
+LAVA_PHASES = (np.pi / 2, -np.pi / 6, -5 * np.pi / 6)   # R, G, B of LavaGround_D (fitted, max error 0.0007)
+_LAVA_TEX = None
+
+
+def load_lava_texture():
+    """LavaGround_D (512 x 512 DXT5, Tex_BD00993D; matched exactly against the hook's dump of shader 97's s10)
+    as mips of float32 0..1 RGBA."""
+    global _LAVA_TEX
+    if _LAVA_TEX is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import bf, tdt
+        px, _ = tdt.decode(bf.read_entry(TEX_BF, 'LavaGround_D.PC.tdt'))
+        a = px[0].astype(np.float32) / 255
+        out = [np.ascontiguousarray(a)]
+        while a.shape[0] > 1:
+            a = 0.25 * (a[0::2, 0::2] + a[1::2, 0::2] + a[0::2, 1::2] + a[1::2, 1::2])
+            out.append(np.ascontiguousarray(a))
+        _LAVA_TEX = out
+    return _LAVA_TEX
 _GROUND = None
 
 
@@ -333,7 +365,7 @@ def _lerp_at3(a, ch, y0, x0, y1, x1, fy, fx):
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _shade_textured(gxa, gya, sfa, oa, aa, wet, gy0, gx0, k, soft_t, hard_t, tpc, ramp, vh, vs, bump, gain, light,
-                    water_tex, D, strength, foamk, frame, foam, wt, kr, kf, out):
+                    water_tex, D, strength, foamk, frame, foam, wt, kr, kf, lmask, ltemp, lava_t, kl, cw, out):
     """Natural view of a grid window, per pixel: ground = the game's sand / rock textures blended by the sand
     fraction (shader 96: normal map lerp(hard, soft, s); colour = TerrainRamp at V = lerp(vh, vs, s) +
     (alpha x 2 - 1) x 0.25), lit with the cell slope + the textures' normals; then the water / lava layer
@@ -380,7 +412,25 @@ def _shade_textured(gxa, gya, sfa, oa, aa, wet, gy0, gx0, k, soft_t, hard_t, tpc
                 nx += (_lerp_at3(soft_t, 0, ty0, tx0, ty1, tx1, tfy, tfx) - nx) * s
                 ny += (_lerp_at3(soft_t, 1, ty0, tx0, ty1, tx1, tfy, tfx) - ny) * s
                 al += (_lerp_at3(soft_t, 3, ty0, tx0, ty1, tx1, tfy, tfx) - al) * s
-            rv = vh + (vs - vh) * s + (al * two - one) * np.float32(0.25)
+            v0 = vh + (vs - vh) * s
+            lm = _lerp_at(lmask, cy0, cx0, cy1, cx1, fy, fx)
+            if lm > 0:                                       # shader 97: lava (GroundParams.x = lava mask)
+                nx += (half - nx) * lm                       # lava flattens the ground bumps
+                ny += (half - ny) * lm
+                al += (half - al) * lm
+                lt = np.float32(0)                           # LavaGround_D on the two flow layers, x 8 per map
+                for kk in range(2):
+                    ox, oy = _bilinear2(D, kk, yc, xc)
+                    qx = (x + ox) * kl
+                    qy = (y + oy) * kl
+                    lt += wt[kk] * (cw[0] * _tex4(lava_t, qx, qy, 0) + cw[1] * _tex4(lava_t, qx, qy, 1)
+                                    + cw[2] * _tex4(lava_t, qx, qy, 2))
+                tt = _lerp_at(ltemp, cy0, cx0, cy1, cx1, fy, fx)
+                term = tt ** np.float32(0.15) if tt > np.float32(1e-4) else np.float32(0.251188636)
+                fkl = _lerp_at(foamk, cy0, cx0, cy1, cx1, fy, fx)
+                L = (lt + fkl + term + np.float32(1.1)) * lm * np.float32(0.5143)
+                v0 += (np.float32(LAVA_V) - v0) * L          # not clamped: hot lava goes past 0.125 towards the orange top
+            rv = v0 + (al * two - one) * np.float32(0.25)
             rp = min(max(rv * nr - half, np.float32(0)), np.float32(nr - 1))
             r0 = int(rp)
             r1 = min(r0 + 1, nr - 1)
@@ -605,7 +655,7 @@ class FlowLayer:
                             np.empty((n, n, 3), np.float32), np.empty((n, n), np.float32))
         gxa, gya, sfa, oa, aa = self._layers
         viewfast.natural_layers(fr.ground, fr.soft, fr.water, fr.lava, fr.sediment, fr.temperature,
-                                lava_xs, lava_cs, gxa, gya, sfa, oa, aa)
+                                lava_xs, lava_cs, gxa, gya, sfa, oa, aa, False)   # lava is drawn on the ramp below
         if water_tex:
             depth, lv = self.update(fr.water, fr.flux, t, fr.lava, min_depth)
         else:
@@ -615,12 +665,34 @@ class FlowLayer:
         soft_m, hard_m, ramp = load_ground_textures()
         tpc0 = soft_m[0].shape[0] * GROUND_TILES / n          # texels per cell at full resolution (32)
         level = int(min(max(np.floor(np.log2(max(tpc0 / k, 1.0))), 0), len(soft_m) - 1))   # ~1-2 texels per pixel
+        # upload byte x = 255 wherever lava; the game softens it before the terrain pass (screen dump: lava edges ~2x
+        # as wide as sand edges, mask rarely near 1); passes chosen by eye: 6 (as the water parameters) wipes out 1-2 cell channels
+        if getattr(self, '_lkey', None) != id(fr.lava):                   # once per simulation frame
+            m = (np.asarray(fr.lava) > 0).astype(np.float32)
+            self._ltarget = _blur(m, LAVA_MASK_BLUR) if LAVA_MASK_BLUR else m
+            self._lkey = id(fr.lava)
+        # cells fade in / out instead of switching (seen in play); time constant chosen by eye, on the simulation clock
+        prev, t_prev = getattr(self, '_lmask', None), getattr(self, '_lt', None)
+        if prev is None or t_prev is None or not LAVA_FADE or t < t_prev or t - t_prev > 2.0:
+            self._lmask = self._ltarget.copy()
+        elif t > t_prev:
+            a = np.float32(1 - np.exp(-(t - t_prev) / LAVA_FADE))
+            self._lmask += (self._ltarget - self._lmask) * a
+        self._lt = t
+        lmask = self._lmask
+        ltemp = np.where(lmask > 0, np.minimum(np.round(fr.temperature), 255) / 255, 0).astype(np.float32)
+        lava_m = load_lava_texture()
+        kl0 = lava_m[0].shape[0] * LAVA_TILES / n                       # 8 texels per cell
+        llev = int(min(max(np.floor(np.log2(max(kl0 / k, 1.0))), 0), len(lava_m) - 1))
+        clk = LAVA_CLOCK * t
+        cw = np.array([0.5 + 0.5 * np.cos(clk - p) for p in LAVA_PHASES], np.float32)
         out = np.empty((size, size, 3), np.uint8)
         _shade_textured(gxa, gya, sfa, oa, aa, wet, np.float32(gy0), np.float32(gx0), np.float32(k),
                         soft_m[level], hard_m[level], np.float32(tpc0 / 2 ** level), ramp,
                         np.float32(RAMP_V_HARD), np.float32(RAMP_V_SOFT), np.float32(BUMP), np.float32(GROUND_GAIN),
                         np.asarray(light, np.float32), bool(water_tex), self.D, strength, foamk, self._frame(t),
-                        self.foam, self.wt, np.float32(self.kr), np.float32(self.kf), out)
+                        self.foam, self.wt, np.float32(self.kr), np.float32(self.kf),
+                        lmask, ltemp, lava_m[llev], np.float32(kl0 / 2 ** llev), cw, out)
         return out
 
     DEBUG_MODES = ('foam', 'velocity', 'drag')
@@ -630,7 +702,7 @@ class FlowLayer:
         foam: the foam factor 0..1 as black -> white (the game multiplies the foam texture by it).
         velocity: hue = direction, brightness = |v| (full at |v| = 0.5, i.e. ~11 cells/s).
         drag: how far the texture coordinates have been dragged, blended like the layers (black 0,
-        white >= 60 cells); it grows during a layer's 1.11 s life and drops when the visible layer restarts."""
+        white >= 60 cells); it grows during a layer's 2.22 s life and drops when the visible layer restarts."""
         vx, vy, strength, foamk = self.fields
         wet = (depth > 0.02)[..., None]
         if mode == 'foam':

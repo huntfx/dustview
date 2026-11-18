@@ -101,17 +101,25 @@ def find_modifier_list(p, gens):
     return None
 
 
-def read_modifier_list(p, vec, settle=0.03):
+def read_modifier_list(p, vec, settle=0.03, last_tick=False):
     """Current entries of the modifier list as dicts. Waits (up to `settle` s) for the refill to finish:
-    reads until the count has stopped changing and is not 0."""
+    reads until the count has stopped changing and is not 0.
+    last_tick: if the count is 0 (the game empties the list after each tick, so it stays 0 while the game is
+    paused), read the entries still in the buffer instead: the last tick's list (contiguous valid entries up
+    to the capacity; a longer older list could leave extra stale entries behind it). Use only when paused."""
     import time
-    t0, last, n = time.time(), None, 0
+    t0, last = time.time(), None
+    ptr, n, cap = struct.unpack('<3I', p.read(vec, 12))
     while time.time() - t0 < settle:
         ptr, n, cap = struct.unpack('<3I', p.read(vec, 12))
         if n and n == last:
             break
         last = n
         time.sleep(0.001)
+    if not n and last_tick and 0 < cap <= 4096:
+        raw = p.read(ptr, ENTRY * cap)
+        while raw is not None and n < cap and _valid_entry(raw, ENTRY * n):
+            n += 1
     if not n or n > 4096:
         return []
     raw = p.read(ptr, ENTRY * n)

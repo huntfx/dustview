@@ -406,12 +406,12 @@ class LiveGame(Source):
                     self.source_note = 'source list not found yet (needs a running, unburied source)'
                     self.other_modifiers = [dict(s) for s in self.songs]   # repulsions from the song objects
                 else:
-                    self.refresh_sources()
+                    self.refresh_sources(paused_check=True)
             except Exception as e:                       # game closed, level changing, ...
                 self.source_note = 'sources: %s' % e
             time.sleep(10)
 
-    def refresh_sources(self, settle=0.01):
+    def refresh_sources(self, settle=0.01, paused_check=False):
         """Read the modifier list now; pair each fluid entry with a generator object for its nominal rate,
         stored height and height mode (needed by the Python model's bury rule). Generators with identical
         settings are told apart by the effective amount (rate x activity x fade-in), then by stored height
@@ -420,6 +420,18 @@ class LiveGame(Source):
         if vec is None:
             return
         entries = live_generators.read_modifier_list(self.p, vec, settle)
+        from_buffer = False
+        if entries:
+            self._last_count = len(entries)              # the real list length, seen while the game ran
+        elif paused_check:                               # paused game: the list is emptied after each tick
+            m = self._counter()
+            time.sleep(0.05)
+            if self._counter() == m:                     # no tick in 50 ms: paused, so the buffer holds the last tick's list
+                entries = live_generators.read_modifier_list(self.p, vec, 0, last_tick=True)
+                if getattr(self, '_last_count', None):
+                    entries = entries[:self._last_count]
+                else:                                    # length unknown: older, longer lists leave stale entries behind
+                    from_buffer = True                   # (seen: 4,080 on Story 10), so keep only generator-backed ones
         if not entries:
             return
         gens = [g for g in (live_generators.read_generator(self.p, a) for a in getattr(self, 'gen_addrs', [])) if g and g['mode'] != 0]
@@ -428,7 +440,8 @@ class LiveGame(Source):
         free, out, other = list(gens), [], []
         for e in entries:
             if e['type'] != 0:
-                other.append(e)
+                if not from_buffer:
+                    other.append(e)
                 continue
             src = dict(col=e['col'], row=e['row'], radius=e['radius'], rate=e['amount'], amount=e['amount'],
                        sediment=e['sediment'], temperature=e['temperature'])
@@ -440,7 +453,13 @@ class LiveGame(Source):
                 free.remove(g)
                 src.update(rate=g['rate'], activity=g['activity'], buried=g['activity'] < 1, height_mode=g['height_mode'],
                            z=g['stored_z'], bury_threshold=g['bury_threshold'])
+            elif from_buffer:
+                continue                                 # no generator left for it: stale
             out.append(src)
+        if from_buffer:
+            other = [dict(s) for s in getattr(self, 'songs', [])]   # repels from the song objects instead
+            if not out:
+                return
         self.sources, self.other_modifiers, self.entries = out, other, entries
         seen = self.__dict__.setdefault('seen_repulsors', {})   # repels stay known once seen (live_repulsors)
         for e in other:

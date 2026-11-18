@@ -13,6 +13,11 @@
 //     0-15 (format, size, pool, usage)
 //   - the terrain shader (fxcache 96, CTAB name af4_TerrainRampUV): constants c55-c70 and c128-c135 plus its
 //     textures, same rate (c59 = terrain ramp rows, c131 = ground tiling / ramp distance term)
+//   - the lava terrain shader (fxcache 97 / 299 / 364, CTAB g_SamplerLava) the same way, plus: SetRenderTarget is
+//     watched, and any draw into the lava's g_FlowUVs texture (s5) is logged as "flowwriter" (its shader code saved
+//     once to dustdump_flowwriter_<ptr>.ps)
+//   - after each full log, the next 12 draws of that kind log one "burst" line each (frame, c36, c38, c67-c69) so
+//     per-frame rates can be read (the 10 s interval aliases anything that cycles faster)
 // F3 (in the game window): dump the textures bound to the next draw of each water pass to
 //   dustdump_<pass>_s<stage>.bin next to the DLL (header: u32 width, height, format, pitch; then rows),
 //   if they can be read (managed / system-memory / dynamic textures by LockRect, render targets by
@@ -28,6 +33,11 @@ extern char g_logDir[MAX_PATH];
 volatile LONG g_dumpRequest = 0;
 
 typedef HRESULT (STDMETHODCALLTYPE *CreateDeviceFn)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **);
+typedef HRESULT (STDMETHODCALLTYPE *SetRTFn)(IDirect3DDevice9 *, DWORD, IDirect3DSurface9 *);
+static SetRTFn g_SetRT;
+static IDirect3DSurface9 *g_rt0;          // current render target 0
+static IDirect3DSurface9 *g_lavaFlowSurf; // level 0 of the lava shader's g_FlowUVs (s5)
+static int g_burst[16];                   // consecutive-draw lines still to log, per kind
 typedef HRESULT (STDMETHODCALLTYPE *SetTextureFn)(IDirect3DDevice9 *, DWORD, IDirect3DBaseTexture9 *);
 typedef HRESULT (STDMETHODCALLTYPE *DrawPrimitiveFn)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE *DrawIndexedPrimitiveFn)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
@@ -54,8 +64,8 @@ static IDirect3DPixelShader9 *g_curPS;
 static DWORD g_frame;
 
 // water pass kinds, recognised by names in the shader's constant table
-enum { K_NONE = 0, K_UVSCROLL, K_WATER, K_FOAMPACK, K_PARAMS, K_OTHERWATER, K_CONVERT, K_TERRAIN, K_COUNT };
-static const char *kKindName[K_COUNT] = { "none", "uvscroll", "water", "foampack", "params", "otherwater", "convert", "terrain" };
+enum { K_NONE = 0, K_UVSCROLL, K_WATER, K_FOAMPACK, K_PARAMS, K_OTHERWATER, K_CONVERT, K_TERRAIN, K_LAVA, K_FLOWWRITER, K_COUNT };
+static const char *kKindName[K_COUNT] = { "none", "uvscroll", "water", "foampack", "params", "otherwater", "convert", "terrain", "lava", "flowwriter" };
 struct ShaderKind { IDirect3DPixelShader9 *ps; int kind; };
 static ShaderKind g_kinds[512];
 static int g_nkinds;
@@ -79,7 +89,8 @@ static int Classify(IDirect3DPixelShader9 *ps) {
         BYTE *buf = (BYTE *)malloc(n);
         if (buf && SUCCEEDED(ps->GetFunction(buf, &n))) {
             UINT m = n < 4096 ? n : 4096;
-            if (Has(buf, m, "af4_TerrainRampUV")) kind = K_TERRAIN;            // fxcache 96: sand / rock terrain
+            if (Has(buf, m, "g_SamplerLava")) kind = K_LAVA;                   // fxcache 97 / 299 / 364: terrain with lava
+            else if (Has(buf, m, "af4_TerrainRampUV")) kind = K_TERRAIN;            // fxcache 96: sand / rock terrain
             else if (Has(buf, m, "samp_MatWeigthTex")) kind = K_CONVERT;          // fxcache 105 / 343: builds WaterParams
             else if (Has(buf, m, "g_SamplerPreviousUV")) kind = K_UVSCROLL;
             else if (Has(buf, m, "g_SamplerWaterFoam")) kind = K_FOAMPACK;
@@ -174,7 +185,32 @@ static void DumpTexture(IDirect3DDevice9 *dev, IDirect3DTexture9 *tx, const char
 static void OnDraw(IDirect3DDevice9 *dev) {
     __try {
         int kind = Classify(g_curPS);
+        if (g_lavaFlowSurf && g_rt0 == g_lavaFlowSurf) {   // a draw INTO the lava flow UVs: whatever shader it is
+            static IDirect3DPixelShader9 *saved;
+            if (g_curPS && g_curPS != saved) {                 // save its code once (disassemble with fxcache)
+                saved = g_curPS;
+                UINT n = 0;
+                if (SUCCEEDED(g_curPS->GetFunction(NULL, &n)) && n > 0 && n < (1 << 20)) {
+                    BYTE *buf = (BYTE *)malloc(n);
+                    if (buf && SUCCEEDED(g_curPS->GetFunction(buf, &n))) {
+                        char path[MAX_PATH]; sprintf_s(path, "%sdustdump_flowwriter_%p.ps", g_logDir, g_curPS);
+                        FILE *f = NULL; if (fopen_s(&f, path, "wb") == 0 && f) { fwrite(buf, 1, n, f); fclose(f); }
+                        Log("d3d: flow-UV writer shader %p (%u bytes, kind %s) saved to %s", g_curPS, n, kKindName[kind], path);
+                    }
+                    free(buf);
+                }
+            }
+            kind = K_FLOWWRITER;
+        }
         if (kind == K_NONE || kind == K_OTHERWATER) return;
+        if (g_burst[kind] > 0 && kind != K_CONVERT) {        // consecutive draws after a full log: rates / phases
+            g_burst[kind]--;
+            Log("d3d: burst frame %u %s %p c36 %.5f %.5f %.5f %.5f c38 %.5f %.5f %.5f %.5f c67 %.5f %.5f %.5f %.5f c68 %.5f %.5f %.5f %.5f c69 %.5f %.5f %.5f %.5f",
+                g_frame, kKindName[kind], g_curPS, g_psConst[36][0], g_psConst[36][1], g_psConst[36][2], g_psConst[36][3],
+                g_psConst[38][0], g_psConst[38][1], g_psConst[38][2], g_psConst[38][3],
+                g_psConst[67][0], g_psConst[67][1], g_psConst[67][2], g_psConst[67][3], g_psConst[68][0], g_psConst[68][1], g_psConst[68][2], g_psConst[68][3],
+                g_psConst[69][0], g_psConst[69][1], g_psConst[69][2], g_psConst[69][3]);
+        }
         if (kind == K_CONVERT) {                      // log the border constants whenever they change
             static float last[3][4];
             static bool first = true;
@@ -191,15 +227,23 @@ static void OnDraw(IDirect3DDevice9 *dev) {
         bool dump = InterlockedCompareExchange(&g_dumpPending[kind], 0, 1) == 1;
         if (!dump && now - g_lastLog[kind] < 10000) return;
         g_lastLog[kind] = now;
+        g_burst[kind] = 12;
+        if (kind == K_LAVA && g_tex[5] && g_tex[5]->GetType() == D3DRTYPE_TEXTURE) {
+            IDirect3DSurface9 *sf = NULL;
+            if (SUCCEEDED(((IDirect3DTexture9 *)g_tex[5])->GetSurfaceLevel(0, &sf)) && sf) {
+                if (sf != g_lavaFlowSurf) Log("d3d: lava g_FlowUVs surface %p (watching for draws into it)", sf);
+                g_lavaFlowSurf = sf; sf->Release();
+            }
+        }
         Log("d3d: frame %u draw with %s shader %p", g_frame, kKindName[kind], g_curPS);
-        if (kind == K_TERRAIN) {                      // terrain shader: c55-c70 (c59 = af4_TerrainRampUV, c67 detail) and c128-c135 (c131 tiling)
+        if (kind == K_TERRAIN || kind == K_LAVA) {                      // terrain shader: c55-c70 (c59 = af4_TerrainRampUV, c67 detail) and c128-c135 (c131 tiling)
             for (int r = 55; r <= 70; r++)
                 Log("d3d:    c%d %12.6f %12.6f %12.6f %12.6f", r, g_psConst[r][0], g_psConst[r][1], g_psConst[r][2], g_psConst[r][3]);
             for (int r = 128; r <= 135; r++)
                 Log("d3d:    c%d %12.6f %12.6f %12.6f %12.6f", r, g_psConst[r][0], g_psConst[r][1], g_psConst[r][2], g_psConst[r][3]);
         }
         static const char *cname[7] = { "WaterTime", "SedimentColor", "UVScrollParams", "c39", "WaterNormalmapParams", "c41", "WaterDetailParams" };
-        for (int r = 36; r <= 42 && kind != K_TERRAIN; r++)
+        for (int r = 36; r <= 42 && kind != K_TERRAIN && kind != K_LAVA; r++)
             Log("d3d:    c%d %-20s %10.5f %10.5f %10.5f %10.5f", r, cname[r - 36], g_psConst[r][0], g_psConst[r][1], g_psConst[r][2], g_psConst[r][3]);
         for (int s = 0; s < 16; s++) {
             char desc[160]; IDirect3DTexture9 *tx;
@@ -214,6 +258,10 @@ static void OnDraw(IDirect3DDevice9 *dev) {
 }
 
 // ---- hooks -------------------------------------------------------------------------
+static HRESULT STDMETHODCALLTYPE Hk_SetRT(IDirect3DDevice9 *d, DWORD i, IDirect3DSurface9 *sf) {
+    if (i == 0) g_rt0 = sf;
+    return g_SetRT(d, i, sf);
+}
 static HRESULT STDMETHODCALLTYPE Hk_SetTexture(IDirect3DDevice9 *d, DWORD stage, IDirect3DBaseTexture9 *t) {
     if (stage < 16) g_tex[stage] = t;
     return g_SetTexture(d, stage, t);
@@ -265,6 +313,7 @@ static HRESULT STDMETHODCALLTYPE Hk_CreateDevice(IDirect3D9 *self, UINT ad, D3DD
         void **vt = *(void ***)*out;
         Patch(vt, 17, (void *)Hk_Present, (void **)&g_Present);
         Patch(vt, 65, (void *)Hk_SetTexture, (void **)&g_SetTexture);
+        Patch(vt, 37, (void *)Hk_SetRT, (void **)&g_SetRT);
         Patch(vt, 81, (void *)Hk_DrawPrimitive, (void **)&g_DrawPrimitive);
         Patch(vt, 82, (void *)Hk_DrawIndexedPrimitive, (void **)&g_DrawIndexedPrimitive);
         Patch(vt, 83, (void *)Hk_DrawPrimitiveUP, (void **)&g_DrawPrimitiveUP);

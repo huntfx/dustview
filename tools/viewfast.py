@@ -114,11 +114,13 @@ def render_natural(ground, soft, water, lava, sed, temp, light, lava_xs, lava_cs
 
 
 @numba.njit(parallel=True, nogil=True, cache=True)
-def natural_layers(ground, soft, water, lava, sed, temp, lava_xs, lava_cs, gx_out, gy_out, s_out, o_out, a_out):
+def natural_layers(ground, soft, water, lava, sed, temp, lava_xs, lava_cs, gx_out, gy_out, s_out, o_out, a_out,
+                   lava_colour=True):
     """The parts of render_natural, per cell, for the textured terrain (flowtex.shade_textured): surface
     gradient (gx, gy as np.gradient of ground + water + lava), sand fraction s = soft / 1.5 clamped, and the
     water + lava layer over the ground as one colour o (n, n, 3) and opacity a: render_natural's
-    c += (w - c) * aw; c += (lava - c) * al  ==  c * (1 - a) + o * a."""
+    c += (w - c) * aw; c += (lava - c) * al  ==  c * (1 - a) + o * a. lava_colour False: water only (the
+    textured view draws lava on the terrain ramp, as the game's shader 97)."""
     n = ground.shape[0]
     for r in numba.prange(n):
         for c in range(n):
@@ -152,7 +154,7 @@ def natural_layers(ground, soft, water, lava, sed, temp, lava_xs, lava_cs, gx_ou
                 w1 += (118 - w1) * mud
                 w2 += (80 - w2) * mud
                 aw = 1 - np.exp(-d / 2.0)
-            al = 1 - np.exp(-lava[r, c] / 0.5)
+            al = 1 - np.exp(-lava[r, c] / 0.5) if lava_colour else 0.0
             a = 1 - (1 - aw) * (1 - al)
             a_out[r, c] = a
             if a > 0:
