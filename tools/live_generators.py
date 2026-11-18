@@ -79,6 +79,46 @@ def _valid_entry(raw, o):
     return t in (0, 1) and 0 <= col < 512 and 0 <= row < 512 and col == int(col) and row == int(row) and 0 < rad < 64
 
 
+_HINT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'live', 'modifier_list_address.txt')
+
+
+def valid_modifier_list(p, vec):
+    """Does `vec` look like the per-tick modifier vector {ptr, count, capacity}? Count <= capacity <= 4096 and
+    the entries in use (or, with count 0 as while paused, the first one in the buffer) are valid."""
+    try:
+        hdr = p.read(vec, 12)
+        if hdr is None:
+            return False
+        ptr, n, cap = struct.unpack('<3I', hdr)
+        if not (0 < cap <= 4096 and n <= cap and ptr):
+            return False
+        raw = p.read(ptr, ENTRY * max(n, 1))
+        return raw is not None and all(_valid_entry(raw, ENTRY * k) for k in range(max(n, 1)))
+    except Exception:
+        return False
+
+
+def known_modifier_list(p):
+    """The address remembered from an earlier search (it stayed at 0x7ED70124 across levels and game restarts
+    on 2026-11-18), if it still checks out; else None."""
+    try:
+        for line in open(_HINT_FILE, encoding='utf-8'):
+            vec = int(line.split()[0], 16)
+            if valid_modifier_list(p, vec):
+                return vec
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def remember_modifier_list(vec):
+    try:
+        os.makedirs(os.path.dirname(_HINT_FILE), exist_ok=True)
+        open(_HINT_FILE, 'w', encoding='utf-8').write('%08X  per-tick modifier list vector (found by find_modifier_list)\n' % vec)
+    except OSError:
+        pass
+
+
 def find_modifier_list(p, gens):
     """Address of the vector {ptr, count, capacity} (or None). Locates one entry by a generator running at
     full strength (radius, 0, rate), walks back to the array start, then finds the pointer to it."""

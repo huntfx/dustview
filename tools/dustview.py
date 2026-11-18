@@ -32,6 +32,10 @@ Views (panel only): natural, height, water depth, lava temperature, sediment, fl
     gained, orange = fluid lost, yellow = ground raised, magenta = ground lowered; fades with a 1.5 s
     half-life. A few cells are always left (rounding, the small-vent timing).
   M  switch to the Python model, starting from the state on screen (sources as last found)
+  C  compare: run the model alongside the live game, tick for tick, with the game's own per-tick list
+     (again: re-sync the model to the game); G cycles game -> model -> differences (view 'model vs game':
+     model minus game (cyan / orange fluid more / less, yellow /
+     magenta ground higher / lower)
   L  switch to the live game (found afresh)    Space  pause / resume the model    N  one model tick
   T  model speed: 1x the game's 31 ticks/s (default), 2x, 4x, as fast as possible (the level script's
      clock runs per tick, so tides and events speed up with it). The model step is compiled with numba
@@ -259,6 +263,8 @@ class LiveGame(Source):
         self.paused = False
         self.running = True
         threading.Thread(target=self._source_loop, daemon=True).start()
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        threading.Thread(target=self._list_loop, daemon=True).start()
 
     def stop(self):
         self.running = False
@@ -266,26 +272,69 @@ class LiveGame(Source):
     def _counter(self):
         return struct.unpack('<I', self.p.read(self.base + 0x92C, 4))[0]
 
+    ROW = (N // 16) * 8 * 16 * 4                  # bytes per grid row in the game's packed layout
+    PROBE_ROWS = (40, 136, 232, 328, 424, 472)
+
+    def _capture_loop(self):
+        """Reads each new grid right when the tick counter moves (measured 2026-11-18 on Map 4: at that
+        moment buffer (m - 1) & 1 is complete, sources included; the game's next step starts overwriting it
+        before the counter moves again, from ~4 ms later, usually ~25-60 ms). The display loop used to read
+        at a random point in the tick and sometimes got a half-written next step (a spring's +amount
+        missing, one-frame flicker). After the read a few rows are read again: if they changed, the next
+        step had started during the read and the frame is dropped."""
+        last, last_base, t_old = None, None, 0.0
+        while self.running:
+            try:
+                base = self.base
+                if base != last_base:
+                    last, last_base = None, base
+                m = struct.unpack('<I', self.p.read(base + 0x92C, 4))[0]
+                now = time.perf_counter()
+                if m == last:
+                    t_old = now                          # last time the old value was seen
+                    time.sleep(0.0005)
+                    continue
+                late = last is not None and now - t_old > 0.002   # change noticed late (other threads busy):
+                last = m                                 # the buffer may already be overwritten, skip it
+                if late and getattr(self, '_captured', None) is not None:
+                    self.cap_late = getattr(self, 'cap_late', 0) + 1
+                    continue
+                bufs = struct.unpack('<2I', self.p.read(base + 0x950, 8))
+                addr = bufs[(m - 1) & 1]
+                R = self.ROW
+                before = [self.p.read(addr + y * R, R) for y in self.PROBE_ROWS]
+                raw = self.p.read(addr, GRID_BYTES)
+                params = np.frombuffer(self.p.read(base + 0x20, 224), np.float32).copy()
+                ok = raw is not None and len(raw) == GRID_BYTES and self._counter() == m
+                if ok:                                   # sample rows the same before, in and after the read
+                    ok = all(self.p.read(addr + y * R, R) == raw[y * R:(y + 1) * R] == b0
+                             for y, b0 in zip(self.PROBE_ROWS, before))
+                if ok:
+                    self._captured = (m, raw, params)
+                else:
+                    self.cap_dropped = getattr(self, 'cap_dropped', 0) + 1
+            except Exception:
+                time.sleep(0.05)
+
     def read(self):
-        for _ in range(4):
-            m = self._counter()
-            if m == self.last_tick:
-                self.paused = bool(self.tick_times) and time.time() - self.tick_times[-1][1] > 0.5   # no new tick for 0.5 s (also when connected to an already paused game: one tick seen)
-                return None
-            bufs = struct.unpack('<2I', self.p.read(self.base + 0x950, 8))
-            raw = self.p.read(bufs[(m - 1) & 1], GRID_BYTES)
-            params = np.frombuffer(self.p.read(self.base + 0x20, 224), np.float32).copy()
-            if raw is None or len(raw) != GRID_BYTES or self._counter() != m:
-                continue                                    # buffer was being overwritten: retry
-            self.last_tick = m
-            self.paused = False
-            now = time.time()
-            self.tick_times = [(t, s) for t, s in self.tick_times if now - s < 3] + [(m, now)]
-            self.refresh_sources()
-            fr = Frame(m - 1, galileo.unpack(raw), params, self.sources, self.name)
-            self._terrain_events(fr)
-            return fr
-        return None
+        cap = getattr(self, '_captured', None)
+        if cap is None:
+            return None
+        m, raw, params = cap
+        if self.last_tick is not None and m < self.last_tick:   # tick counter went back: a map (re)loaded
+            self._relook = True
+            self.source_note = 'map loaded: looking for the source list...'
+        if m == self.last_tick:
+            self.paused = bool(self.tick_times) and time.time() - self.tick_times[-1][1] > 0.5   # no new tick for 0.5 s
+            return None
+        self.last_tick = m
+        self.paused = False
+        now = time.time()
+        self.tick_times = [(t, s) for t, s in self.tick_times if now - s < 3] + [(m, now)]
+        self.refresh_sources()
+        fr = Frame(m - 1, galileo.unpack(raw), params, self.sources, self.name)
+        self._terrain_events(fr)
+        return fr
 
     def _terrain_events(self, fr):
         """Terrain changes in dry areas since the previous frame. The simulation only changes terrain where
@@ -382,12 +431,18 @@ class LiveGame(Source):
         return (t1 - t0) / max(s1 - s0, 1e-6)
 
     def _source_loop(self):
-        """Every ~10 s: find (once) the simulator's per-tick modifier list and cache the generator objects'
+        """Every second until found, then every ~10 s (and at once after a map loads: tick counter going back):
+        find the simulator's per-tick modifier list and cache the generator objects'
         addresses. The list itself is read every frame (refresh_sources), so script switches, burying,
         fade-in and Jellify show up at once."""
         delta = None
         while self.running:
             try:
+                self._check_sim()
+                if getattr(self, 'vec', None) is None:           # remembered address: no scan needed
+                    self.vec = live_generators.known_modifier_list(self.p)
+                    if self.vec is not None:
+                        self.refresh_sources(paused_check=True)
                 delta = live_generators.dustai_delta(self.p) if delta is None else delta
                 gens = live_generators.generators(self.p, delta)
                 self.gen_addrs = [int(g['address'], 16) for g in gens]
@@ -397,7 +452,11 @@ class LiveGame(Source):
                     pass
                 if getattr(self, 'vec', None) is None:
                     self.source_note = 'looking for the source list...'
-                    self.vec = live_generators.find_modifier_list(self.p, gens)
+                    self.vec = live_generators.known_modifier_list(self.p)        # remembered address first
+                    if self.vec is None:
+                        self.vec = live_generators.find_modifier_list(self.p, gens)
+                        if self.vec is not None:
+                            live_generators.remember_modifier_list(self.vec)
                 try:                                     # village songs, readable without the modifier list
                     self.songs = live_generators.songs(self.p, delta)
                 except Exception:
@@ -409,7 +468,52 @@ class LiveGame(Source):
                     self.refresh_sources(paused_check=True)
             except Exception as e:                       # game closed, level changing, ...
                 self.source_note = 'sources: %s' % e
-            time.sleep(10)
+            for _ in range(10 if getattr(self, 'vec', None) is not None else 1):   # retry every second until found
+                if getattr(self, '_relook', False):      # a new map loaded: search again at once
+                    break
+                time.sleep(1)
+            if getattr(self, '_relook', False):
+                self._relook = False
+                self.vec, self.sources, self.gen_addrs, self._latest_entries = None, [], [], None
+                self.__dict__.pop('seen_repulsors', None)   # the old level's repels
+                self._last_count = None
+
+    def _list_loop(self):
+        """The game fills the per-tick modifier list during a tick and empties it afterwards, so a read at a
+        random moment often finds it empty (sources then took 10+ s to appear). Check every 2 ms and keep
+        the last non-empty list with its time (also covers a paused game: the last tick's list stays)."""
+        while self.running:
+            vec = getattr(self, 'vec', None)
+            if vec is not None:
+                try:
+                    n = struct.unpack('<I', self.p.read(vec + 4, 4))[0]
+                    if 0 < n <= 4096:
+                        es = live_generators.read_modifier_list(self.p, vec, 0.002)
+                        if es:
+                            self._latest_entries = (time.time(), es)
+                except Exception:
+                    pass
+            time.sleep(0.002)
+
+    def _check_sim(self):
+        """After a level change the game may use a new simulator object: when no tick has arrived for 3 s
+        (paused, loading or a new level), look for it again and switch to it if it moved."""
+        last = self.tick_times[-1][1] if self.tick_times else getattr(self, '_t_start', None)
+        if last is None:
+            self._t_start = time.time()
+            return
+        if time.time() - last < 3 or time.time() - getattr(self, '_sim_checked', 0) < 3:
+            return
+        self._sim_checked = time.time()
+        try:
+            base = live_check.find_sim(self.p)
+        except SystemExit:
+            return
+        if base != self.base:
+            self.base, self.last_tick, self.tick_times = base, None, []
+            self._relook = True
+            self.sim_changes = getattr(self, 'sim_changes', 0) + 1
+            self.source_note = 'new level: looking for the source list...'
 
     def refresh_sources(self, settle=0.01, paused_check=False):
         """Read the modifier list now; pair each fluid entry with a generator object for its nominal rate,
@@ -419,7 +523,11 @@ class LiveGame(Source):
         vec = getattr(self, 'vec', None)
         if vec is None:
             return
-        entries = live_generators.read_modifier_list(self.p, vec, settle)
+        lat = getattr(self, '_latest_entries', None)
+        if lat is not None and (time.time() - lat[0] < 0.5 or self.paused):
+            entries = lat[1]                             # caught by _list_loop
+        else:
+            entries = live_generators.read_modifier_list(self.p, vec, settle)
         from_buffer = False
         if entries:
             self._last_count = len(entries)              # the real list length, seen while the game ran
@@ -620,6 +728,170 @@ class ModelSource(Source):
         self.other_modifiers = totem_repulsors(self.totems, self.loose_repulsors)
 
 
+class CompareSource(Source):
+    """The live game plus a copy of it in the Python model, run in lockstep: whenever the game advances N
+    ticks the model advances N ticks too, with the game's own per-tick list (fluid sources at the amounts
+    the game applied, RepulseFluid entries as listed), so what drifts apart is the simulation, not
+    DustView's source / bury / village rules. Not modelled: tides / waves / weather, player powers,
+    vegetation and fire (all of these show up as differences). read() returns the game's frame or the
+    model's (show = 'game' / 'model'), each with .other = the other one; resync() copies the game into
+    the model again. Anything not defined here (sources, totems, songs, ...) comes from the live reader."""
+    name = 'model vs game'
+    MAX_GAP = 600                                  # ticks behind (~20 s) before the model is re-synced instead
+
+    def __init__(self, live, frame):
+        self.live = live
+        self.params = np.asarray(frame.params, np.float32)
+        self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, self.params)}
+        self.lock = threading.Lock()
+        self.show = 'game'
+        self.running = True
+        self.game = frame
+        self.game_params, self._params_obj = frame.params, None
+        self.sim_changes = getattr(live, 'sim_changes', 0)
+        self._sync_to(frame)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def __getattr__(self, k):                     # sources, totems, songs, seen_repulsors, ... of the live reader
+        if k == 'live':
+            raise AttributeError(k)
+        return getattr(self.live, k)
+
+    def _sync_to(self, fr):
+        with self.lock:
+            self.G, self.extra = dustsim.from_grid(fr.grid), fr.grid
+            self.model_tick, self.target, self.synced_at = fr.tick, fr.tick, fr.tick
+            self.model_fr, self.published, self.pair, self._prev_diff = None, None, None, None
+            self.gen = getattr(self, 'gen', 0) + 1
+            self.note = 'in step since game tick %d' % fr.tick
+
+    def resync(self):
+        self._sync_to(self.game)
+
+    def _loop(self):
+        while self.running:
+            with self.lock:
+                G, behind, gen = self.G, self.target - self.model_tick, self.gen
+            if behind <= 0:
+                time.sleep(0.003)
+                continue
+            if behind > self.MAX_GAP:                 # fell far behind (or the game jumped): start again from the game
+                self._sync_to(self.game)
+                self.note = 'model was %d ticks behind: re-synced at game tick %d' % (behind, self.game.tick)
+                continue
+            live = self.live
+            if getattr(live, 'vec', None) is None:       # source list not found yet: no model ticks (see read)
+                time.sleep(0.01)
+                continue
+            if self._params_obj is not self.game_params:   # the game's current parameters (tide / border level, ...)
+                self._params_obj = self.game_params
+                self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(self.game_params, np.float32))}
+            srcs = live.applied_sources()             # what the game applied this tick (fade-in, burial included)
+            reps = [e for e in (getattr(live, 'other_modifiers', None) or []) if e.get('type') == 1]
+            G = dustsim.tick(G, self.P, srcs, reps)
+            ground = [e for e in (getattr(live, 'entries', None) or []) if e.get('type') in (2, 3)]
+            if ground:                                # HardGround / SoftGround entries (e.g. a power adding sand)
+                dustsim.apply_modifiers(G, ground, self.P)
+            with self.lock:
+                if self.gen == gen:                   # not re-synced meanwhile
+                    self.G, self.model_tick = G, self.model_tick + 1
+
+    def read(self):
+        fr = self.live.read()
+        changed = False
+        if fr is not None and np.array_equal(fr.grid[2], self.game.grid[2]) and np.array_equal(fr.grid[0], self.game.grid[0]):
+            # the tick counter moved but the grid did not (seen on Map 4: the counter kept running with the
+            # whole map frozen, e.g. in the game's menu): treat it as paused, don't run the model
+            self.frozen = getattr(self, 'frozen', 0) + 1
+            fr = None
+        elif fr is not None:
+            self.frozen = 0
+        if fr is not None:
+            sim_changed = getattr(self.live, 'sim_changes', 0) != self.sim_changes
+            if fr.tick < self.game.tick or sim_changed:   # the game went back or a new level loaded: start again
+                self.sim_changes = getattr(self.live, 'sim_changes', 0)
+                self.game = fr
+                self._sync_to(fr)
+                self.note = 'new level / map reload: re-synced at game tick %d' % fr.tick
+            self.game, self.game_params, changed = fr, fr.params, True
+            self.recent = [g for g in getattr(self, 'recent', []) if g.tick < fr.tick][-8:] + [fr]
+            if getattr(self.live, 'vec', None) is None:     # no sources yet: keep the model on the game
+                self._sync_to(fr)
+                self.note = 'waiting for the source list (model held on the game until then)'
+            elif self.note.startswith('waiting'):
+                self.note = 'source list found: in step since game tick %d' % self.synced_at
+            with self.lock:
+                self.target = fr.tick
+        with self.lock:
+            key = self.model_tick
+            if key != self.published:
+                self.published, G, t = key, self.G, self.model_tick
+                self.model_fr = Frame(t, state_to_grid(G, self.extra), self.params, self.live.sources, 'python model')
+                changed = True
+        # show the game frame of the model's tick (the model usually runs a tick behind the newest game
+        # frame: pairing different ticks made every moving wave look like a difference)
+        model = self.model_fr
+        match = next((g for g in getattr(self, 'recent', []) if model is not None and g.tick == model.tick), None)
+        if match is not None:
+            if getattr(self, 'pair', None) is None or self.pair[1] is not model:
+                self._diff(match, model)
+            self.pair = (match, model)
+        elif getattr(self, 'pair', None) is None or self.pair[0].tick > self.game.tick:
+            self.pair = (self.game, model if model is not None else self.game)
+        if not changed and getattr(self, '_shown', None) == (self.show, id(self.pair[0])):
+            return None
+        self._shown = (self.show, id(self.pair[0]))
+        game, model = self.pair
+        game.other, model.other = model, game
+        game.role, model.role = 'game', 'model'
+        return model if self.show == 'model' else game
+
+    def _diff(self, game, model):
+        """model - game for fluid (water + lava) and ground, kept only where the previous pair differed the
+        same way too (by the smaller amount): one-frame blips (a game frame now and then a tick off) drop out."""
+        dF = (model.water + model.lava) - (game.water + game.lava)
+        dT = model.ground - game.ground
+        prev, self._prev_diff = getattr(self, '_prev_diff', None), (dF, dT)
+        if prev is not None:
+            keep = lambda a, b: np.where(np.sign(a) == np.sign(b), np.sign(a) * np.minimum(np.abs(a), np.abs(b)), 0)
+            dF, dT = keep(dF, prev[0]), keep(dT, prev[1])
+        game.diff = model.diff = (dF.astype(np.float32), dT.astype(np.float32))
+
+    def status(self):
+        lag = self.game.tick - self.model_tick
+        frozen = ' | game grid not changing (paused / menu?): model held' if getattr(self, 'frozen', 0) > 3 else ''
+        return 'model vs game (G: game / model / differences) | game tick %d, model tick %d%s%s | %s | %s' % (
+            self.game.tick, self.model_tick, (' (%d behind)' % lag) if lag else '', frozen, self.note, self.live.status())
+
+    def stop(self):                                 # the live reader stays (App.live)
+        self.running = False
+
+
+def render_compare(fr):
+    """'model vs game': the game's natural view dimmed, with model minus game coloured like the
+    unexplained-changes view: cyan = more fluid (water + lava) in the model, orange = less, yellow = model
+    ground higher, magenta = lower (log scale, 0.01 .. ~3 units)."""
+    other = getattr(fr, 'other', None)
+    if other is None:
+        return render(fr, 'natural')
+    game, model = (fr, other) if getattr(fr, 'role', 'game') == 'game' else (other, fr)
+    col = render(game, 'natural').astype(np.float32).mean(-1, keepdims=True).repeat(3, -1) * 0.4
+    fm, fg = model.water + model.lava, game.water + game.lava
+    dF = fm - fg
+    dT = model.ground - game.ground
+    if getattr(fr, 'diff', None) is not None:      # compare mode: steady differences only (CompareSource._diff)
+        dF, dT = fr.diff
+    # fluid: ignore the open sea's small wave noise (the game moves the sea, the model does not): only
+    # differences above 0.05 and above 3 % of the local depth count
+    floor = np.maximum(0.05, 0.03 * np.maximum(fm, fg))
+    dF = np.sign(dF) * np.maximum(np.abs(dF) - floor, 0)
+    for d, colour, lo in ((np.maximum(dF, 0), (0, 220, 255), 1e-2), (np.maximum(-dF, 0), (255, 140, 0), 1e-2),
+                          (np.maximum(dT, 0), (255, 240, 0), 1e-2), (np.maximum(-dT, 0), (255, 0, 255), 1e-2)):
+        a = np.clip(np.log10(np.maximum(d, lo) / lo) / 2.5, 0, 1)[..., None]
+        col += (np.array(colour, np.float32) - col) * a
+    return np.clip(col, 0, 255).astype(np.uint8)
+
+
 def level_names():
     """Level files in the game's DustSave/Ingame folder (story maps first, then the challenge maps)."""
     import compare_sim, re
@@ -777,7 +1049,7 @@ def brush_edit(tool, col, row, radius, amount, P, temperature=LAVA_TEMPERATURE):
 # ---------------------------------------------------------------- rendering
 LIGHT = np.array([-0.6, -0.6, 0.55]) / np.linalg.norm([-0.6, -0.6, 0.55])
 VIEWS = ('natural', 'height', 'water depth', 'lava temperature', 'sediment', 'flow speed', 'unexplained changes',
-         'engine texture')                      # engine texture: one of engine_textures.ENTRIES (App.texture)
+         'model vs game', 'engine texture')         # model vs game: needs the compare source (C)                      # engine texture: one of engine_textures.ENTRIES (App.texture)
 FLOW_TEXTURES = ('wp_velocity', 'wp_foam', 'uv_drag')   # engine textures that need the running flow layer
 
 
@@ -1121,13 +1393,48 @@ class App:
             return 0.0
         if isinstance(src, ModelSource):
             return float(src.speed) if src.speed else src.ticks_per_second() / ModelSource.GAME_RATE
-        return 1.0 if isinstance(src, LiveGame) else 0.0
+        return 1.0 if isinstance(src, (LiveGame, CompareSource)) else 0.0
 
     def take_over(self):
         """M: continue in the Python model from the live state on screen."""
         if self.frame is not None and isinstance(self.src, LiveGame):
             self.pending_takeover = time.time()          # switch now if ready, else as soon as it is (tick)
             self.try_takeover()
+
+    def compare(self):
+        """C: run the model alongside the live game, tick for tick (CompareSource); again: re-sync the model."""
+        if isinstance(self.src, CompareSource):
+            self.src.resync()
+            self.say('model re-synced to the game')
+        elif self.frame is not None and isinstance(self.src, LiveGame):
+            self.set_source(CompareSource(self.src, self.frame))
+            if self.view not in ('natural', 'model vs game'):
+                self.set_view('natural')
+            self.say('comparing: G switches between game and model, view "model vs game" shows the differences')
+        else:
+            self.say('compare needs the live game (L)')
+
+    def compare_mode(self):
+        """What compare mode shows: 'game', 'model' or 'differences' (the model vs game view)."""
+        if not isinstance(self.src, CompareSource):
+            return None
+        return 'differences' if self.view == 'model vs game' else self.src.show
+
+    def toggle_compare_show(self):
+        """G (compare mode): game -> model -> differences -> game. Both keep running throughout."""
+        mode = self.compare_mode()
+        if mode is None:
+            return
+        if mode == 'game':
+            self.src.show = 'model'
+        elif mode == 'model':
+            self._view_before_diff = self.view
+            self.src.show = 'game'
+            self.set_view('model vs game')
+        else:
+            self.set_view(getattr(self, '_view_before_diff', 'natural') or 'natural')
+            self.src.show = 'game'
+        self.dirty = True
 
     def load(self, label, make):
         """Build a new source in the background (reading a map or finding the game can take seconds) and
@@ -1157,7 +1464,7 @@ class App:
 
     def set_source(self, new):
         old = self.src
-        if old is not new and isinstance(old, ModelSource):
+        if old is not new and isinstance(old, (ModelSource, CompareSource)):
             old.stop()
         if isinstance(new, LiveGame):
             if self.live is not None and self.live is not new:
@@ -1197,6 +1504,10 @@ class App:
             self.screenshot()
         elif k == 'm':
             self.take_over()
+        elif k == 'c':
+            self.compare()
+        elif k == 'g':
+            self.toggle_compare_show()
         elif k == 'l':
             self.connect_live()
         elif k == 'space':
@@ -1297,7 +1608,8 @@ class App:
         elif self.view == 'natural' and self.ground_tex:
             rgb = None                                   # drawn per pixel below
         else:
-            rgb = render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else render(fr, self.view)
+            rgb = (render_unexplained(fr, self.acc) if self.view == 'unexplained changes' else
+                   render_compare(fr) if self.view == 'model vs game' else render(fr, self.view))
         size, v = N * self.scale, N / self.zoom          # canvas pixels; visible cells across
         x0, y0 = self.view_x0, self.view_y0
         if self.view == 'natural' and self.ground_tex:
@@ -1415,6 +1727,11 @@ class App:
                     c, r, fr.ground[r, c], fr.soft[r, c], fr.ground[r, c] - fr.soft[r, c], fluid, *fr.flux[:, r, c]))
                 if self.view == 'engine texture' and self.tex_read is not None:
                     lines.append('texture here: ' + self.tex_read(r, c))
+                oth = getattr(fr, 'other', None)
+                if isinstance(self.src, CompareSource) and oth is not None:
+                    g, m = (fr, oth) if getattr(fr, 'role', '') == 'game' else (oth, fr)
+                    lines.append('model - game here: water %+.3f, lava %+.3f, ground %+.3f' % (
+                        m.water[r, c] - g.water[r, c], m.lava[r, c] - g.lava[r, c], m.ground[r, c] - g.ground[r, c]))
                 ex = getattr(self.src, 'explained', None)
                 if self.view == 'unexplained changes' and ex is not None:
                     lines.append('unexplained at this cell (tick %d): ground %+.4f, fluid %+.4f' % (ex['tick'], ex['dT'][r, c], ex['dF'][r, c]))

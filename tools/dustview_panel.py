@@ -37,6 +37,11 @@ class ControlPanel:
         self._button(row, 'Live game (L)', app.connect_live).pack(side='left')
         self.takeover_btn = self._button(row, 'Continue in model (M)', app.take_over)
         self.takeover_btn.pack(side='left', padx=(4, 0))
+        row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
+        self.compare_btn = self._button(row, 'Compare with model (C)', app.compare)
+        self.compare_btn.pack(side='left')
+        self.show_btn = self._button(row, 'Next: model (G)', app.toggle_compare_show)
+        self.show_btn.pack(side='left', padx=(4, 0))
 
         # ---- tabs: Map / Model / View
         self.tabs = ttk.Notebook(f, takefocus=False)
@@ -263,6 +268,8 @@ class ControlPanel:
         if model:
             t = level_names.title(getattr(src, 'level_name', None))
             what = 'Python model: %s%s' % ((t + ' | ') if t else '', src.label or 'model')
+        elif isinstance(src, dv.CompareSource):
+            what = 'Live game + model in lockstep (showing: %s)' % app.compare_mode()
         elif isinstance(src, dv.LiveGame):
             what = 'Live game (read-only)'
         else:
@@ -271,6 +278,16 @@ class ControlPanel:
             what += '\nloading %s ...' % app.loading
         self._put(self.source_text, what)
         self._enable(self.takeover_btn, isinstance(src, dv.LiveGame) and app.frame is not None)
+        comparing = isinstance(src, dv.CompareSource)
+        self._enable(self.compare_btn, comparing or (isinstance(src, dv.LiveGame) and app.frame is not None))
+        label = 'Re-sync model (C)' if comparing else 'Compare with model (C)'
+        if self.compare_btn.cget('text') != label:
+            self.compare_btn.configure(text=label)
+        self._enable(self.show_btn, comparing)
+        nxt = {'game': 'model', 'model': 'differences', 'differences': 'game'}.get(app.compare_mode(), 'model')
+        label = 'Next: %s (G)' % nxt
+        if self.show_btn.cget('text') != label:
+            self.show_btn.configure(text=label)
         for w in [self.pause_btn, self.step_btn] + self.speed_btns:
             self._enable(w, model)
         if model:
@@ -292,9 +309,13 @@ class ControlPanel:
         self._put(self.flip, bool(app.flip))
         self._put(self.scale, app.scale)
         self._sync_totems(src if model else None)
-        if src is not self._shown_src:              # a new map: point the level list at it
-            self._shown_src = src
-            name = getattr(src, 'level_name', None)
+        name = getattr(src, 'level_name', None)
+        if name is None and not model:              # live / compare: the story level from the totems (once found)
+            n = self.dv.level_number(src)
+            hit = [x for x in self.levels if n and x.startswith('ALPHA_Map%d_' % n) and 'Demo' not in x]
+            name = hit[0] if hit else None
+        if (src, name) != self._shown_src:          # a new map or a new live level: point the level list at it
+            self._shown_src = (src, name)
             if name in self.levels and self._current_level() != name:
                 self._put(self.level, self._level_label(name))
                 self._show_saves()

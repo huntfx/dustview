@@ -69,7 +69,7 @@ def _step(T0, So0, W0, sed0, F, c):
             H = abs(w)
             Sd = z if lava else sed0[y, x]
             Tm = sed0[y, x] if lava else z
-            So = So0[y, x]
+            So = z if lava else So0[y, x]               # lava turns the sand under it into rock (DLL)
             T = T0[y, x]
             sumf = f32(F[0, y, x] + F[1, y, x] + F[2, y, x] + F[3, y, x]) / f32(256)
             wet = water and H > c[WET]
@@ -150,11 +150,13 @@ def _step(T0, So0, W0, sed0, F, c):
             r = HL - fs                                          # what stays in the cell
             if lava and abs(r) < f32(1e-6):
                 r = z
+            elif not lava and r < z:                     # drained water's negative float leftover (see dustsim)
+                r = z
             T2[y, x] = T; So2[y, x] = So; Sd2[y, x] = Sd; ratio2[y, x] = ratio; outs[y, x] = fs; rem[y, x] = r
 
     # ---------------- C: what each cell receives (from neighbour n, through n's outflow towards it)
     Sn = np.empty_like(T0); lv0 = np.empty_like(T0); wv0 = np.empty_like(T0)
-    num0 = np.empty_like(T0); fD = np.empty_like(T0)
+    num0 = np.empty_like(T0); fD = np.empty_like(T0); lin0 = np.empty_like(T0)
     for yp in numba.prange(N):
         y = np.int64(yp)                 # (prange's index is unsigned: y - 1 would become float)
         for x in range(M):
@@ -186,6 +188,7 @@ def _step(T0, So0, W0, sed0, F, c):
             r = rem[y, x]
             Sn[y, x] = (z if lava else Sd2[y, x] - outs[y, x] * ratio2[y, x]) + sed_in / f32(4096)
             lv0[y, x] = (r if lava else z) + lsum
+            lin0[y, x] = lsum                                 # lava inflow from 3 sides
             wv0[y, x] = (z if lava else r) + wsum
             num0[y, x] = (r * Tm1[y, x] if lava else z) + hsum
 
@@ -198,12 +201,16 @@ def _step(T0, So0, W0, sed0, F, c):
             f = fD[y, x]
             bL = below_lava[x]
             lv = lv0[y, x] + (f if bL else z)
+            lin = lin0[y, x] + (f if bL else z)
             wv = wv0[y, x] + (z if bL else f)
             bl = lv > z
             tn = (num0[y, x] + (f * below_C3[x] if bL else z)) / (lv + wv) if bl else z
+            old = lava1[y, x]                            # the cell was lava at the start of the step
             if bl and tn <= Tmax:                       # diluted below WaterTemperatureMax: hardens
-                T2[y, x] = T2[y, x] + lv
+                T2[y, x] = T2[y, x] + (((lv + lin) + wv) if old else lv)   # was lava: + inflow again + water (DLL)
                 bl = False
+            elif old and not bl and wv > z:             # its lava all left and water came in: hardens too
+                T2[y, x] = T2[y, x] + ((lv + lin) + wv)
             C3[y, x] = tn if bl else Sn[y, x]
             Wn[y, x] = -lv if bl else wv
             below_lava[x] = bl

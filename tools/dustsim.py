@@ -58,6 +58,7 @@ def step_numpy(G, P):
     Sd = np.where(lava, 0, G['sed']).astype(f32)       # sediment (water cells)
     Tm = np.where(lava, G['sed'], 0).astype(f32)       # temperature (lava cells)
     water = ~lava
+    So = np.where(lava, f32(0), So).astype(f32)         # lava turns the sand under it into rock (T unchanged; DLL, 2026-11-18)
 
     # ---------------- Step1: water cells -- erosion and deposit
     sumf = F.sum(0).astype(f32) / f32(256)
@@ -104,6 +105,7 @@ def step_numpy(G, P):
     tot = f.sum(0)
     f *= np.where(tot > H, H / np.where(tot > 0, tot, 1), 1).astype(f32)
     Fq = np.rint(f * 256).astype(np.int32)
+    f_flow = f                                       # (debug: flows before rounding)
 
     # ---------------- lateral erosion (sand slumping into mud), water/dry cells
     thr = [P['LateralErosionSlopeThresholdLeft'], P['LateralErosionSlopeThresholdRight'],
@@ -123,6 +125,10 @@ def step_numpy(G, P):
     # float leftovers of a fully drained lava cell (~1e-7) count as empty: the DLL (approximate
     # reciprocals, other summation order) ends at exactly 0 there and keeps no lava below 1/256
     rem = np.where(lava & (np.abs(rem) < f32(1e-6)), f32(0), rem).astype(f32)
+    # a drained water cell's float leftover can come out slightly negative (-1.2e-7 seen: 1.56 out as
+    # 399/256); negative fluid means lava, so a spring then 'hardened' it and made 8 x its rate of water
+    # (Map 4, 2026-11-18). The DLL ends at 0 there.
+    rem = np.where(~lava & (rem < 0), f32(0), rem).astype(f32)
     fin = Fq.astype(f32) / f32(256)                  # what receivers get (rounded)
     def gather(a):                                   # sum over the 4 neighbours of a[opposite dir]
         return sum(shift(a[OPP[kk]], *NB[kk]) for kk in NB)
@@ -138,9 +144,13 @@ def step_numpy(G, P):
     # lava at its new temperature; otherwise (drained, water) it counts as water. The other three
     # neighbours count by their old state, lava at its cooled temperature. Lava + water: the water boils
     # away but dilutes the temperature; diluted to WaterTemperatureMax or below, the lava hardens at once
-    # (ground += lava volume) and the cell stays water.
+    # and the cell stays water. Ground += the lava volume if the cell was water; if it was lava: lava volume +
+    # the lava that flowed in this step (counted a second time) + the water volume, and this also happens
+    # when all its lava left and water came in (2026-11-18, against the DLL with the running game's
+    # parameters, WaterEnergy 8, on the Fire and Water map; earlier checks used 0 and missed it).
     noD = [kk for kk in NB if kk != D]
-    lv0 = (np.where(lava, rem, 0) + sum(shift(np.where(lava, fin, 0)[OPP[kk]], *NB[kk]) for kk in noD)).astype(f32)
+    lin0 = sum(shift(np.where(lava, fin, 0)[OPP[kk]], *NB[kk]) for kk in noD).astype(f32)   # lava inflow (3 sides)
+    lv0 = (np.where(lava, rem, 0) + lin0).astype(f32)
     wv0 = (np.where(lava, 0, rem) + sum(shift(np.where(lava, 0, fin)[OPP[kk]], *NB[kk]) for kk in noD)).astype(f32)
     num0 = (np.where(lava, rem * Tm, 0) + sum(shift(np.where(lava, fin * Tm, 0)[OPP[kk]], *NB[kk]) for kk in noD)).astype(f32)
     fD = shift(fin[U], *NB[D])                                 # inflow from row y - 1 (any fluid)
@@ -155,12 +165,15 @@ def step_numpy(G, P):
     for y in rows:
         f = fD[y]
         lv = lv0[y] + np.where(below_lava, f, 0)
+        lin = lin0[y] + np.where(below_lava, f, 0)
         wv = wv0[y] + np.where(below_lava, 0, f)
         bl = lv > 0
         tn = np.where(bl, (num0[y] + np.where(below_lava, f * below_C3, 0)) / np.where(bl, lv + wv, 1), 0).astype(f32)
         fr = bl & (tn <= Tmax)
-        if fr.any():
-            T[y] = np.where(fr, T[y] + lv, T[y])
+        old = lava[y]                            # the cell was lava at the start of the step
+        fr_old = old & ~bl & (wv > 0)            # its lava all left and water came in: hardens too (DLL)
+        if fr.any() or fr_old.any():             # was lava: ground += lava + lava inflow again + water;
+            T[y] = np.where(fr | fr_old, T[y] + np.where(old, (lv + lin) + wv, lv), T[y])   # was water: += lava
             bl = bl & ~fr
         C3[y] = np.where(bl, tn, Sn[y])
         Wn[y] = np.where(bl, -lv, wv)
@@ -169,7 +182,7 @@ def step_numpy(G, P):
     T = T.astype(f32)
     out_d = {'T': T, 'soft': So, 'W': Wn.astype(f32), 'sed': C3.astype(f32), 'F': Fq}
     if DEBUG:
-        out_d['_dbg'] = dict(lava_vol=lava_vol, water_vol=water_vol, rem=rem, lava_in=lava_in, water_in=water_in, heat_in=heat_in, Tm=Tm, lava=lava)
+        out_d['_dbg'] = dict(lava_vol=lava_vol, water_vol=water_vol, rem=rem, lava_in=lava_in, water_in=water_in, heat_in=heat_in, Tm=Tm, lava=lava, f=f_flow, Fq=Fq)
     return out_d
 
 
@@ -262,7 +275,9 @@ def fluid_modifier(G, ys, xs, rate, sediment=0.0, temperature=0.0, P=None):
                    sediment); lava cell (depth d, temperature T0): T = T0 - E x rate / d, and if that is
                    <= Tmax the lava hardens (ground += d) and the cell becomes water of depth
                    d + max(0, E x rate - T0 x d) (as the DLL does: no division by E), sediment 0.
-      RemoveWater: water cells: depth = max(depth - |rate|, 0); sediment unchanged; lava untouched.
+      RemoveWater: water cells: depth = max(depth - |rate|, 0); sediment = max(sediment - |rate| x the source's
+                   sediment setting, 0) (a drain with sediment 0.1 also takes mud; checked against the DLL
+                   2026-11-18); lava untouched.
       AddLava:     lava / dry cell: lava += rate, temperature = T; water cell (depth w): h = w x E / T
                    hardens from the new lava: if h <= rate: ground += h, lava = rate - h at T;
                    else ground += rate and the water loses rate x T / E (sediment kept); outflows of
@@ -288,6 +303,8 @@ def fluid_modifier(G, ys, xs, rate, sediment=0.0, temperature=0.0, P=None):
             W[ys, xs], Sd[ys, xs] = newW.astype(f32), newS.astype(f32)
         else:                                                           # RemoveWater
             W[ys, xs] = np.where(w > 0, np.maximum(w + rate, f32(0)), w).astype(f32)
+            if sediment:                     # the drain's sediment setting removes sediment too (DLL, 2026-11-18)
+                Sd[ys, xs] = np.where(w > 0, np.maximum(s0 + rate * sediment, f32(0)), s0).astype(f32)
     else:
         if rate > 0:                                                    # AddLava
             water = w > 0
