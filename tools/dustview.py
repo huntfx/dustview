@@ -688,7 +688,9 @@ class ModelSource(Source):
 
     def _vegetation_tick(self, G):
         """One step of the game's own vegetation / fire job on the new state (ground, sand, water from G;
-        plants from self.extra); returns a copy of self.extra with the new components 6 / 7, or None if
+        plants from self.extra); returns a new grid holding only the new components 6 / 7 (0-5 are zero:
+        state_to_grid fills them from G, nothing else reads them; copying the whole 8-layer grid cost ~3 ms
+        per tick), or None if
         vegetation is off or the helper is not available. Parameters: vegsim (species set per level:
         vegsim.level_set; ParamI and the propagate table partly guessed, findings/vegetation-fire-layers.md)."""
         if not VEGETATION_STEP or self.veg_failed:
@@ -704,10 +706,9 @@ class ModelSource(Source):
             R.put({0: G['T'].view(np.uint32), 1: G['soft'].view(np.uint32), 2: G['W'].view(np.uint32),
                    3: G['sed'].view(np.uint32), 6: ex[6], 7: ex[7]}, (0, 1, 2, 3, 6, 7))
             R.run(4, 1)
-            got = R.get((6, 7))
-            new = ex.copy()
-            new[6], new[7] = got[6], got[7]
-            return new
+            # a fresh array each tick (frames already published keep the old one); np.zeros is lazily
+            # zeroed by the OS, so only the two layers written cost anything
+            return R.get((6, 7), out=np.zeros((8, N, N), np.uint32))
         except Exception as e:
             print('vegetation step off:', e, flush=True)
             self.veg_failed = True

@@ -258,7 +258,13 @@ class Resident:
         for c in components:
             self.cells[:, :, c, :] = np.asarray(grid[c], np.uint32).reshape(N, N // 16, 16)
 
-    def get(self, components=range(8)):
+    def get(self, components=range(8), out=None):
+        """Components unpacked to (N, N) arrays; with `out` (an (8, N, N) uint32 array) they are written
+        into out[c] instead (no extra copy) and out is returned."""
+        if out is not None:
+            for c in components:
+                np.copyto(out[c].reshape(N, N // 16, 16), self.cells[:, :, c, :])
+            return out
         return {c: np.ascontiguousarray(self.cells[:, :, c, :]).reshape(N, N) for c in components}
 
     def run(self, job, steps=1):
