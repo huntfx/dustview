@@ -144,7 +144,7 @@ class ControlPanel:
         self.checks = {}
         for attr, text in (('overlay', 'Sources, totems, repulsors (O)'), ('flow_on', 'Flow texture, natural view (F)'),
                            ('ground_tex', 'Sand / rock textures, natural view'),
-                           ('show_plants', 'Plants and fire, natural view (own colours)'),
+                           ('show_plants', 'Plants (textured view: the game grass layer)'),
                            ('show_events', 'Terrain-change markers, live (D)')):
             v = self.checks[attr] = tk.BooleanVar(value=getattr(app, attr))
             self._check(box, text, v, lambda a=attr: self._set_flag(a)).pack(anchor='w')

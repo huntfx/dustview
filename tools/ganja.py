@@ -93,6 +93,40 @@ def blend_under(col, alpha, plant_col, plant_cov):
     alpha[:] = A
 
 
+# The game's grass ground layer (findings/vegetation-fire-layers.md "Grass on the ground"): 16 colours with
+# opacity, one per vegetation type, plus the burn colour, as R, G, B, A bytes. Read live (Story 9, 2026-11-21)
+# from the terrain renderer (exe global 0x00921754 -> [renderer] -> +0x150 -> 17 u32); the exe fills the 16 x 1
+# `samp_GrassColorRamp` texture from the first 16 and sets `g_BurnGroundColor` (shader 113 c128) from the 17th.
+GRASS_RAMP_U32 = (0x00ffffff, 0xa3828282, 0x5c0c101e, 0xa3828282, 0x5cbcb85c, 0xa3828282, 0x5c0c101e, 0xa3828282,
+                  0x5cbcb85c, 0x85373742, 0x85373742, 0x67828282, 0x5c0c101e, 0x8c828282, 0x5cbcb85c, 0x7fffffff)
+BURN_GROUND_U32 = 0x6b512e30
+
+
+def _rgba(v):
+    return np.array([v & 255, (v >> 8) & 255, (v >> 16) & 255, v >> 24], np.float32) / 255
+
+
+GRASS_RAMP = np.stack([_rgba(v) for v in GRASS_RAMP_U32])      # (16, 4) 0..1
+BURN_GROUND = _rgba(BURN_GROUND_U32)
+
+
+def grass_color_opacity(c6):
+    """The game's GrassColorRT (shader 113, `Technique_ComputeGrassColorAndOpacity`), one RGBA 0..1 texel per
+    cell: the average of GrassColorRamp[type] over the cell and its 4 diagonal neighbours, pulled towards the
+    burn colour by the share of those 5 cells whose plant byte is >= 0x40 (burning or burned)."""
+    b = np.pad(np.asarray(c6, np.uint32) & 0xFF, 1, mode='edge')
+    n0, n1 = b.shape[0] - 2, b.shape[1] - 2
+    acc = np.zeros((n0, n1, 4), np.float32)
+    burnt = np.zeros((n0, n1), np.float32)
+    for dy, dx in ((0, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+        t = b[1 + dy:1 + dy + n0, 1 + dx:1 + dx + n1]
+        acc += GRASS_RAMP[t & 15]
+        burnt += (t >= 0x40)
+    avg = acc * np.float32(0.2)
+    f = (burnt * np.float32(0.2))[..., None]
+    return np.ascontiguousarray(avg + (BURN_GROUND - avg) * f, np.float32)
+
+
 def type_table(ganja):
     """Per-type parameters from the 512-byte ganja block: dict name -> list of 16 values."""
     g = bytes(ganja)

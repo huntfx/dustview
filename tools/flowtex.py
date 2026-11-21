@@ -278,7 +278,7 @@ GROUND_TILES = 16.0        # shader 96: ground UV = world x 1/768 + 0.5 (c131.z 
 RAMP_V_HARD, RAMP_V_SOFT = 0.375, 0.625  # af4_TerrainRampUV c59 .z / .y as logged from the game (rock / sand)
 RAMP_U = 0.5               # ramp U = GroundParams.w (logged 0.75-1.0) - |view depth| x 0.0035: camera-dependent, chosen
 BUMP = 0.6                 # strength of the textures' normal perturbation against the cell slope (chosen)
-SHOW_VEGETATION = True     # natural view: plants from grid component 6 (ganja.colours, DustView's own colours)
+SHOW_VEGETATION = True     # natural view: plants from grid component 6 (textured view: the game's grass layer; plain view: ganja.colours)
 GROUND_GAIN = 1.35         # brightness (the game's light intensities are not modelled)
 LAVA_V = 0.125             # af4_TerrainRampUV .w (logged): the ramp's lava row; V above it is orange -> red
 LAVA_SCROLL = 1 + 0.92 * (0.0032 / (0.5 * 0.00293) - 1)   # lava's flow-texture speed vs water's (2.09): see _cell_fields
@@ -309,8 +309,8 @@ _GROUND = None
 
 
 def load_ground_textures():
-    """(soft mips, hard mips, ramp): SoftGround_2_D / HardGround_2_D (1024 x 1024 RGBA, no stored mips:
-    built here by 2 x 2 averaging) as float32 0..1, and RampeGround_D's column at RAMP_U as (256, 3)."""
+    """(soft mips, hard mips, ramp, grass mips): SoftGround_2_D / HardGround_2_D / Grass_D (1024 x 1024 RGBA;
+    mips built here by 2 x 2 averaging) as float32 0..1, and RampeGround_D's column at RAMP_U as (256, 3)."""
     global _GROUND
     if _GROUND is None:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -327,7 +327,7 @@ def load_ground_textures():
         rpx, _ = tdt.decode(bf.read_entry(TEX_BF, 'RampeGround_D.PC.tdt'))
         col = int(RAMP_U * (rpx[0].shape[1] - 1))
         ramp = np.ascontiguousarray(rpx[0][:, col, :3].astype(np.float32))
-        _GROUND = (mips('SoftGround_2_D.PC.tdt'), mips('HardGround_2_D.PC.tdt'), ramp)
+        _GROUND = (mips('SoftGround_2_D.PC.tdt'), mips('HardGround_2_D.PC.tdt'), ramp, mips('Grass_D.PC.tdt'))
     return _GROUND
 
 
@@ -366,13 +366,16 @@ def _lerp_at3(a, ch, y0, x0, y1, x1, fy, fx):
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _shade_textured(gxa, gya, sfa, oa, aa, wet, gy0, gx0, k, soft_t, hard_t, tpc, ramp, vh, vs, bump, gain, light,
-                    water_tex, D, strength, foamk, frame, foam, wt, kr, kf, lmask, ltemp, lava_t, kl, cw, out):
+                    water_tex, D, strength, foamk, frame, foam, wt, kr, kf, lmask, ltemp, lava_t, kl, cw,
+                    grass_t, gco, use_grass, out):
     """Natural view of a grid window, per pixel: ground = the game's sand / rock textures blended by the sand
     fraction (shader 96: normal map lerp(hard, soft, s); colour = TerrainRamp at V = lerp(vh, vs, s) +
     (alpha x 2 - 1) x 0.25), lit with the cell slope + the textures' normals; then the water / lava layer
     (colour oa, opacity aa, from viewfast.natural_layers); then, if water_tex, the ripple and foam textures as
     in _shade_window. Everything per cell is interpolated between cell centres (positions computed once per
-    pixel). tpc = texels per cell at the chosen mip level (soft_t and hard_t have the same size)."""
+    pixel). tpc = texels per cell at the chosen mip level (soft_t, hard_t and grass_t have the same size).
+    Grass (shader 96, if use_grass): colour = lerp(colour, Grass_D.rgb x GrassColorRT.rgb, saturate(2 x
+    GrassColorRT.a + Grass_D.a - 1)) before the lighting; gco = ganja.grass_color_opacity (per cell, bilinear)."""
     H, W = out.shape[0], out.shape[1]
     n = sfa.shape[0]
     fh, fw = frame.shape
@@ -439,6 +442,19 @@ def _shade_textured(gxa, gya, sfa, oa, aa, wet, gy0, gx0, k, soft_t, hard_t, tpc
             c0 = ramp[r0, 0] + (ramp[r1, 0] - ramp[r0, 0]) * f
             c1 = ramp[r0, 1] + (ramp[r1, 1] - ramp[r0, 1]) * f
             c2 = ramp[r0, 2] + (ramp[r1, 2] - ramp[r0, 2]) * f
+            if use_grass:
+                ga = _lerp_at3(gco, 3, cy0, cx0, cy1, cx1, fy, fx)
+                if ga > 0:
+                    ta = _lerp_at3(grass_t, 3, ty0, tx0, ty1, tx1, tfy, tfx)
+                    t = min(max(ga * two + ta - one, np.float32(0)), one)
+                    if t > 0:
+                        k255 = np.float32(255)
+                        g0 = _lerp_at3(grass_t, 0, ty0, tx0, ty1, tx1, tfy, tfx) * _lerp_at3(gco, 0, cy0, cx0, cy1, cx1, fy, fx) * k255
+                        g1 = _lerp_at3(grass_t, 1, ty0, tx0, ty1, tx1, tfy, tfx) * _lerp_at3(gco, 1, cy0, cx0, cy1, cx1, fy, fx) * k255
+                        g2 = _lerp_at3(grass_t, 2, ty0, tx0, ty1, tx1, tfy, tfx) * _lerp_at3(gco, 2, cy0, cx0, cy1, cx1, fy, fx) * k255
+                        c0 += (g0 - c0) * t
+                        c1 += (g1 - c1) * t
+                        c2 += (g2 - c2) * t
             px = -_lerp_at(gxa, cy0, cx0, cy1, cx1, fy, fx) + (nx * two - one) * bump
             py = -_lerp_at(gya, cy0, cx0, cy1, cx1, fy, fx) + (ny * two - one) * bump
             sh = (px * L0 + py * L1 + L2) / np.sqrt(px * px + py * py + one)
@@ -657,19 +673,19 @@ class FlowLayer:
         gxa, gya, sfa, oa, aa = self._layers
         viewfast.natural_layers(fr.ground, fr.soft, fr.water, fr.lava, fr.sediment, fr.temperature,
                                 lava_xs, lava_cs, gxa, gya, sfa, oa, aa, False)   # lava is drawn on the ramp below
-        if SHOW_VEGETATION and fr.grid is not None and fr.grid.shape[0] > 6 and fr.grid[6].any():
-            import ganja                                 # plants (grid component 6) under the water layer
-            pc, cov = ganja.colours(fr.grid[6])
-            L = np.asarray(light, np.float32)
-            lit = np.clip((-gxa * L[0] - gya * L[1] + L[2]) / np.sqrt(gxa * gxa + gya * gya + 1), 0, 1) * 0.75 + 0.25
-            ganja.blend_under(oa, aa, pc * lit[..., None] * np.float32(GROUND_GAIN), cov * (np.asarray(fr.lava) <= 0))
+        use_grass = bool(SHOW_VEGETATION and fr.grid is not None and fr.grid.shape[0] > 6 and fr.grid[6].any())
+        if use_grass and getattr(self, '_gkey', None) is not fr.grid:      # once per simulation frame
+            import ganja                                 # the game's grass ground layer (shaders 113 + 96)
+            self._gco = ganja.grass_color_opacity(fr.grid[6])
+            self._gkey = fr.grid
+        gco = self._gco if use_grass else np.zeros((1, 1, 4), np.float32)
         if water_tex:
             depth, lv = self.update(fr.water, fr.flux, t, fr.lava, min_depth)
         else:
             depth, lv = np.asarray(fr.water, np.float32), np.asarray(fr.lava, np.float32)
         vx, vy, strength, foamk = self.fields
         wet = ((depth > min_depth) & (lv <= 0)).astype(np.float32)
-        soft_m, hard_m, ramp = load_ground_textures()
+        soft_m, hard_m, ramp, grass_m = load_ground_textures()
         tpc0 = soft_m[0].shape[0] * GROUND_TILES / n          # texels per cell at full resolution (32)
         level = int(min(max(np.floor(np.log2(max(tpc0 / k, 1.0))), 0), len(soft_m) - 1))   # ~1-2 texels per pixel
         # upload byte x = 255 wherever lava; the game softens it before the terrain pass (screen dump: lava edges ~2x
@@ -699,7 +715,8 @@ class FlowLayer:
                         np.float32(RAMP_V_HARD), np.float32(RAMP_V_SOFT), np.float32(BUMP), np.float32(GROUND_GAIN),
                         np.asarray(light, np.float32), bool(water_tex), self.D, strength, foamk, self._frame(t),
                         self.foam, self.wt, np.float32(self.kr), np.float32(self.kf),
-                        lmask, ltemp, lava_m[llev], np.float32(kl0 / 2 ** llev), cw, out)
+                        lmask, ltemp, lava_m[llev], np.float32(kl0 / 2 ** llev), cw,
+                        grass_m[level], gco, use_grass, out)
         return out
 
     DEBUG_MODES = ('foam', 'velocity', 'drag')

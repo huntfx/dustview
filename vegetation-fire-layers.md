@@ -136,12 +136,33 @@ Measured on a flat sand plain (water layer fixed, one flowering type-1 patch of 
 ### Starting plants from the level files
 The `.sav` files hold the vegetation layers (`docs/sav-format.md`, reader `sav.vegetation_components`): the plant byte, the random nibble, vegetation time and fire time, loaded by the interface DLL's `FillGanja*` functions. DustView loads them with the map, so model runs start with the level's plants (e.g. Map 6 *Wildfires* starts with 3,218 burned cells and burning fronts). Plants are drawn in DustView's natural view with its own colours per type (`ganja.colours`; the game draws 3D models), under the water layer; burning cells orange, burned dark grey (View tab: *Plants and fire*).
 
+## Grass on the ground (how the game draws it; in DustView since 2026-11-21)
+Besides the 3D plant models, the game paints a grass layer onto the terrain from the plant byte (component 6 byte 0), in two shader passes (`Cache/fxlist_PC.fxl`, `tools/fxcache.py dis 113` / `96`):
+1. **Shader 113** (`Technique_ComputeGrassColorAndOpacity`, vertex shader 112) renders the 512 x 512 target `engine/GrassColorRT` (created at exe `0x00454279`; one texel per cell). Per cell it reads the plant byte of the cell and its **4 diagonal neighbours** (from the 512 x 1024 ground upload, byte z), looks up `samp_GrassColorRamp` at U = type / 16 for each, **averages the 5** and pulls the result towards `g_BurnGroundColor` by the share of the 5 bytes that are >= 0x40 (burning or burned): `out = avg + (burn - avg) x burnt / 5`.
+2. **Shader 96 / 97** (terrain): `Grass_D` (`Tex_BD00993D.lin.bf`, 1024 x 1024 DXT5, tiled 16 x per map like the sand / rock textures; sampler `g_SamplerGrassGroundNormal`) and GrassColorRT (bilinear, map UV) give `colour = lerp(terrain colour, Grass_D.rgb x GCO.rgb, saturate(2 x GCO.a + Grass_D.a - 1))` before the lighting. The texture's alpha makes thin cover patchy instead of a flat tint.
+
+The ramp and burn colour are not in any data file found: the exe fills the 16 x 1 ramp texture (`[renderer+0x3088]`, code `0x004541F0`-`0x00454229`, swapping bytes 0 and 2 for the texture format) from **17 u32 colours** at `[[renderer] + 0x150]` (the 17th is the burn colour, set as constant c128 x 1/255 at `0x004543E9`). The renderer is the exe global `0x00921754` (the per-frame caller `0x00829C30` stores the object passed in at `[renderer]` before calling `0x00455A40`, which calls the grass pass `0x00454140`). Read live on Story 9 (2026-11-21), as R, G, B, opacity:
+
+| Types | Colour | Opacity |
+|---|---|---|
+| 0 | (255, 255, 255) | 0 (no grass) |
+| 1, 3, 5, 7 | (130, 130, 130): `Grass_D` at about half brightness | 163 |
+| 11 / 13 (village ground) | (130, 130, 130) | 103 / 140 |
+| 2, 6, 12 | (30, 16, 12) dark brown | 92 |
+| 4, 8, 14 | (92, 184, 188) pale cyan | 92 |
+| 9, 10 | (66, 55, 55) | 133 |
+| 15 | (255, 255, 255) | 127 |
+| burn colour | (48, 46, 81) | 107 |
+
+DustView (textured natural view): `ganja.grass_color_opacity` = shader 113 with these colours (`ganja.GRASS_RAMP_U32`, `BURN_GROUND_U32`), `flowtex._shade_textured` = shader 96's blend; the untextured natural view keeps DustView's own plant colours (`ganja.colours`). Compared with a game screenshot (2026-11-21) the grass is greener / less yellow in DustView: the game's colour grading (post-process) is not modelled (game-wide TODO). Fire itself (flames) is drawn by particles in the game, not by the ground layer: burning cells show only the burn tint.
+
 ## Fire: what is read so far (not yet checked against the DLL)
 - `Step1`: a cell with a plant (type != 0) under **lava** (fluid < 0) gets the fire bit.
 - The fire time (component 7 high half) doubles as **ignition heat** for a cell that is not burning: each tick it gains 8 x (burning 4-neighbours); with no burning neighbour it **halves** (`pavgw` with 0). The cell ignites when the heat passes `FireIgnition[type]` (8 x fireIgnition) + 8 x the cell's random nibble. While burning it gains `FireSpeedProgressBase` (10) per tick up to `FireDuration[type]`, then the cell turns burned (measured life cycle above). The fire bit is recomputed from these timers, so setting the bit with a zero timer does nothing (seen in the harness).
 - Water: `LifeFireResistWH` (`lifeFireResistanceWaterHeight`) is compared against the water depth in the fire section; exact effect not read.
 
 ## TODO (skipped, worth revisiting)
+- [ ] Grass colours: read on one level only (Story 9); whether they differ per level (they sit in a renderer settings object whose source is not found) is not checked. The words after the 17 colours (`0101070f 0101070f 0f0f0f0f 00000808 ...`) are not decoded. Texture format of the 16 x 1 ramp (LyN format code 0x16) assumed to keep alpha (the shader needs it: type 0 has opacity 0).
 - [ ] Fire rules: finish reading `Step2` (from the `FireDuration` lookup at `0x1002A0B0` on: burned phase, `LifeFireResistWH`, `FireAnim`) and check every rule against the DLL with `vegsim.run_dll` (give a burning cell a fire time above its ignition threshold to start a fire). Paused 2026-11-21 to do vegetation first (on request). The annotated listings came from a scratch script (names for `ConstParam` / per-type block offsets); worth keeping as a tool if the reading continues.
 - [ ] The 48-86 cells per tick where the game blocks new growth that the step makes (live check above): find what does it (people / creatures walking, `m_humansBlockingFactor`? paths? a second writer of component 6 in the AI or the interface DLL). Not modelled in DustView.
 - [ ] Where most new vegetation in play comes from (Map 2: 1,571 plants in the level file, 26,569 in the player's save; the step alone adds few): probably villages planting village ground (types 11-14, `m_isVillageVegetation`, which spreads as type 1) and the AI's random seeding (`VegetationInterface`: `m_activateRandom` 1, `m_randomGridRange` 16). Both are outside the step and not modelled.
