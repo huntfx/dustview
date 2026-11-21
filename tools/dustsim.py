@@ -371,13 +371,39 @@ def apply_modifiers(G, entries, P=None):
             ground_modifier(G, ys, xs, e['amount'], soft=(t == 3))
 
 
-def tick(G, P, sources=(), repulsors=()):
+def modifier_calls(G, sources=(), repulsors=()):
+    """The game's own modifier calls for springs / vents / drains and RepulseFluid entries, for
+    galileo.Resident.modify: [(kind, center, param)] in the order apply_sources + repulse_fluid use.
+    Param = (signed rate, +-1, sediment, temperature) for the fluid modifiers (checked 2026-11-21 against
+    fluid_modifier on a random grid: identical but for last-bit lava temperatures), (amount, mode, sediment,
+    0) for RepulseFluid. Sets each source's 'activity' (bury rule) on G as given, before any modifier
+    runs (apply_sources works them out one after the other; only differs where a source sits inside
+    another one's disc)."""
+    calls = []
+    for s in sources:
+        act = bury_activity(G, s)
+        s['activity'] = act
+        rate = float(s['rate'] * act)
+        if rate == 0:
+            continue
+        temp = float(s.get('temperature', 0.0))
+        kind = ('AddLava' if rate > 0 else 'RemoveLava') if temp > 0 else ('AddWater' if rate > 0 else 'RemoveWater')
+        calls.append((kind, (s['col'], s['row'], s['radius'], 0.0),
+                      (rate, 1.0 if rate > 0 else -1.0, float(s.get('sediment', 0.0)), temp)))
+    for e in repulsors:
+        calls.append(('RepulseFluid', (e['col'], e['row'], e['radius'], 0.0),
+                      (e['amount'], e['f5'], float(e.get('sediment', 0.0)), 0.0)))
+    return calls
+
+
+def tick(G, P, sources=(), repulsors=(), step_fn=None):
     """One full game tick as far as modelled: border ring reset, step(), sources, then RepulseFluid
     modifiers (village outposts; entries with col, row, radius, amount, f5). The 32-cell band
-    outside the ring is kept unchanged. Not modelled: tides/waves, script changes, player powers."""
+    outside the ring is kept unchanged. Not modelled: tides/waves, script changes, player powers.
+    step_fn(G, P) replaces step() (e.g. the game's own DLL step; it must return fresh arrays)."""
     a, b = RING
     set_border_ring(G, P)
-    out = step(G, P)                                   # fresh arrays: copy the old band into them
+    out = (step_fn or step)(G, P)                      # fresh arrays: copy the old band into them
     band = ((slice(0, a), slice(None)), (slice(b + 1, None), slice(None)),
             (slice(a, b + 1), slice(0, a)), (slice(a, b + 1), slice(b + 1, None)))
     for k in ('T', 'soft', 'W', 'sed'):

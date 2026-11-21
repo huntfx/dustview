@@ -90,9 +90,24 @@ class ControlPanel:
         for b in self.speed_btns:
             b.pack(side='left', padx=(4, 0))
         dustview = sys.modules['__main__'] if hasattr(sys.modules['__main__'], 'VEGETATION_STEP') else __import__('dustview')
-        self.veg_step = tk.BooleanVar(value=dustview.VEGETATION_STEP)
-        self._check(box, "Plants grow and burn (the game's own vegetation step)", self.veg_step,
-                    lambda: setattr(dustview, 'VEGETATION_STEP', self.veg_step.get())).pack(anchor='w', pady=(4, 0))
+        box = self._section('Simulation', tab_model)
+        self.step_vars = {}
+        for attr, label, choices in (('FLUID_STEP', 'Water / lava / sand', ('off', 'game', 'model')),
+                                     ('SOURCE_STEP', 'Sources / repels', ('off', 'game', 'model')),
+                                     ('WAVE_STEP', 'Waves / tide', ('off', 'model')),
+                                     ('VEGETATION_STEP', 'Vegetation / fire', ('off', 'game'))):
+            row = ttk.Frame(box); row.pack(fill='x', pady=(2, 0))
+            ttk.Label(row, text=label, width=17).pack(side='left')
+            var = self.step_vars[attr] = tk.StringVar(value=getattr(dustview, attr))
+            for val in choices:
+                self._radio(row, {'off': 'Disabled', 'game': 'Game', 'model': 'Model'}[val], var, val,
+                            lambda a=attr, v=var: setattr(dustview, a, v.get())).pack(side='left', padx=(4, 0))
+        ttk.Label(box, text="Game = the game's own simulation code, run in a helper program (matches the game "
+                            "exactly). Model = DustView's re-implementation. Water, lava and sand are one step in "
+                            "the game, so they share one choice. Sources / repels = springs, lava vents, drains "
+                            "and village repels. Waves / tide = the level script's edge waves and sea level "
+                            "(Disabled keeps the current level). Painting works whatever is chosen.",
+                  wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
         box = self._section('Villages (or click a totem on the map)', tab_model)
         self.totem_frame = ttk.Frame(box); self.totem_frame.pack(fill='x')
         self.totem_vars = []

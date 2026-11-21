@@ -237,15 +237,17 @@ class Resident:
     listed components of it) into the shared grid, runs the game's job in place and returns the components
     asked for (default all) unpacked. Not thread-safe: use from one thread."""
     GRID_OFS = 0x1000
+    MOD_OFS = GRID_OFS + N * N * 32              # modifier records (simstep.cpp serve(): 0x60 bytes each)
+    MOD_SIZE, MAX_MODS = 0x60, 4096
 
     def __init__(self, param_bytes=None):
         import mmap, threading
         self.name = 'DustSimstep_%d_%d' % (os.getpid(), id(self))
-        self.mm = mmap.mmap(-1, self.GRID_OFS + N * N * 32, tagname=self.name)
+        self.mm = mmap.mmap(-1, self.MOD_OFS + self.MAX_MODS * self.MOD_SIZE, tagname=self.name)
         self.cells = np.frombuffer(self.mm, np.uint32, N * N * 8, self.GRID_OFS).reshape(N, N // 16, 8, 16)
         if param_bytes is not None:
             self.set_params(param_bytes)
-        self.p = subprocess.Popen([SIMSTEP, '--serve', WORKER, self.name], stdin=subprocess.PIPE,
+        self.p = subprocess.Popen([SIMSTEP, '--serve', WORKER, self.name, MODIFIER_DLL], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         r = self.p.stdout.readline().strip()
         if r != 'ready':
@@ -267,8 +269,25 @@ class Resident:
             return out
         return {c: np.ascontiguousarray(self.cells[:, :, c, :]).reshape(N, N) for c in components}
 
+    def modify(self, calls, P, skip=2):
+        """Apply the game's own modifiers to the shared grid, in order. calls: (kind, center, param) with
+        kind a MODIFIER_RVA key, center (col, row, radius, w), param (4 floats); P: the parameter array
+        (P[17], P[46] = WaterEnergy go into each block, as SimulatorWater::Modify does)."""
+        calls = list(calls)
+        if len(calls) > self.MAX_MODS:
+            raise ValueError('too many modifiers: %d' % len(calls))
+        for i, (kind, center, param) in enumerate(calls):
+            o = self.MOD_OFS + i * self.MOD_SIZE
+            self.mm[o:o + 4] = struct.pack('<I', MODIFIER_RVA[kind])
+            self.mm[o + 0x10:o + 0x60] = modifier_block(center, param, P, skip)
+        if calls:
+            self._command('mods %d' % len(calls))
+
     def run(self, job, steps=1):
-        self.p.stdin.write('run %d %d\n' % (job, steps))
+        self._command('run %d %d' % (job, steps))
+
+    def _command(self, cmd):
+        self.p.stdin.write(cmd + '\n')
         self.p.stdin.flush()
         r = self.p.stdout.readline().strip()
         if r != 'ok':

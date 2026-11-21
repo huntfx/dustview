@@ -641,8 +641,9 @@ class ModelSource(Source):
         try:
             self._run_loop()
         finally:
-            if self.veg is not None:
-                self.veg.close()
+            if self.helper is not None:
+                self.helper.close()
+                self.helper, self._helper_image, self._helper_holds = None, None, None
 
     def _run_loop(self):
         due = time.perf_counter()
@@ -660,14 +661,17 @@ class ModelSource(Source):
                 due = max(due, time.perf_counter() - 0.25) + 1 / (self.GAME_RATE * speed)
             sch = self.schedule
             srcs = self.sources
+            waves = WAVE_STEP == 'model'
             if sch is not None:
                 sch.tick(1 / 31, ground=self.G['T'])
                 srcs = sch.sources()                 # fresh dicts: 'activity' (burial) is set by the tick,
-                self.P['BorderWaterSurfaceHeight'] = sch.border_level   # so publish them only after it
-            G = dustsim.tick(self.G, self.P, srcs, self.other_modifiers)
+                if waves:                            # so publish them only after it
+                    self.P['BorderWaterSurfaceHeight'] = sch.border_level   # tide (kept as it was while off)
+            G = self._fluid_tick(srcs)
             if sch is not None:
-                sch.write_back(srcs)
-                if sch.profiles:
+                if SOURCE_STEP != 'off':
+                    sch.write_back(srcs)
+                if waves and sch.profiles:
                     dustsim.apply_edges(G, sch.border_level, sch.profiles)
             extra = self._vegetation_tick(G)
             with self.lock:
@@ -683,8 +687,91 @@ class ModelSource(Source):
         with self.lock:
             self.pending.append(fn)
 
-    veg = None                                   # galileo.Resident running the game's vegetation step (job 4)
-    veg_failed = False
+    helper = None                                # galileo.Resident running the game's own steps (job 0 water / lava,
+    helper_failed = False                        # job 4 vegetation / fire, the modifiers); one helper process
+    mods_failed = False                          # the helper could not run modifiers (e.g. an old simstep.exe)
+    _helper_consts = _helper_image = _helper_holds = None   # _helper_holds: state dict the helper's grid equals
+
+    def _fluid_tick(self, srcs):
+        """Water / lava / sand step, then the modifier pass (springs, vents, drains, village repels), each as
+        chosen on the Model tab (FLUID_STEP, SOURCE_STEP). Returns a new state dict."""
+        fluid, mods, reps = FLUID_STEP, SOURCE_STEP, self.other_modifiers
+        if fluid == 'off':                       # fresh arrays: published frames keep the old ones
+            G = {k: v.copy() for k, v in self.G.items()}
+        else:
+            G = dustsim.tick(self.G, self.P, (), (),
+                             step_fn=self._game_step if fluid == 'game' and not self.helper_failed else None)
+        if mods == 'game' and not (self.mods_failed or self.helper_failed):
+            self._game_modifiers(G, srcs, reps)
+        elif mods != 'off':
+            dustsim.apply_sources(G, srcs, self.P)
+            for e in reps:
+                dustsim.repulse_fluid(G, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
+        return G
+
+    def _game_modifiers(self, G, srcs, reps):
+        """The game's own modifier code (GalileoSimulatorWater.dll) for this tick's sources and repels,
+        applied to G in place through the helper. Falls back to the Python copies (and stays there)."""
+        calls = dustsim.modifier_calls(G, srcs, reps)
+        if not calls:
+            return
+        try:
+            R = self._helper()
+            if self._helper_holds is not G:      # the game step just left exactly this state in the helper
+                R.put(state_to_grid(G), range(6))
+            Pa = np.array([self.P[n] for n in galileo.PARAM_NAMES], np.float32)
+            if not Pa[46]:                       # WaterEnergy: the default parameters have 0, the game 8
+                Pa[46] = dustsim.WATER_ENERGY
+            R.modify(calls, Pa)
+            G.update(dustsim.from_grid(R.get(range(6), out=np.zeros((8, N, N), np.uint32))))
+            self._helper_holds = G
+        except Exception as e:
+            print('game modifiers not available, using the model:', e, flush=True)
+            self.mods_failed = True
+            self._helper_holds = None
+            dustsim.apply_sources(G, srcs, self.P)
+            for e in reps:
+                dustsim.repulse_fluid(G, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
+
+    def _helper(self):
+        """The resident simstep helper with the current parameters (self.P changes during a level: tide /
+        border level), started on first use."""
+        if self._helper_consts is None:
+            import vegsim
+            vset = vegsim.level_set(getattr(self, 'level_name', '') or '')
+            self._helper_consts = dict(param_i=vegsim.param_i(), param_u8=vegsim.param_u8(), ganja=vegsim.ganja_block(vset))
+            self._helper_vset = vset
+        img = galileo.param_image(np.array([self.P[n] for n in galileo.PARAM_NAMES], np.float32), 2, **self._helper_consts)
+        if self.helper is None:
+            self.helper = galileo.Resident(img)
+            print('game step helper running (species set %d)' % self._helper_vset, flush=True)
+        elif img != self._helper_image:
+            self.helper.set_params(img)          # the helper copies the parameters at every run
+        self._helper_image = img
+        return self.helper
+
+    def _game_step(self, G, P):
+        """The game's own water / lava / sand step (DLL job 0) as a step_fn for dustsim.tick. Falls back to
+        dustsim.step (and stays there) if the helper cannot run."""
+        try:
+            R = self._helper()
+            grid = state_to_grid(G)              # components 0-5 packed as the game stores them
+            R.put(grid, range(6))
+            R.run(0, 1)
+            out = self._helper_holds = dustsim.from_grid(R.get(range(6), out=grid))
+            return out                           # dustsim.tick only copies the unchanged border band into it
+        except Exception as e:
+            self._helper_holds = None
+            print('game water step not available, using the model:', e, flush=True)
+            self.helper_failed = True
+            return dustsim.step(G, P)
+
+    def step_modes(self):
+        fluid = FLUID_STEP if not (FLUID_STEP == 'game' and self.helper_failed) else 'model (game step failed)'
+        mods = SOURCE_STEP if not (SOURCE_STEP == 'game' and (self.helper_failed or self.mods_failed)) else 'model (game modifiers failed)'
+        plants = VEGETATION_STEP if not (VEGETATION_STEP == 'game' and self.helper_failed) else 'off (game step failed)'
+        lab = lambda v: STEP_LABELS.get(v, v)
+        return 'water/lava/sand: %s, sources/repels: %s, waves: %s, plants: %s' % (lab(fluid), lab(mods), lab(WAVE_STEP), lab(plants))
 
     def _vegetation_tick(self, G):
         """One step of the game's own vegetation / fire job on the new state (ground, sand, water from G;
@@ -693,25 +780,20 @@ class ModelSource(Source):
         per tick), or None if
         vegetation is off or the helper is not available. Parameters: vegsim (species set per level:
         vegsim.level_set; ParamI and the propagate table partly guessed, findings/vegetation-fire-layers.md)."""
-        if not VEGETATION_STEP or self.veg_failed:
+        if VEGETATION_STEP != 'game' or self.helper_failed:
             return None
         try:
-            if self.veg is None:
-                import vegsim
-                vset = vegsim.level_set(getattr(self, 'level_name', '') or '')
-                self.veg = galileo.Resident(galileo.param_image(self.params, 2, param_i=vegsim.param_i(),
-                                                                param_u8=vegsim.param_u8(), ganja=vegsim.ganja_block(vset)))
-                print('vegetation: game step running (species set %d)' % vset, flush=True)
-            R, ex = self.veg, self.extra
+            R, ex = self._helper(), self.extra
             R.put({0: G['T'].view(np.uint32), 1: G['soft'].view(np.uint32), 2: G['W'].view(np.uint32),
                    3: G['sed'].view(np.uint32), 6: ex[6], 7: ex[7]}, (0, 1, 2, 3, 6, 7))
+            self._helper_holds = None
             R.run(4, 1)
             # a fresh array each tick (frames already published keep the old one); np.zeros is lazily
             # zeroed by the OS, so only the two layers written cost anything
             return R.get((6, 7), out=np.zeros((8, N, N), np.uint32))
         except Exception as e:
             print('vegetation step off:', e, flush=True)
-            self.veg_failed = True
+            self.helper_failed = True
             return None
 
     def _apply_edits(self):
@@ -748,7 +830,8 @@ class ModelSource(Source):
         note = getattr(self, 'progress_note', '')
         vil = (' | villages %d/%d%s (click a totem: village on/off)' % (sum(1 for t in self.totems if t.get('built')), len(self.totems),
                                                                (', from ' + note) if note else '')) if self.totems else ''
-        return '%s%s | %s | %d sources, %d repulsors%s%s' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers), vil, extra)
+        return '%s%s | %s | %s | %d sources, %d repulsors%s%s' % (self.name, ' (%s)' % self.label if self.label else '', state,
+                                                              self.step_modes(), len(self.sources), len(self.other_modifiers), vil, extra)
 
     def stop(self):
         self.running = False                     # the model thread closes the vegetation helper on its way out
@@ -1067,7 +1150,14 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
 TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock')
 LAVA_TEMPERATURE = 255.0                         # internal units, as the level files' lava vents
 BRUSH_MIN, BRUSH_MAX = 1, 40
-VEGETATION_STEP = True                           # model mode: run the game's vegetation / fire step each tick
+# Model mode, chosen on the Model tab. Water, lava and sand are one step in the game, so they share one choice.
+FLUID_STEP = 'model'          # the step: 'off' (no flow), 'game' (the game's own DLL step via the simstep
+                              # helper), 'model' (dustsim, our re-implementation)
+SOURCE_STEP = 'model'         # the modifier pass (springs, vents, drains, village repels): 'off' | 'game' (the
+                              # game's modifier code in the same helper) | 'model' (dustsim's copies)
+WAVE_STEP = 'model'           # waves and tide at the map edge from the level script: 'off' | 'model'
+VEGETATION_STEP = 'game'      # 'off' | 'game' (the game's own vegetation / fire step; there is no Python version)
+STEP_LABELS = {'off': 'disabled', 'game': 'game', 'model': 'model'}
 
 
 def brush_edit(tool, col, row, radius, amount, P, temperature=LAVA_TEMPERATURE):
