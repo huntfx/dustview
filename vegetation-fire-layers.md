@@ -43,7 +43,7 @@ The grid in memory is tiled in 16-cell strips (cell offset `((x >> 4) << 7) + (y
 | FloweringStopTime (0xE0) | 245 | 1000 | 900 | 1000 | 1000 | 1000 | 1000 | 1000 | 1000 | 500 | 180 | 1000 | 1000 | 1000 | 1000 | 245 |
 | FireAnimation (0x140) | 640 | 120 | 400 | 80 | 0 | 120 | 80 | 80 | 0 | 500 | 500 | 80 | 80 | 120 | 0 | 640 |
 
-Unnamed blocks (no debug string found): 0xA0 (bit 15 set on types 0, 2, 3, 4, 9, 15: flags?), 0x120 (15 / 128 / 256 / 896), 0x160 (16, or 1 on types 9-10, 32767 on 0 and 15), 0x180, 0x1A0, 0x1C0, and 0x1E0 = 8 × type (0, 8, 16 … 120: probably an offset into a per-type table elsewhere). Types 9 and 10 ignite almost at once (8) and flower (150 to 500 / 180): candidates for the fire trees seen on Map 6; types 2, 6, 12 hardly burn (4800). The table may differ per level (only one level read).
+Unnamed blocks (no debug string found): 0xA0 (bit 15 set on types 0, 2, 3, 4, 9, 15: flags?), 0x120 (15 / 128 / 256 / 896), 0x160 (16, or 1 on types 9-10, 32767 on 0 and 15), 0x180, 0x1A0, 0x1C0, and 0x1E0 = 0, 8, 16 … 120 (not per type: the lookup n -> 8 n, see "Parameters" below). Types 9 and 10 ignite almost at once (8) and flower (150 to 500 / 180): candidates for the fire trees seen on Map 6; types 2, 6, 12 hardly burn (4800). The table may differ per level (only one level read).
 
 Live field counts on the same frame (262,144 cells): type 0 on 218,760, 1 on 36,965 (all flowering), 10 on 3,204 (mostly status 2), 11 on 3,186 (flowering), 9 on 29; random nibble 1-15 each on ~12,400 cells (uniform) and 0 on 75,599; fire / burned / fire time all 0 (no fire on this map); vegetation time 0-1036.
 
@@ -67,7 +67,7 @@ Each species file holds a list `m_vegetationParameters` of **4 `DustAi::SpecieVe
 | 0x160 | `lifeFireResistanceWaterHeight` |
 | 0x180 / 0x1A0 | 128 x `spreadWaterHeightMin` / `Max` |
 | 0x1C0 | 128 x `spreadDeltaHeightMax` |
-| 0x1E0 | 8 x type |
+| 0x1E0 | 8 x index (`m_speedIgnitionBase` x n lookup, not per type; see "Parameters") |
 
 **Which set:** The Big Wave = set 0 (set 2 differs on type 13); Waves = set 1 or 3 (they differ only in `lifeGroundType` and the unnamed fields, which are not in the table). Sets 0 / 2 are "dry" (cover spreads only where water is at most 0.5 deep, dies above 1), sets 1 / 3 "wet" (spreads in 0.5-9.5 of water, lives up to 10); types 9 / 10 differ only in their life span (adult 1000 / 200 vs 4000 / 2000). How a level picks its set is not found.
 
@@ -102,10 +102,54 @@ Observations made before the layout was decoded, with the decoded fields they co
 | C7 b2 | Fire with a trail: white, then black, then back to white | low byte of the **fire time**: wraps fast while burning (10 per tick), resets to 0 when the cell turns burned, then climbs 1 per tick through the burned phase (measured, see the life cycle above) |
 | C7 b3 | The active fire | high byte of the fire time |
 
+## Running the game's own vegetation step (2026-11-21)
+The vegetation / fire step is job 4 of `GalileoSimulatorWater_9_9.dll` (`sCodeAddrJob(4)` = `CallbackSimulatorGanja`, same `SimulatorParam` as the water job). It reads ground, sand and water (components 0-3) and writes components 6 / 7. Ways to run it:
+- one-off: `SIMSTEP_JOB=4` (simstep.exe), `galileo.run(..., job=4)`, wrapper [../tools/vegsim.py](../tools/vegsim.py) (`from_sav`, `plant`, `run_dll`);
+- every tick: `simstep --serve` keeps the DLL loaded and shares the grid through named shared memory (`galileo.Resident`, ~5 ms per tick including packing, bit-identical to the file harness). DustView's model mode uses it (Model tab: *Plants grow and burn*).
+
+**Checked against the live game** (Story 9: The Tears of Stone, `ALPHA_Map9_TheGreatCaldeira`, identified by hard ground, 76 % match; 2026-11-21): from a live tick's grid the harness step reproduces the game's next tick **exactly in component 7** (all ~79,000 changing cells, 3 ticks) and in component 6 on all but 48-86 cells per tick (of ~22,000 changing). The parameter image built by `vegsim` (no live data needed) equals the live one byte for byte in the per-type block and ParamI, and gives the same result as the live image. The leftover cells are all **new growth the game did not make**: the step started a plant (0x11) or marked bare ground ready (0x10) where the game kept 0. They are not concentrated at the totems (median 62 cells from the nearest one, vs 162 for bare cells in general). Running the step after the water step instead made it worse (75-86 cells, and component 7 no longer exact), so the game runs it on the same start state as the water step. Probably something outside the step blocks growth there (see TODO).
+
+### Parameters (all now known)
+From the `ConstParam` constructor (`0x10005656`) and the live read:
+
+| Where | Value | Meaning |
+|---|---|---|
+| ParamI[0] (`SimulatorParam+0xF0`) | 10 | `SoftGroundQuantityMin`: sand x 128 must be above this (= `m_ganjaSoftGroundQuantityMin` 0.08 x 128) |
+| ParamI[4] | 1 | `DefaultGrowingTime`: vegetation time added per tick |
+| ParamI[5] | 10 | `FireSpeedProgressBase` (= `m_speedProgressBase`) |
+| ParamI[7] | 246 | `BurnedTime` (= `m_cellBurnedTime`) |
+| ParamI[1], [2], [3], [6] | 2, 10, 1, 0 | not used by this step as far as read; names unknown |
+| `SimulatorParam+0x130` (16 bytes) | 0,1,2,3,4,1,2,3,4,9,9,1,2,1,4,0 | `PropagateTable`: type t spreads into neighbours as this type = the species' `m_spreadingVegetationType` (5 -> 1, 10 -> 9, 11 / 13 -> 1, ...); 15 -> 0 |
+| `SimulatorParam+0x140` (512 bytes) | species set (table above) | live Story 9 = **set 0** exactly for types 1-14 |
+
+Each ParamI int32 holds its 16-bit value twice (`0x000A000A`): the step reads them as 16-bit lanes, so a value in the low half only reaches half the cells (an early harness run showed timers advancing in some cells only, for this reason). Types 0 and 15 (no species file) in the per-type block, live, the same on The Big Wave and Story 9: FireIgnition 17 / 37, FireDuration 640, RandomGrowingTime 64 / 16, EvolveDuration 64, AdultDuration 256, NextType 0x800F, Flowering 5-245, LifeWaterMax 15, block 0x140 640, LifeFireResist / SpreadWaterMax 32767, SpreadDeltaMax 15 (`vegsim.LIVE_T0` / `LIVE_T15`). **Block 0x1E0 is not "8 x type"**: the code indexes it by small counts (burning neighbours, the random nibble), so it is the lookup `n -> 8 n` (= `m_speedIgnitionBase` 8 x n); its values happen to equal 8 x index.
+
+### Growth rules (read from the code, behaviour measured with the harness)
+`Step2_ComputeViability` returns one byte per cell:
+- low nibble: the type that would **spread into** this cell: the highest type among the 4 neighbours, counted only where the neighbour is **flowering** (status 0x30), the height step between the two cells is below the neighbour type's `SpreadDeltaMax`, this cell's water depth is inside that type's `SpreadWaterMin`-`Max`, and this cell has more sand than `SoftGroundQuantityMin`. `Step2` maps it through the `PropagateTable`.
+- bits 4-6: number of burning 4-neighbours; bit 7: viability of the cell's own plant (life water range etc.).
+
+Status is recomputed from the vegetation time every tick (young below `EvolveDuration`, flowering between `FlowerStart` and `FlowerStop`), so a hand-set status on a plant with time 0 becomes young after one step.
+
+Measured on a flat sand plain (water layer fixed, one flowering type-1 patch of 4 x 4 cells, 600 ticks): set 0 spreads over dry ground and water up to 0.5 deep (16 -> 290 cells, about one cell outwards every 30-60 ticks) and the plants die in 1.0 of water; set 1 does not spread on dry ground at all and spreads fast in 1.0 of water (16 -> 946). The Big Wave from its level file is stable over 620 ticks (cover already fills the islands; saplings 9 mature into trees 10: 27 -> 16 / 3,248 -> 3,258). Map 2 (`ALPHA_Map2_Archipel`) from its level file grows only 1,571 -> 1,599 cells in 1,500 ticks with set 0 (3,503 with set 1), while the player's save of that level has 26,569: most of the spread in play must come from outside the step (TODO).
+
+### Starting plants from the level files
+The `.sav` files hold the vegetation layers (`docs/sav-format.md`, reader `sav.vegetation_components`): the plant byte, the random nibble, vegetation time and fire time, loaded by the interface DLL's `FillGanja*` functions. DustView loads them with the map, so model runs start with the level's plants (e.g. Map 6 *Wildfires* starts with 3,218 burned cells and burning fronts). Plants are drawn in DustView's natural view with its own colours per type (`ganja.colours`; the game draws 3D models), under the water layer; burning cells orange, burned dark grey (View tab: *Plants and fire*).
+
+## Fire: what is read so far (not yet checked against the DLL)
+- `Step1`: a cell with a plant (type != 0) under **lava** (fluid < 0) gets the fire bit.
+- The fire time (component 7 high half) doubles as **ignition heat** for a cell that is not burning: each tick it gains 8 x (burning 4-neighbours); with no burning neighbour it **halves** (`pavgw` with 0). The cell ignites when the heat passes `FireIgnition[type]` (8 x fireIgnition) + 8 x the cell's random nibble. While burning it gains `FireSpeedProgressBase` (10) per tick up to `FireDuration[type]`, then the cell turns burned (measured life cycle above). The fire bit is recomputed from these timers, so setting the bit with a zero timer does nothing (seen in the harness).
+- Water: `LifeFireResistWH` (`lifeFireResistanceWaterHeight`) is compared against the water depth in the fire section; exact effect not read.
+
 ## TODO (skipped, worth revisiting)
-- [ ] Growth rules (next step for modelling vegetation): read `Step2_ComputeViability` (395 lines) and the growth part of `Step2` (1,374 lines) in `GalileoSimulatorWater_9_9.dll` (SSE41; disassembly with `dumpbin -disasm:nobytes`, PDB names load automatically), then check against the live game with `ganja.py` the way the water step was checked (the simstep harness could run the game's own vegetation job too: `CallbackSimulatorGanja`).
+- [ ] Fire rules: finish reading `Step2` (from the `FireDuration` lookup at `0x1002A0B0` on: burned phase, `LifeFireResistWH`, `FireAnim`) and check every rule against the DLL with `vegsim.run_dll` (give a burning cell a fire time above its ignition threshold to start a fire). Paused 2026-11-21 to do vegetation first (on request). The annotated listings came from a scratch script (names for `ConstParam` / per-type block offsets); worth keeping as a tool if the reading continues.
+- [ ] The 48-86 cells per tick where the game blocks new growth that the step makes (live check above): find what does it (people / creatures walking, `m_humansBlockingFactor`? paths? a second writer of component 6 in the AI or the interface DLL). Not modelled in DustView.
+- [ ] Where most new vegetation in play comes from (Map 2: 1,571 plants in the level file, 26,569 in the player's save; the step alone adds few): probably villages planting village ground (types 11-14, `m_isVillageVegetation`, which spreads as type 1) and the AI's random seeding (`VegetationInterface`: `m_activateRandom` 1, `m_randomGridRange` 16). Both are outside the step and not modelled.
+- [ ] How a level picks its species set: known Big Wave 0, Story 7 1 (or 3), Story 9 0; DustView uses `vegsim.LEVEL_SETS`, default 0 (a guess for other levels).
+- [ ] DustView's model feeds the vegetation step its own water, but the model's water step ignores the plants' erosion blocking (`mv_ErosionBlocking`, types 9-10; not checked in `dustsim`).
+- [ ] A Python re-implementation of the vegetation step (DustView runs the game's DLL instead, which is exact; a port would only be needed without the 32-bit helper). The growth rules above are read in outline, not instruction by instruction.
 - [ ] How a level picks its vegetation set (0-3), types 0 / 15 values, the 6 unnamed set fields, the fire-duration source for types 9-10. Species display names (`Pyrix_Tree`, `FiguierBarrique`, `Bombarde` in the same archive) not tied to letters (not needed for the simulation).
 - [ ] Meaning of status 2 and the `die` bit; why the index 1 → 2 switch happens at ~870-890 (static, index and TimeAnim are now explained by the measured life cycle, but only for type 1 on one map). Rules from the code: read `Step1` / `Step2` / `Step2_ComputeViability` of `SimulatorGanjaIterator` (`GalileoSimulatorWater_9_9.dll`, around `0x10011000`+; disassembly via dumpbin) for the growth, flowering and fire-spread rules (fire neighbours mask 7, the 16-byte propagate table `ConstParam+0x440`, copied from `SimulatorParam+0x130`; how `SimulatorParam` lines up with live_check's `prm` is not checked; `FireSpeedProgressBase`, `BurnedTime`, `DefaultGrowingTime`, `SoftGroundQuantityMin`).
 - [ ] The per-type times are in ticks (measured for FireDuration and AdultDuration on type 1); fire progress is 10 per tick (probably `FireSpeedProgressBase`, value not read), the burned phase ~246 ticks (`BurnedTime`, not read). The table differs per level (two levels read). The unnamed table blocks (0xA0, 0x120, 0x160-0x1E0).
 - [ ] Which type is which plant (fire tree, water tree, grass, …): only The Big Wave read (1 = cover, 11 = village ground, 10 / 9 = one patch, unidentified); look at the type map on a story level (fire trees on Map 6) next to the game.
-- [ ] Load components 6 / 7 from `.sav` files (save blocks 3-7 not mapped; docs/sav-format.md) so the model and the viewer have them without the live game. Not modelled in `dustsim` (fire trees evaporating water: findings/water-lava-sim.md TODO).
+- [x] ~~Load components 6 / 7 from `.sav` files~~ (done 2026-11-21: `sav.vegetation_components`, DustView model mode). Fire trees evaporating water is still not in `dustsim` (findings/water-lava-sim.md TODO).

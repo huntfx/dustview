@@ -172,8 +172,9 @@ def flux_pair(grid, comp):
     return (v & 0xFFFF).astype(np.uint16), (v >> 16).astype(np.uint16)
 
 
-def run(grid, P, steps=1, skip_border=0, dump_every_step=False, **kw):
-    """Run the game's step `steps` times. Returns the final grid (or a list per step)."""
+def run(grid, P, steps=1, skip_border=0, dump_every_step=False, job=0, **kw):
+    """Run the game's step `steps` times. Returns the final grid (or a list per step).
+    job=0: water / lava step (CallbackSimulator); job=4: vegetation / fire step (CallbackSimulatorGanja)."""
     with tempfile.TemporaryDirectory() as td:
         pin, gin, gout = (os.path.join(td, n) for n in ('param.bin', 'in.bin', 'out.bin'))
         open(pin, 'wb').write(param_image(P, skip_border, **kw))
@@ -181,7 +182,7 @@ def run(grid, P, steps=1, skip_border=0, dump_every_step=False, **kw):
         cmd = [SIMSTEP, WORKER, pin, gin, gout, str(steps)]
         if dump_every_step:
             cmd.append(os.path.join(td, 'step'))
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, SIMSTEP_JOB=str(job)))
         if r.returncode:
             raise RuntimeError(r.stderr or r.stdout)
         if dump_every_step:
@@ -228,3 +229,47 @@ if __name__ == '__main__':
     for i, n in enumerate(PARAM_NAMES):
         if P[i]:
             print('%2d %-42s %g' % (i, n, P[i]))
+
+
+class Resident:
+    """A resident simstep helper (simstep --serve) sharing one grid with Python through named shared memory:
+    no files or process start per call. run(job, steps, grid=None, components=None) packs `grid` (or only the
+    listed components of it) into the shared grid, runs the game's job in place and returns the components
+    asked for (default all) unpacked. Not thread-safe: use from one thread."""
+    GRID_OFS = 0x1000
+
+    def __init__(self, param_bytes=None):
+        import mmap, threading
+        self.name = 'DustSimstep_%d_%d' % (os.getpid(), id(self))
+        self.mm = mmap.mmap(-1, self.GRID_OFS + N * N * 32, tagname=self.name)
+        self.cells = np.frombuffer(self.mm, np.uint32, N * N * 8, self.GRID_OFS).reshape(N, N // 16, 8, 16)
+        if param_bytes is not None:
+            self.set_params(param_bytes)
+        self.p = subprocess.Popen([SIMSTEP, '--serve', WORKER, self.name], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        r = self.p.stdout.readline().strip()
+        if r != 'ready':
+            raise RuntimeError('simstep --serve: %r' % r)
+
+    def set_params(self, param_bytes):
+        self.mm[0:len(param_bytes)] = param_bytes
+
+    def put(self, grid, components=range(8)):
+        for c in components:
+            self.cells[:, :, c, :] = np.asarray(grid[c], np.uint32).reshape(N, N // 16, 16)
+
+    def get(self, components=range(8)):
+        return {c: np.ascontiguousarray(self.cells[:, :, c, :]).reshape(N, N) for c in components}
+
+    def run(self, job, steps=1):
+        self.p.stdin.write('run %d %d\n' % (job, steps))
+        self.p.stdin.flush()
+        r = self.p.stdout.readline().strip()
+        if r != 'ok':
+            raise RuntimeError('simstep --serve: %r' % r)
+
+    def close(self):
+        try:
+            self.p.stdin.write('quit\n'); self.p.stdin.flush(); self.p.wait(2)
+        except Exception:
+            self.p.kill()

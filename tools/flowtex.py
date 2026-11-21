@@ -278,6 +278,7 @@ GROUND_TILES = 16.0        # shader 96: ground UV = world x 1/768 + 0.5 (c131.z 
 RAMP_V_HARD, RAMP_V_SOFT = 0.375, 0.625  # af4_TerrainRampUV c59 .z / .y as logged from the game (rock / sand)
 RAMP_U = 0.5               # ramp U = GroundParams.w (logged 0.75-1.0) - |view depth| x 0.0035: camera-dependent, chosen
 BUMP = 0.6                 # strength of the textures' normal perturbation against the cell slope (chosen)
+SHOW_VEGETATION = True     # natural view: plants from grid component 6 (ganja.colours, DustView's own colours)
 GROUND_GAIN = 1.35         # brightness (the game's light intensities are not modelled)
 LAVA_V = 0.125             # af4_TerrainRampUV .w (logged): the ramp's lava row; V above it is orange -> red
 LAVA_SCROLL = 1 + 0.92 * (0.0032 / (0.5 * 0.00293) - 1)   # lava's flow-texture speed vs water's (2.09): see _cell_fields
@@ -656,6 +657,12 @@ class FlowLayer:
         gxa, gya, sfa, oa, aa = self._layers
         viewfast.natural_layers(fr.ground, fr.soft, fr.water, fr.lava, fr.sediment, fr.temperature,
                                 lava_xs, lava_cs, gxa, gya, sfa, oa, aa, False)   # lava is drawn on the ramp below
+        if SHOW_VEGETATION and fr.grid is not None and fr.grid.shape[0] > 6 and fr.grid[6].any():
+            import ganja                                 # plants (grid component 6) under the water layer
+            pc, cov = ganja.colours(fr.grid[6])
+            L = np.asarray(light, np.float32)
+            lit = np.clip((-gxa * L[0] - gya * L[1] + L[2]) / np.sqrt(gxa * gxa + gya * gya + 1), 0, 1) * 0.75 + 0.25
+            ganja.blend_under(oa, aa, pc * lit[..., None] * np.float32(GROUND_GAIN), cov * (np.asarray(fr.lava) <= 0))
         if water_tex:
             depth, lv = self.update(fr.water, fr.flux, t, fr.lava, min_depth)
         else:

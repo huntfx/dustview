@@ -638,6 +638,13 @@ class ModelSource(Source):
     step_req = 0                                 # ticks to run while paused (key N / Step button)
 
     def _loop(self):
+        try:
+            self._run_loop()
+        finally:
+            if self.veg is not None:
+                self.veg.close()
+
+    def _run_loop(self):
         due = time.perf_counter()
         while self.running:
             self._apply_edits()
@@ -662,8 +669,11 @@ class ModelSource(Source):
                 sch.write_back(srcs)
                 if sch.profiles:
                     dustsim.apply_edges(G, sch.border_level, sch.profiles)
+            extra = self._vegetation_tick(G)
             with self.lock:
                 self.G, self.tick, self.sources = G, self.tick + 1, srcs
+                if extra is not None:
+                    self.extra = extra
                 now = time.time()
                 self.times = [t for t in self.times if now - t < 3] + [now]
 
@@ -672,6 +682,36 @@ class ModelSource(Source):
         tick, or within ~10 ms while paused."""
         with self.lock:
             self.pending.append(fn)
+
+    veg = None                                   # galileo.Resident running the game's vegetation step (job 4)
+    veg_failed = False
+
+    def _vegetation_tick(self, G):
+        """One step of the game's own vegetation / fire job on the new state (ground, sand, water from G;
+        plants from self.extra); returns a copy of self.extra with the new components 6 / 7, or None if
+        vegetation is off or the helper is not available. Parameters: vegsim (species set per level:
+        vegsim.level_set; ParamI and the propagate table partly guessed, findings/vegetation-fire-layers.md)."""
+        if not VEGETATION_STEP or self.veg_failed:
+            return None
+        try:
+            if self.veg is None:
+                import vegsim
+                vset = vegsim.level_set(getattr(self, 'level_name', '') or '')
+                self.veg = galileo.Resident(galileo.param_image(self.params, 2, param_i=vegsim.param_i(),
+                                                                param_u8=vegsim.param_u8(), ganja=vegsim.ganja_block(vset)))
+                print('vegetation: game step running (species set %d)' % vset, flush=True)
+            R, ex = self.veg, self.extra
+            R.put({0: G['T'].view(np.uint32), 1: G['soft'].view(np.uint32), 2: G['W'].view(np.uint32),
+                   3: G['sed'].view(np.uint32), 6: ex[6], 7: ex[7]}, (0, 1, 2, 3, 6, 7))
+            R.run(4, 1)
+            got = R.get((6, 7))
+            new = ex.copy()
+            new[6], new[7] = got[6], got[7]
+            return new
+        except Exception as e:
+            print('vegetation step off:', e, flush=True)
+            self.veg_failed = True
+            return None
 
     def _apply_edits(self):
         with self.lock:
@@ -710,7 +750,7 @@ class ModelSource(Source):
         return '%s%s | %s | %d sources, %d repulsors%s%s' % (self.name, ' (%s)' % self.label if self.label else '', state, len(self.sources), len(self.other_modifiers), vil, extra)
 
     def stop(self):
-        self.running = False
+        self.running = False                     # the model thread closes the vegetation helper on its way out
 
     def adopt_totems(self, totems):
         """Totems that arrived after the takeover (the live totem search finished later)."""
@@ -994,6 +1034,9 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
     for c, a in enumerate((T, So, W, C3)):
         grid[c] = a.astype(np.float32).view(np.uint32)
     _, u = sav.read_sav(os.path.join(compare_sim.SAVES, name + '.sav'))
+    c6, c7 = sav.vegetation_components(sav.read_sav(grid_path)[1] if grid_path else u)   # plants (docs/sav-format.md)
+    if c6 is not None:
+        grid[6], grid[7] = c6, c7
     import level_schedule
     sch = level_schedule.LevelSchedule(name, villages=villages, border_level=border[0])
     st = sav_sources.statues(sav.read_sav(grid_path)[1] if grid_path else u)   # a save: totems where they are now
@@ -1023,6 +1066,7 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
 TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock')
 LAVA_TEMPERATURE = 255.0                         # internal units, as the level files' lava vents
 BRUSH_MIN, BRUSH_MAX = 1, 40
+VEGETATION_STEP = True                           # model mode: run the game's vegetation / fire step each tick
 
 
 def brush_edit(tool, col, row, radius, amount, P, temperature=LAVA_TEMPERATURE):
@@ -1077,12 +1121,26 @@ _LAVA_XS = np.array([s[0] for s in LAVA_STOPS], np.float32)
 _LAVA_CS = np.array([s[1] for s in LAVA_STOPS], np.float32)
 
 
+def add_plants(fr, rgb):
+    """Untextured natural view: plants (grid component 6) blended in, fading under water and lava
+    (the textured view puts them under its water layer instead, flowtex.shade_textured)."""
+    import flowtex, ganja
+    if not flowtex.SHOW_VEGETATION or fr.grid is None or not fr.grid[6].any():
+        return rgb
+    pc, cov = ganja.colours(fr.grid[6])
+    cov = cov * np.exp(-fr.water / 0.5) * (fr.lava <= 0)
+    pc = pc * (shade(fr.ground) * 1.2)[..., None]
+    out = rgb.astype(np.float32)
+    out += (pc - out) * cov[..., None]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def render(fr, view):
     if view == 'natural' and viewfast is not None:
         out = np.empty((N, N, 3), np.uint8)
         viewfast.render_natural(fr.ground, fr.soft, fr.water, fr.lava, fr.sediment, fr.temperature,
                                 LIGHT, _LAVA_XS, _LAVA_CS, out)
-        return out
+        return add_plants(fr, out)
     if view == 'natural':
         rock = np.array([118, 108, 98], np.float32); sand = np.array([214, 188, 138], np.float32)
         s = np.clip(fr.soft / 1.5, 0, 1)[..., None]
@@ -1097,6 +1155,7 @@ def render(fr, view):
         lc = ramp_colours(fr.temperature, LAVA_STOPS)
         a = (1 - np.exp(-fr.lava / 0.5))[..., None]
         col += (lc - col) * a
+        return add_plants(fr, np.clip(col, 0, 255).astype(np.uint8))
     elif view == 'height':
         h = fr.ground
         lo, hi = np.percentile(h, 1), np.percentile(h, 99.5)
@@ -1165,6 +1224,7 @@ class App:
         self.zoom, self.view_x0, self.view_y0 = 1.0, 0.0, 0.0   # zoom and the top-left display cell shown
         self.smooth = True                               # interpolate when zoomed (False: crisp cells)
         self.ground_tex = True                           # natural view: the game's sand / rock textures
+        self.show_plants = True                          # natural view: plants / fire (flowtex.SHOW_VEGETATION)
         self.drag = None                                 # (x, y, view_x0, view_y0, moved) while panning
         self.painting, self.paint_time = None, None      # +1 add / -1 remove while a mouse button is held
         self.show_events, self.events = True, []        # (time, row, col, cells, total)

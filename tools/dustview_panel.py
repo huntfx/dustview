@@ -7,7 +7,7 @@ then tabs: Map (pick a level, then one of its saves or New, all profiles), Model
 villages), Edit (paint water / lava / sand / rock with the game's own modifiers, model mode), View (views
 incl. the engine-texture dropdown, overlays, display).
 """
-import os
+import os, sys
 import tkinter as tk
 from tkinter import ttk, filedialog
 import level_names
@@ -89,6 +89,10 @@ class ControlPanel:
                            for val, text in SPEED_LABELS]
         for b in self.speed_btns:
             b.pack(side='left', padx=(4, 0))
+        dustview = sys.modules['__main__'] if hasattr(sys.modules['__main__'], 'VEGETATION_STEP') else __import__('dustview')
+        self.veg_step = tk.BooleanVar(value=dustview.VEGETATION_STEP)
+        self._check(box, "Plants grow and burn (the game's own vegetation step)", self.veg_step,
+                    lambda: setattr(dustview, 'VEGETATION_STEP', self.veg_step.get())).pack(anchor='w', pady=(4, 0))
         box = self._section('Villages (or click a totem on the map)', tab_model)
         self.totem_frame = ttk.Frame(box); self.totem_frame.pack(fill='x')
         self.totem_vars = []
@@ -140,6 +144,7 @@ class ControlPanel:
         self.checks = {}
         for attr, text in (('overlay', 'Sources, totems, repulsors (O)'), ('flow_on', 'Flow texture, natural view (F)'),
                            ('ground_tex', 'Sand / rock textures, natural view'),
+                           ('show_plants', 'Plants and fire, natural view (own colours)'),
                            ('show_events', 'Terrain-change markers, live (D)')):
             v = self.checks[attr] = tk.BooleanVar(value=getattr(app, attr))
             self._check(box, text, v, lambda a=attr: self._set_flag(a)).pack(anchor='w')
@@ -209,6 +214,9 @@ class ControlPanel:
     # ---- actions
     def _set_flag(self, attr):
         setattr(self.app, attr, self.checks[attr].get())
+        if attr == 'show_plants':
+            import flowtex
+            flowtex.SHOW_VEGETATION = self.checks[attr].get()
         self.app.dirty = True
 
     def _set_texture(self):

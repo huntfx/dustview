@@ -54,6 +54,45 @@ def decode(grid):
     return out
 
 
+# DustView's colours per vegetation type (the game draws plants as 3D models; these are not the game's).
+# Which plant each type is: 1 = the general green cover, 11-14 = village ground (m_isVillageVegetation),
+# 9 / 10 = erosion-blocking trees (m_erosionBlocking); the rest not identified (findings TODO).
+TYPE_COLOURS = np.array([
+    (0, 0, 0), (74, 140, 52), (40, 104, 56), (96, 150, 60), (60, 128, 70), (88, 158, 82), (34, 92, 48),
+    (110, 160, 70), (70, 120, 40), (30, 82, 40), (46, 98, 44), (128, 150, 64), (120, 146, 70), (110, 140, 60),
+    (100, 134, 56), (74, 140, 52)], np.float32)
+BURNED_COLOUR = np.array((40, 34, 30), np.float32)
+FIRE_COLOUR = np.array((255, 120, 30), np.float32)
+STATUS_COVER = np.array((0.0, 0.45, 0.75, 0.85), np.float32)   # young plants drawn thinner
+
+
+def colours(c6):
+    """Per-cell plant colour (n, n, 3) float32 and coverage 0-1 (n, n) from grid component 6:
+    plants by type (coverage by status), burning cells orange, burned cells dark grey."""
+    c6 = np.asarray(c6, np.uint32)
+    t = (c6 & 15).astype(np.intp)
+    st = ((c6 >> 4) & 3).astype(np.intp)
+    fire = (c6 & 0x40) != 0
+    burned = (c6 & 0x80) != 0
+    col = TYPE_COLOURS[t]
+    cov = np.where(t > 0, STATUS_COVER[st], np.float32(0))
+    col = np.where(burned[..., None], BURNED_COLOUR, col)
+    cov = np.where(burned, np.float32(0.7), cov)
+    col = np.where(fire[..., None], FIRE_COLOUR, col)
+    cov = np.where(fire, np.float32(0.95), cov)
+    return col.astype(np.float32), cov.astype(np.float32)
+
+
+def blend_under(col, alpha, plant_col, plant_cov):
+    """Put plants (plant_col, plant_cov) underneath an existing colour / opacity layer (col (n, n, 3),
+    alpha (n, n), e.g. the natural view's water layer) in place: the water stays on top."""
+    a2 = plant_cov * (1 - alpha)
+    A = alpha + a2
+    safe = np.where(A > 0, A, 1)
+    col[:] = np.where((A > 0)[..., None], (col * alpha[..., None] + plant_col * a2[..., None]) / safe[..., None], col)
+    alpha[:] = A
+
+
 def type_table(ganja):
     """Per-type parameters from the 512-byte ganja block: dict name -> list of 16 values."""
     g = bytes(ganja)

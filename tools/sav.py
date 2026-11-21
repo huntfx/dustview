@@ -28,6 +28,36 @@ def read_sav(path):
     return {'version': ver, 'usize': usize, 'field3': one, 'csize': csize}, u
 
 
+VEG_BYTE, VEG_TIME, VEG_FIRE, VEG_RANDOM = 0x400080, 0x640080, 0x6C0080, 0x740080
+
+
+def vegetation_layers(u):
+    """Vegetation layers of a decompressed .sav (level file or player save; docs/sav-format.md):
+    dict byte (u8: type | status << 4 | fire 0x40 | burned 0x80), time (u16), fire_time (u16),
+    random (u8: random nibble in bits 0-3; player saves also have die / static / index in bits 4-7,
+    level files have 0 there), each (512, 512), or None if the file is too short."""
+    import numpy as np
+    n = GRID * GRID
+    if len(u) < VEG_RANDOM + n:
+        return None
+    return dict(byte=np.frombuffer(u, np.uint8, n, VEG_BYTE).reshape(GRID, GRID),
+                time=np.frombuffer(u, np.uint16, n, VEG_TIME).reshape(GRID, GRID),
+                fire_time=np.frombuffer(u, np.uint16, n, VEG_FIRE).reshape(GRID, GRID),
+                random=np.frombuffer(u, np.uint8, n, VEG_RANDOM).reshape(GRID, GRID))
+
+
+def vegetation_components(u):
+    """Grid components 6 and 7 (uint32, (512, 512) each) as the game's FillGanja* loaders build them
+    from a save, or (None, None)."""
+    import numpy as np
+    v = vegetation_layers(u)
+    if v is None:
+        return None, None
+    c6 = v['byte'].astype(np.uint32) | (v['random'].astype(np.uint32) << 8)   # FillGanjaRandom: whole byte 1
+    c7 = v['time'].astype(np.uint32) | (v['fire_time'].astype(np.uint32) << 16)
+    return c6, c7
+
+
 def float_layer(u, k):
     a = array.array('f')
     a.frombytes(u[GRID_START + k * LAYER_BYTES: GRID_START + (k + 1) * LAYER_BYTES])
