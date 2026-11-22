@@ -5,7 +5,8 @@ Everything here calls the same App actions as the keyboard shortcuts (shown in b
 Layout: what is shown (live game or the Python model) and the live / takeover buttons always at the top,
 then tabs: Map (pick a level, then one of its saves or New, all profiles), Model (pause, step, speed,
 villages), Edit (paint water / lava / sand / rock with the game's own modifiers, model mode), View (views
-incl. the engine-texture dropdown, overlays, display).
+incl. the engine-texture dropdown, overlays, display), Slice (pick two points on the map for a side-on
+cross-section in its own window: rock, sand, water / lava, air; tools/dustslice.py).
 """
 import os, sys
 import tkinter as tk
@@ -46,8 +47,9 @@ class ControlPanel:
         # ---- tabs: Map / Model / View
         self.tabs = ttk.Notebook(f, takefocus=False)
         self.tabs.pack(fill='both', expand=True)
-        tab_map, tab_model, tab_edit, tab_view = (self._tab(t) for t in ('Map', 'Model', 'Edit', 'View'))
-        self.tabs.bind('<<NotebookTabChanged>>', lambda e: self.root.focus_set())
+        tab_map, tab_model, tab_edit, tab_view, tab_slice = (self._tab(t) for t in ('Map', 'Model', 'Edit', 'View', 'Slice'))
+        self.tab_slice = tab_slice
+        self.tabs.bind('<<NotebookTabChanged>>', lambda e: self._tab_changed())
 
         # ---- map: pick a level, then its empty map or one of its saves
         box = self._section('Map', tab_map)
@@ -188,6 +190,31 @@ class ControlPanel:
         for s in (1, 2, 3):
             self._radio(row, '%dx' % s, self.scale, s, lambda: app.set_scale(self.scale.get())).pack(side='left', padx=(4, 0))
         self._button(box, 'Screenshot (S)', app.screenshot).pack(anchor='w', pady=(4, 0))
+        # ---- slice: two points on the map -> side-on cross-section window
+        box = self._section('Slice', tab_slice)
+        ttk.Label(box, text='While this tab is open: left-click the map for point A, right-click for point B '
+                            '(hold and drag to move them). The slice opens in its own window and follows the '
+                            'simulation. Middle-drag still pans.',
+                  wraplength=250).pack(fill='x')
+        self.slice_text = tk.StringVar()
+        ttk.Label(box, textvariable=self.slice_text, justify='left').pack(anchor='w', pady=(4, 0))
+        row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
+        self.slice_open_btn = self._button(row, 'Open window', app.open_slice)
+        self.slice_open_btn.pack(side='left')
+        self._button(row, 'Swap A / B', app.swap_slice).pack(side='left', padx=(4, 0))
+        self._button(row, 'Clear', app.clear_slice).pack(side='left', padx=(4, 0))
+        box = self._section('Height scale', tab_slice)
+        self.slice_whole = tk.BooleanVar(value=app.slice_whole)
+        self._radio(box, 'Fit to the slice', self.slice_whole, False, lambda: app.set_slice_whole(False)).pack(anchor='w')
+        self._radio(box, "Whole map's heights (compare slices)", self.slice_whole, True,
+                    lambda: app.set_slice_whole(True)).pack(anchor='w')
+        ttk.Label(tab_slice, text='Bottom to top: rock (grey, darker deeper down), sand, water (darker deeper, '
+                                  'browner with sediment) or lava (by temperature), plants (a band on dry ground), '
+                                  'air. One column per cell the line crosses; heights are stretched to fit, so '
+                                  'slopes look steeper than in the game. Hover the slice for the values of a column '
+                                  '(marked on the map in yellow).',
+                  wraplength=260, foreground='#666').pack(fill='x', pady=(4, 0))
+
         ttk.Label(f, text='Hover the map for cell values.  Esc quits.', foreground='#666').pack(anchor='w', pady=(6, 0))
 
     # ---- widget helpers (no keyboard focus, so Space / letters keep working as shortcuts)
@@ -227,6 +254,15 @@ class ControlPanel:
         return hit[0] if hit else (self.levels[0] if self.levels else '')
 
     # ---- actions
+    def _tab_changed(self):
+        """The Slice tab turns map clicks into placing its points; leaving it goes back to Inspect."""
+        self.root.focus_set()
+        on_slice = self.tabs.select() == str(self.tab_slice)
+        if on_slice and self.app.tool != 'slice':
+            self.app.set_tool('slice')
+        elif not on_slice and self.app.tool == 'slice':
+            self.app.set_tool('inspect')
+
     def _set_flag(self, attr):
         setattr(self.app, attr, self.checks[attr].get())
         if attr == 'show_plants':
@@ -332,6 +368,14 @@ class ControlPanel:
         self._put(self.flip, bool(app.flip))
         self._put(self.scale, app.scale)
         self._sync_totems(src if model else None)
+        a, b = app.slice_a, app.slice_b
+        fmt = lambda c: 'col %d, row %d' % (c[1], c[0]) if c else '(not set)'
+        text = 'A: %s\nB: %s' % (fmt(a), fmt(b))
+        if a and b:
+            text += '\nlength %.0f cells' % ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+        self._put(self.slice_text, text)
+        self._enable(self.slice_open_btn, bool(a and b) and app.slice_win is None)
+        self._put(self.slice_whole, bool(app.slice_whole))
         name = getattr(src, 'level_name', None)
         if name is None and not model:              # live / compare: the story level from the totems (once found)
             n = self.dv.level_number(src)

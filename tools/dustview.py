@@ -1332,6 +1332,9 @@ class App:
         self.texture, self.tex_read = 'wp_foam_nofade', None   # engine texture view: entry, cell readout
         self.tool, self.brush_radius, self.brush_strength = 'inspect', 6, 10.0   # editing (model mode)
         self.lava_temperature = LAVA_TEMPERATURE
+        self.slice_a = self.slice_b = None               # Slice tab: end points (row, col), the point being dragged,
+        self.slice_drag, self.slice_win = None, None     # the slice window (tools/dustslice.py)
+        self.slice_hover, self.slice_whole, self.slice_time, self.slice_range = None, False, 0.0, None
         self.zoom, self.view_x0, self.view_y0 = 1.0, 0.0, 0.0   # zoom and the top-left display cell shown
         self.smooth = True                               # interpolate when zoomed (False: crisp cells)
         self.ground_tex = True                           # natural view: the game's sand / rock textures
@@ -1491,7 +1494,7 @@ class App:
 
     def set_tool(self, tool):
         self.tool = tool
-        if tool != 'inspect' and not self.is_model():
+        if tool not in ('inspect', 'slice') and not self.is_model():
             self.say('painting works on the Python model: press M (Continue in model) or load a map first')
         self.dirty = True
 
@@ -1505,6 +1508,9 @@ class App:
         self.dirty = True
 
     def start_paint(self, e, sign):
+        if self.tool == 'slice':                 # right button: point B
+            self.set_slice_point('b', self.cell_at(e.x, e.y))
+            return
         if self.tool == 'inspect':
             return
         if not self.is_model():
@@ -1516,6 +1522,7 @@ class App:
 
     def stop_paint(self):
         self.painting = None
+        self.slice_drag = None
 
     def paint(self):
         """Apply the brush at the mouse for the time since the last call (strength = amount per cell per
@@ -1528,6 +1535,88 @@ class App:
         r, c = self.idx_r[self.mouse], self.idx_c[self.mouse]
         self.src.edit(brush_edit(self.tool, int(c), int(r), self.brush_radius,
                                  self.painting * self.brush_strength * dt, self.src.P, self.lava_temperature))
+
+    # ---- slice (Slice tab): a side-on cross-section between two points, in its own window
+    def set_slice_point(self, which, disp):
+        """Put point A or B at display cell disp (stored as a grid (row, col)); dragging moves it."""
+        cell = (int(self.idx_r[disp]), int(self.idx_c[disp]))
+        setattr(self, 'slice_' + which, cell)
+        self.slice_drag, self.slice_range, self._slice_key = which, None, None
+        if self.slice_a is not None and self.slice_b is not None:
+            self.open_slice()
+        self.slice_time, self.dirty = 0.0, True
+
+    def clear_slice(self):
+        self.slice_a = self.slice_b = self.slice_hover = None
+        if self.slice_win is not None:
+            self.slice_win.close()
+        self.dirty = True
+
+    def swap_slice(self):
+        self.slice_a, self.slice_b = self.slice_b, self.slice_a
+        self.slice_time, self._slice_key, self.dirty = 0.0, None, True
+
+    def set_slice_whole(self, whole):
+        self.slice_whole, self.slice_range, self.slice_time = whole, None, 0.0
+
+    def open_slice(self):
+        if self.slice_a is None or self.slice_b is None:
+            self.say('Slice: left-click the map for point A, right-click for point B')
+            return
+        if self.slice_win is None:
+            import dustslice
+            self.slice_win = dustslice.SliceWindow(self.root, self._slice_hovered, self._slice_closed, _LAVA_XS, _LAVA_CS)
+            self.root.focus_force()              # keep the keys on the map
+        self.slice_time, self._slice_key = 0.0, None
+
+    def _slice_closed(self):
+        self.slice_win, self.slice_hover = None, None
+        self.dirty = True
+
+    def _slice_hovered(self, cell):
+        self.slice_hover, self.dirty = cell, True
+
+    def update_slice(self):
+        """Redraw the slice window from the current frame (at most ~10 times a second)."""
+        win, fr = self.slice_win, self.frame
+        if win is None or fr is None or self.slice_a is None or self.slice_b is None:
+            return
+        now = time.time()
+        key = (id(fr), self.slice_a, self.slice_b, self.slice_whole)
+        if now - self.slice_time < 0.1 or key == getattr(self, '_slice_key', None):
+            return                               # nothing new (a point move resets slice_time, a frame changes key)
+        self.slice_time, self._slice_key = now, key
+        import dustslice
+        p = dustslice.sample(fr, self.slice_a, self.slice_b)
+        whole = None
+        if self.slice_whole:
+            whole = (float((fr.ground - fr.soft).min()), float((fr.ground + fr.water + fr.lava).max()))
+        lo, hi = dustslice.height_range(p, whole)
+        old = self.slice_range                   # steady scale: grow at once, shrink only when much too big
+        if old is not None and lo >= old[0] and hi <= old[1] and (hi - lo) > 0.7 * (old[1] - old[0]):
+            lo, hi = old
+        self.slice_range = (lo, hi)
+        win.update(p, lo, hi)
+
+    def draw_slice(self, img):
+        """Slice line A -> B on the map, and the column hovered in the slice window."""
+        if self.slice_a is None and self.slice_b is None:
+            return
+        dr = ImageDraw.Draw(img)
+        pts = {}
+        for name, cell in (('A', self.slice_a), ('B', self.slice_b)):
+            if cell is not None:
+                pts[name] = self.to_px(*self.cell_to_disp[cell])
+        if len(pts) == 2:
+            dr.line([pts['A'], pts['B']], fill=(0, 0, 0), width=3)
+            dr.line([pts['A'], pts['B']], fill=(255, 255, 255), width=1)
+        for name, (x, y) in pts.items():
+            dr.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(255, 255, 255), outline=(0, 0, 0))
+            draw_text(img, (x + 6, y - 14), name, (255, 255, 255))
+        if self.slice_hover is not None:
+            x, y = self.to_px(*self.cell_to_disp[self.slice_hover])
+            r = max(3, self.px_per_cell())
+            dr.rectangle([x - r, y - r, x + r, y + r], outline=(255, 255, 0), width=2)
 
     def set_flip(self, flip):
         self.flip = flip; self._make_index(); self.dirty = True
@@ -1715,12 +1804,16 @@ class App:
 
     def on_move(self, e):
         self.set_mouse(self.cell_at(e.x, e.y))
+        if self.tool == 'slice' and self.slice_drag:
+            self.set_slice_point(self.slice_drag, self.mouse)
         if self.tool != 'inspect':
             self.dirty = True                    # move the brush outline
 
     def on_press(self, e):
         """Left button: paint (edit tools) or start a pan / click (inspect)."""
-        if self.tool != 'inspect':
+        if self.tool == 'slice':                 # left button: point A
+            self.set_slice_point('a', self.cell_at(e.x, e.y))
+        elif self.tool != 'inspect':
             self.start_paint(e, +1)
         else:
             self.start_drag(e)
@@ -1857,7 +1950,8 @@ class App:
                 cx, cy, r = *self.to_px(y, x), e['radius'] * k
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(235, 235, 235), width=1)
                 dr.text((cx + r + 2, cy - 6), 'mod %+g/%+g' % (e['amount'], e['f5']), fill=(235, 235, 235))
-        if self.tool != 'inspect' and self.mouse is not None:
+        self.draw_slice(img)
+        if self.tool not in ('inspect', 'slice') and self.mouse is not None:
             y, x = self.mouse
             cx, cy, r = *self.to_px(y, x), (self.brush_radius + 0.5) * k
             colour = {'water': (120, 200, 255), 'lava': (255, 120, 40), 'sand': (240, 210, 140), 'rock': (200, 200, 200)}[self.tool]
@@ -1968,6 +2062,7 @@ class App:
             self.dirty = False
             now = time.time()
             self.fps = [t for t in self.fps if now - t < 2] + [now]
+        self.update_slice()
         self.panel.sync()
         self.update_info()
         spent = time.perf_counter() - t_start      # next frame FRAME after this one started
