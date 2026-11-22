@@ -8,7 +8,7 @@ Library use:
   out = v.run_dll(grid, steps=10)          # game's own step
   f = v.fields(out)                        # decoded fields (ganja.decode)
 
-Parameter sources (findings/vegetation-fire-layers.md, "Fire and growth rules"):
+Parameter sources (findings/vegetation-fire-layers.md, "Parameters" and "Fire rules"):
   ganja block (512 bytes, per-type table) from SpecieVegetation*_0.ai set `vset` (vegetation_species.py);
   ParamI: LIVE_PARAM_I (read live; [5] = m_speedProgressBase, [7] = m_cellBurnedTime of VegetationInterface_0.ai);
   PropagateTable (ParamU8 bytes 0x20-0x2F, SimulatorParam+0x130).
