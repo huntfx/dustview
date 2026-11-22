@@ -345,11 +345,15 @@ def ground_modifier(G, ys, xs, amount, soft=False):
 def apply_sources(G, sources, P=None):
     """Apply springs, lava vents and drains (dicts with col, row, radius, rate per cell per tick,
     sediment fraction, temperature; optional height data for the bury rule) with the game's
-    modifier rules (fluid_modifier) on each source's disc (dx^2 + dy^2 <= r^2)."""
+    modifier rules (fluid_modifier) on each source's disc (dx^2 + dy^2 <= r^2).
+    Every source's bury activity is worked out first, on G as given, then the sources are applied (as
+    modifier_calls does; the game's per-tick list already holds the final amounts, so its AI decides them
+    before any modifier runs. Inferred, not traced; until 2026-11-21 this worked them out one after the
+    other, which differed where a source sits inside another one's disc)."""
     for s in sources:
-        act = bury_activity(G, s)
-        s['activity'] = act
-        rate = s['rate'] * act
+        s['activity'] = bury_activity(G, s)
+    for s in sources:
+        rate = s['rate'] * s['activity']
         if rate == 0:
             continue
         ys, xs = s.get('_cells') or disc(s['col'], s['row'], s['radius'])
@@ -377,8 +381,7 @@ def modifier_calls(G, sources=(), repulsors=()):
     Param = (signed rate, +-1, sediment, temperature) for the fluid modifiers (checked 2026-11-21 against
     fluid_modifier on a random grid: identical but for last-bit lava temperatures), (amount, mode, sediment,
     0) for RepulseFluid. Sets each source's 'activity' (bury rule) on G as given, before any modifier
-    runs (apply_sources works them out one after the other; only differs where a source sits inside
-    another one's disc)."""
+    runs (as apply_sources)."""
     calls = []
     for s in sources:
         act = bury_activity(G, s)
