@@ -95,7 +95,7 @@ class ControlPanel:
         for attr, label, choices in (('FLUID_STEP', 'Water / lava / sand', ('off', 'game', 'model')),
                                      ('SOURCE_STEP', 'Sources / repels', ('off', 'game', 'model')),
                                      ('WAVE_STEP', 'Waves / tide', ('off', 'model')),
-                                     ('VEGETATION_STEP', 'Vegetation / fire', ('off', 'game'))):
+                                     ('VEGETATION_STEP', 'Vegetation / fire', ('off', 'game', 'model'))):
             row = ttk.Frame(box); row.pack(fill='x', pady=(2, 0))
             ttk.Label(row, text=label, width=17).pack(side='left')
             var = self.step_vars[attr] = tk.StringVar(value=getattr(dustview, attr))

@@ -780,6 +780,8 @@ class ModelSource(Source):
         per tick), or None if
         vegetation is off or the helper is not available. Parameters: vegsim (species set per level:
         vegsim.level_set; ParamI and the propagate table partly guessed, findings/vegetation-fire-layers.md)."""
+        if VEGETATION_STEP == 'model':
+            return self._vegetation_model(G)
         if VEGETATION_STEP != 'game' or self.helper_failed:
             return None
         try:
@@ -795,6 +797,23 @@ class ModelSource(Source):
             print('vegetation step off:', e, flush=True)
             self.helper_failed = True
             return None
+
+    _veg_consts = None                           # (level name, ganja block, propagate table) for the model step
+
+    def _vegetation_model(self, G):
+        """One step of ganja_step (the Python / numba re-implementation of the game's vegetation / fire
+        step; exact against the DLL, findings/vegetation-fire-layers.md) on the new state. Returns a grid
+        holding the new components 6 / 7, like _vegetation_tick."""
+        import ganja_step, vegsim
+        name = getattr(self, 'level_name', '') or ''
+        if self._veg_consts is None or self._veg_consts[0] != name:
+            self._veg_consts = (name, vegsim.ganja_block(vegsim.level_set(name)), vegsim.propagate_table())
+        _, block, prop = self._veg_consts
+        ex = self.extra
+        c6, c7 = ganja_step.step_arrays(ex[6], ex[7], G['T'], G['soft'], G['W'], block, prop)
+        out = np.zeros((8, N, N), np.uint32)     # lazily zeroed: only layers 6 / 7 are written
+        out[6], out[7] = c6, c7
+        return out
 
     def _apply_edits(self):
         with self.lock:
@@ -1156,7 +1175,8 @@ FLUID_STEP = 'model'          # the step: 'off' (no flow), 'game' (the game's ow
 SOURCE_STEP = 'model'         # the modifier pass (springs, vents, drains, village repels): 'off' | 'game' (the
                               # game's modifier code in the same helper) | 'model' (dustsim's copies)
 WAVE_STEP = 'model'           # waves and tide at the map edge from the level script: 'off' | 'model'
-VEGETATION_STEP = 'game'      # 'off' | 'game' (the game's own vegetation / fire step; there is no Python version)
+VEGETATION_STEP = 'model'     # 'off' | 'game' (the game's own vegetation / fire step via the helper) | 'model'
+                              # (ganja_step / ganja_step_nb, our re-implementation, exact against the DLL)
 STEP_LABELS = {'off': 'disabled', 'game': 'game', 'model': 'model'}
 
 
