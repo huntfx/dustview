@@ -675,8 +675,8 @@ class FlowLayer:
                                 lava_xs, lava_cs, gxa, gya, sfa, oa, aa, False)   # lava is drawn on the ramp below
         use_grass = bool(SHOW_VEGETATION and fr.grid is not None and fr.grid.shape[0] > 6 and fr.grid[6].any())
         if use_grass and getattr(self, '_gkey', None) is not fr.grid:      # once per simulation frame
-            import ganja                                 # the game's grass ground layer (shaders 113 + 96)
-            self._gco = ganja.grass_color_opacity(fr.grid[6])
+            self._gco = viewfast.grass_color_opacity(fr.grid[6])   # the game's grass ground layer (shaders 113 + 96;
+                                                                    # ganja.grass_color_opacity compiled: 0.7 ms vs 30)
             self._gkey = fr.grid
         gco = self._gco if use_grass else np.zeros((1, 1, 4), np.float32)
         if water_tex:

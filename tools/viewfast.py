@@ -189,3 +189,37 @@ def blur(a, passes=6):
         _blur_pass(a, b)
         a, b = b, a
     return a
+
+
+@numba.njit(parallel=True, nogil=True, cache=True)
+def _grass_color_opacity(c6, ramp, burn, out):
+    n0, n1 = c6.shape
+    for r in numba.prange(n0):
+        for c in range(n1):
+            a0 = f32(0); a1 = f32(0); a2 = f32(0); a3 = f32(0); burnt = f32(0)
+            for k in range(5):
+                dy = (0, -1, -1, 1, 1)[k]
+                dx = (0, -1, 1, -1, 1)[k]
+                rr = min(max(r + dy, 0), n0 - 1)              # edge cells repeat (np.pad mode='edge')
+                cc = min(max(c + dx, 0), n1 - 1)
+                t = c6[rr, cc] & 0xFF
+                i = t & 15
+                a0 += ramp[i, 0]; a1 += ramp[i, 1]; a2 += ramp[i, 2]; a3 += ramp[i, 3]
+                if t >= 0x40:
+                    burnt += f32(1)
+            f = burnt * f32(0.2)
+            av0 = a0 * f32(0.2); av1 = a1 * f32(0.2); av2 = a2 * f32(0.2); av3 = a3 * f32(0.2)
+            out[r, c, 0] = av0 + (burn[0] - av0) * f
+            out[r, c, 1] = av1 + (burn[1] - av1) * f
+            out[r, c, 2] = av2 + (burn[2] - av2) * f
+            out[r, c, 3] = av3 + (burn[3] - av3) * f
+
+
+def grass_color_opacity(c6):
+    """ganja.grass_color_opacity compiled (the game's GrassColorRT per cell; same result to float rounding)."""
+    import ganja
+    c6 = np.ascontiguousarray(c6, np.uint32)
+    out = np.empty(c6.shape + (4,), np.float32)
+    _grass_color_opacity(c6, np.ascontiguousarray(ganja.GRASS_RAMP, np.float32),
+                         np.ascontiguousarray(ganja.BURN_GROUND, np.float32), out)
+    return out

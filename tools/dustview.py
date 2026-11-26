@@ -73,6 +73,9 @@ Grid component layout: 0 ground surface (includes soft ground), 1 soft ground, 2
 lava), 3 sediment (water) or temperature (lava, internal units), 4/5 flux pairs (u16, 1/256 units).
 """
 import argparse, os, struct, sys, threading, time
+# numba's OpenMP workers wait passively: the model thread and the redraw both run parallel kernels, and
+# spinning workers of one starved the other (redraw 94 -> 63 ms at 1x with the model running, 2026-11-26)
+os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
 import tkinter as tk
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
