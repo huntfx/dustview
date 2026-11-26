@@ -17,8 +17,8 @@ import engine_textures
 VIEW_LABELS = (('natural', 'Natural'), ('height', 'Height'), ('water depth', 'Water depth'),
                ('lava temperature', 'Lava temperature'), ('sediment', 'Sediment'), ('flow speed', 'Flow speed'),
                ('unexplained changes', 'Unexplained changes (live)'), ('engine texture', 'Engine texture:'))
-TOOL_LABELS = (('inspect', 'Inspect (click a totem: village on / off; drag pans)'), ('water', 'Water'), ('lava', 'Lava'),
-               ('sand', 'Sand (soft ground)'), ('rock', 'Rock (hard ground)'))
+TOOL_LABELS = (('inspect', 'View (drag pans, wheel zooms; click a totem: village on / off)'), ('water', 'Water'),
+               ('sand', 'Sand (soft ground)'), ('rock', 'Rock (hard ground)'), ('lava', 'Lava'))
 EMPTY_MAP = 'New (the level as shipped, no villages)'
 SPEED_LABELS = ((1, '1x'), (2, '2x'), (4, '4x'), (0, 'max'))
 
@@ -119,7 +119,9 @@ class ControlPanel:
         self.tool = tk.StringVar(value=app.tool)
         for tool, text in TOOL_LABELS:
             self._radio(box, text, self.tool, tool, lambda: app.set_tool(self.tool.get())).pack(anchor='w')
-        ttk.Label(box, text='Left button adds, right button removes.', foreground='#666').pack(anchor='w', pady=(4, 0))
+        ttk.Label(box, text='Left button adds, middle smooths, right removes, wheel = brush size. '
+                            'Ctrl + left-drag pans, Ctrl + wheel zooms.', wraplength=250,
+                  foreground='#666').pack(fill='x', pady=(4, 0))
         box = self._section('Brush', tab_edit)
         self.brush_radius = tk.IntVar(value=app.brush_radius)
         self.brush_strength = tk.DoubleVar(value=app.brush_strength)
@@ -137,7 +139,7 @@ class ControlPanel:
             ttk.Scale(row, from_=lo, to=hi, variable=var, command=cmd, takefocus=False).pack(side='left', fill='x', expand=True)
             ttk.Label(row, textvariable=text, width=7).pack(side='left')
         ttk.Label(box, text='Size = radius in cells. Strength = height added or removed per cell per second '
-                            '(a spring adds ~25). Lava heat: 255 = a vent\'s fresh lava, it hardens at 12.5 (the '
+                            '(a spring adds ~25); for smoothing, how fast (10: halfway to the local average in 0.2 s). Lava heat: 255 = a vent\'s fresh lava, it hardens at 12.5 (the '
                             'shipped maps hold 12.5-255). The game\'s own rules: water on lava cools it to rock, lava '
                             'on water boils it off and hardens; sand and rock raise the ground. The fixed '
                             'border band is not edited.',
@@ -182,7 +184,8 @@ class ControlPanel:
         self.smooth = tk.BooleanVar(value=app.smooth)
         self._check(box, 'Smooth when zoomed (off: crisp cells)', self.smooth,
                     lambda: (setattr(app, 'smooth', self.smooth.get()), setattr(app, 'dirty', True))).pack(anchor='w')
-        ttk.Label(box, text='Mouse wheel zooms at the cursor; middle-drag pans (or left-drag with the Inspect tool).',
+        ttk.Label(box, text='Mouse wheel zooms at the cursor (Ctrl + wheel with an edit tool); left-drag pans with the View tool, '
+                            'Ctrl + left-drag with an edit tool.',
                   wraplength=250, foreground='#666').pack(fill='x')
         row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
         ttk.Label(row, text='Window size:').pack(side='left')
@@ -255,7 +258,7 @@ class ControlPanel:
 
     # ---- actions
     def _tab_changed(self):
-        """The Slice tab turns map clicks into placing its points; leaving it goes back to Inspect."""
+        """The Slice tab turns map clicks into placing its points; leaving it goes back to View."""
         self.root.focus_set()
         on_slice = self.tabs.select() == str(self.tab_slice)
         if on_slice and self.app.tool != 'slice':

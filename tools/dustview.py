@@ -54,11 +54,14 @@ Views (panel only): natural, height, water depth, lava temperature, sediment, fl
   D  terrain-change markers on/off (live only): terrain that changes in dry areas between frames,
      i.e. not caused by the simulation (moving dips, scripted terrain, powers). Magenta = lowered,
      yellow = raised; markers fade over 8 s; every spot is also logged to data/live/terrain_events_*.log
-  Edit tab (model mode): tools inspect (click totems), water, lava, sand, rock; left button adds, right
-     button removes, [ / ] brush size. Uses the game's own modifiers (Add/RemoveWater,
-     Add/RemoveLava at temperature 255, SoftGround, HardGround); the fixed border band is not edited.
+  Edit tab (model mode): tools View (left-drag pans, click a totem: village on / off, wheel zooms) and
+     water, sand, rock, lava: left button adds, middle smooths, right removes, wheel (or [ / ]) brush size,
+     Ctrl + left-drag pans, Ctrl + wheel zooms. Adding / removing uses the game's own modifiers
+     (Add/RemoveWater, Add/RemoveLava at the brush's heat, SoftGround, HardGround); smoothing moves each cell
+     towards its 5 x 5 mean (smooth_edit); the fixed border band is not edited.
   S  save a screenshot to data/live/    Esc quit
-Mouse wheel: zoom (1x-8x) about the cursor. Middle-drag (or left-drag with the inspect tool): pan.
+Mouse wheel: zoom (1x-8x) about the cursor (brush size with an edit tool; Ctrl + wheel zooms). Middle-drag
+pans (except with an edit tool, where it smooths).
 Mouse: hover for the cell's values (col/row, ground, soft ground, water or lava, sediment/temperature).
 
 Reading the game: the simulator object (ISimulatorWater) is found by its parameter array
@@ -1166,7 +1169,9 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
 
 
 # ---------------------------------------------------------------- editing (model mode)
-TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock')
+TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock')   # 'inspect' is shown as View
+EDIT_TOOLS = ('water', 'lava', 'sand', 'rock')
+CONTROL = 0x0004                                 # Tk event.state bit for the Control key
 LAVA_TEMPERATURE = 255.0                         # internal units, as the level files' lava vents
 BRUSH_MIN, BRUSH_MAX = 1, 40
 # Model mode, chosen on the Model tab. Water, lava and sand are one step in the game, so they share one choice.
@@ -1198,6 +1203,75 @@ def brush_edit(tool, col, row, radius, amount, P, temperature=LAVA_TEMPERATURE):
             dustsim.fluid_modifier(G, ys, xs, amount, 0.0, temperature, P)
         elif tool in ('sand', 'rock'):
             dustsim.ground_modifier(G, ys, xs, amount, soft=(tool == 'sand'))
+    return fn
+
+
+SMOOTH_HALF_LIFE = 2.0     # s x strength: the smoothing brush moves a cell halfway to its local average in
+                           # SMOOTH_HALF_LIFE / strength seconds (0.2 s at the default strength 10; chosen)
+SMOOTH_REACH = 2           # cells: the local average is over a (2 x 2 + 1)^2 = 5 x 5 square (chosen)
+
+
+def _box_mean(a, k, weight=None):
+    """Mean of a over a (2k+1)^2 square around each cell (edges clamped); with weight, the weighted mean
+    (cells of weight 0 left out; 0 where no cell counts)."""
+    w = np.ones_like(a) if weight is None else weight
+    ap, wp = np.pad(a * w, k, mode='edge'), np.pad(w, k, mode='edge')
+    s, n = np.zeros_like(a), np.zeros_like(a)
+    h, wd = a.shape
+    for dy in range(2 * k + 1):
+        for dx in range(2 * k + 1):
+            s += ap[dy:dy + h, dx:dx + wd]
+            n += wp[dy:dy + h, dx:dx + wd]
+    return np.where(n > 0, s / np.maximum(n, 1e-9), 0)
+
+
+def smooth_edit(tool, col, row, radius, dt, strength=10.0):
+    """An edit for ModelSource.edit: the smoothing brush (middle button). Every cell in the disc moves
+    towards the mean of the 5 x 5 square around it, height += (mean - height) x weight (the game's own
+    terrain smoothing formula as SkoFix describes it, dustai 0x1004E0E0; its radius and weight are not known,
+    so SMOOTH_REACH / SMOOTH_HALF_LIFE are chosen), weight = 1 - 0.5^(dt x strength / SMOOTH_HALF_LIFE).
+      rock:  the rock surface (ground - sand), sand thickness kept;
+      sand:  the ground surface, by adding / removing sand only (rock is never cut);
+      water / lava: the fluid surface (ground + depth) of the cells holding that fluid, averaged over those
+             cells only, so dry cells stay dry and water and lava do not mix. Sediment is capped at the new
+             depth; lava keeps its temperature, emptied cells become dry.
+    Cells in the fixed border band are left alone."""
+    lo, hi = dustsim.RING[0] + 1, dustsim.RING[1] - 1
+    k, r = SMOOTH_REACH, int(radius)
+    y0, y1 = max(lo, row - r - k), min(hi, row + r + k) + 1
+    x0, x1 = max(lo, col - r - k), min(hi, col + r + k) + 1
+    if y0 >= y1 or x0 >= x1:
+        return lambda G: None
+    w = 1.0 - 0.5 ** (max(dt, 0.0) * max(strength, 0.0) / SMOOTH_HALF_LIFE)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    inside = (yy - row) ** 2 + (xx - col) ** 2 <= radius * radius
+    f32 = np.float32
+
+    def fn(G):
+        win = (slice(y0, y1), slice(x0, x1))
+        T, So, W, Sd = (G[n][win].astype(np.float64) for n in ('T', 'soft', 'W', 'sed'))
+        if tool == 'rock':
+            hard = T - So
+            new = np.maximum(hard + (_box_mean(hard, k) - hard) * w, 0)
+            G['T'][win] = np.where(inside, new + So, T).astype(f32)
+        elif tool == 'sand':
+            d = np.maximum((_box_mean(T, k) - T) * w, -So)
+            d = np.where(inside, d, 0)
+            G['soft'][win] = (So + d).astype(f32)
+            G['T'][win] = (T + d).astype(f32)
+        elif tool in ('water', 'lava'):
+            sign = 1.0 if tool == 'water' else -1.0
+            depth = np.maximum(W * sign, 0)
+            has = (depth > 0).astype(np.float64)
+            level = T + depth
+            new = np.maximum(depth + (_box_mean(level, k, has) - level) * w, 0)
+            new = np.where(inside & (has > 0), new, depth)
+            change = inside & (has > 0)
+            G['W'][win] = np.where(change, new * sign, W).astype(f32)
+            if tool == 'water':
+                G['sed'][win] = np.where(change, np.minimum(Sd, new), Sd).astype(f32)
+            else:
+                G['sed'][win] = np.where(change & (new <= 0), 0, Sd).astype(f32)   # emptied: dry, no heat
     return fn
 
 
@@ -1370,9 +1444,9 @@ class App:
         self.canvas.bind('<Button-3>', lambda e: self.start_paint(e, -1))
         self.canvas.bind('<B3-Motion>', self.on_move)
         self.canvas.bind('<ButtonRelease-3>', lambda e: self.stop_paint())
-        self.canvas.bind('<Button-2>', self.start_drag)
-        self.canvas.bind('<B2-Motion>', self.on_drag)
-        self.canvas.bind('<ButtonRelease-2>', lambda e: self.end_drag())
+        self.canvas.bind('<Button-2>', self.on_middle)
+        self.canvas.bind('<B2-Motion>', self.on_b1_motion)
+        self.canvas.bind('<ButtonRelease-2>', self.on_middle_release)
         root.bind('<MouseWheel>', self.on_wheel)        # Windows sends the wheel to the focused widget
         self._make_index()
         self.tick()
@@ -1431,6 +1505,9 @@ class App:
     def on_wheel(self, e):
         if self.root.winfo_containing(e.x_root, e.y_root) is not self.canvas:
             return                                   # wheel over the panel (lists): not a zoom
+        if self.tool in EDIT_TOOLS and not e.state & CONTROL:     # edit tools: wheel = brush size
+            self.set_brush(radius=self.brush_radius + (1 if e.delta > 0 else -1))
+            return
         ex, ey = e.x_root - self.canvas.winfo_rootx(), e.y_root - self.canvas.winfo_rooty()
         self.zoom_step(1 if e.delta > 0 else -1, ex, ey)
 
@@ -1533,6 +1610,9 @@ class App:
         dt = self.FRAME if self.paint_time is None else min(now - self.paint_time, 0.1)
         self.paint_time = now
         r, c = self.idx_r[self.mouse], self.idx_c[self.mouse]
+        if self.painting == 'smooth':
+            self.src.edit(smooth_edit(self.tool, int(c), int(r), self.brush_radius, dt, self.brush_strength))
+            return
         self.src.edit(brush_edit(self.tool, int(c), int(r), self.brush_radius,
                                  self.painting * self.brush_strength * dt, self.src.P, self.lava_temperature))
 
@@ -1809,29 +1889,45 @@ class App:
         if self.tool != 'inspect':
             self.dirty = True                    # move the brush outline
 
+    # Mouse: View (inspect) tool: left-drag pans, a left click toggles a totem's village, wheel zooms.
+    # Edit tools: left adds, middle smooths, right removes, wheel = brush size; Ctrl + left-drag pans,
+    # Ctrl + wheel zooms. Slice tab: left / right place points A / B. Middle-drag pans with the other tools.
     def on_press(self, e):
-        """Left button: paint (edit tools) or start a pan / click (inspect)."""
+        """Left button."""
         if self.tool == 'slice':                 # left button: point A
             self.set_slice_point('a', self.cell_at(e.x, e.y))
-        elif self.tool != 'inspect':
+        elif self.tool in EDIT_TOOLS and not e.state & CONTROL:
             self.start_paint(e, +1)
         else:
             self.start_drag(e)
 
     def on_b1_motion(self, e):
-        if self.tool != 'inspect':
-            self.on_move(e)
-        else:
+        if self.drag is not None:
             self.on_drag(e)
+        else:
+            self.on_move(e)
 
     def on_release(self, e):
-        if self.tool != 'inspect':
+        if self.drag is not None:
+            if not self.end_drag() and self.tool == 'inspect':
+                self.on_click(e)                 # a click, not a pan
+        else:
             self.stop_paint()
-        elif not self.end_drag():
-            self.on_click(e)                     # a click, not a pan
+
+    def on_middle(self, e):
+        if self.tool in EDIT_TOOLS:
+            self.start_paint(e, 'smooth')
+        else:
+            self.start_drag(e)
+
+    def on_middle_release(self, e):
+        if self.drag is not None:
+            self.end_drag()
+        else:
+            self.stop_paint()
 
     def on_click(self, e):
-        """Inspect tool, model mode: clicking within 8 cells of a totem builds / removes its village (songs
+        """View tool, model mode: clicking within 8 cells of a totem builds / removes its village (songs
         unchanged)."""
         if not isinstance(self.src, ModelSource):
             if getattr(self.src, 'totems', None):
