@@ -1577,7 +1577,7 @@ class App:
 
     def set_brush(self, radius=None, strength=None, temperature=None):
         if temperature is not None:
-            self.lava_temperature = float(min(255.0, max(13.0, temperature)))
+            self.lava_temperature = float(min(255.0, max(12.5, temperature)))   # simulator units (shown x 8)
         if radius is not None:
             self.brush_radius = int(min(BRUSH_MAX, max(BRUSH_MIN, radius)))
         if strength is not None:
@@ -2079,7 +2079,7 @@ class App:
             if self.mouse is not None:
                 r, c = self.idx_r[self.mouse], self.idx_c[self.mouse]
                 if fr.lava[r, c] > 0:
-                    fluid = 'lava %.2f at %.1f deg (editor %.0f)' % (fr.lava[r, c], fr.temperature[r, c], fr.temperature[r, c] * 8)
+                    fluid = 'lava %.2f at %.0f' % (fr.lava[r, c], fr.temperature[r, c] * 8)   # temperature shown x 8
                 elif fr.water[r, c] > 0:
                     fluid = 'water %.2f, sediment %.3f' % (fr.water[r, c], fr.sediment[r, c])
                 else:

@@ -125,22 +125,22 @@ class ControlPanel:
         box = self._section('Brush', tab_edit)
         self.brush_radius = tk.IntVar(value=app.brush_radius)
         self.brush_strength = tk.DoubleVar(value=app.brush_strength)
-        self.lava_temperature = tk.DoubleVar(value=app.lava_temperature)
+        self.lava_temperature = tk.DoubleVar(value=app.lava_temperature * 8)   # shown x 8
         self.radius_text, self.strength_text, self.temp_text = tk.StringVar(), tk.StringVar(), tk.StringVar()
         for label, var, text, lo, hi, cmd in (
                 ('Size ([ ])', self.brush_radius, self.radius_text, dv.BRUSH_MIN, dv.BRUSH_MAX,
                  lambda v: app.set_brush(radius=round(float(v)))),
                 ('Strength', self.brush_strength, self.strength_text, 1, 60,
                  lambda v: app.set_brush(strength=round(float(v), 1))),
-                ('Lava heat', self.lava_temperature, self.temp_text, 13, 255,
-                 lambda v: app.set_brush(temperature=round(float(v))))):
+                ('Lava heat', self.lava_temperature, self.temp_text, 100, 2040,
+                 lambda v: app.set_brush(temperature=round(float(v)) / 8))):
             row = ttk.Frame(box); row.pack(fill='x', pady=(2, 0))
             ttk.Label(row, text=label, width=10).pack(side='left')
             ttk.Scale(row, from_=lo, to=hi, variable=var, command=cmd, takefocus=False).pack(side='left', fill='x', expand=True)
             ttk.Label(row, textvariable=text, width=7).pack(side='left')
         ttk.Label(box, text='Size = radius in cells. Strength = height added or removed per cell per second '
-                            '(a spring adds ~25); for smoothing, how fast (10: halfway to the local average in 0.2 s). Lava heat: 255 = a vent\'s fresh lava, it hardens at 12.5 (the '
-                            'shipped maps hold 12.5-255). The game\'s own rules: water on lava cools it to rock, lava '
+                            '(a spring adds ~25); for smoothing, how fast (10: halfway to the local average in 0.2 s). Lava heat: 2040 = a vent\'s fresh lava, it hardens at 100 (the '
+                            'shipped maps hold 100-2040). The game\'s own rules: water on lava cools it to rock, lava '
                             'on water boils it off and hardens; sand and rock raise the ground. The fixed '
                             'border band is not edited.',
                   wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
@@ -363,7 +363,7 @@ class ControlPanel:
         self._put(self.brush_radius, app.brush_radius)
         self._put(self.radius_text, '%d' % app.brush_radius)
         self._put(self.strength_text, '%.1f/s' % app.brush_strength)
-        self._put(self.temp_text, '%.0f' % app.lava_temperature)
+        self._put(self.temp_text, '%.0f' % (app.lava_temperature * 8))
         self._put(self.zoom_text, '%gx' % app.zoom)
         self._put(self.smooth, bool(app.smooth))
         for attr, v in self.checks.items():
