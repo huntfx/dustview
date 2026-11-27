@@ -740,6 +740,71 @@ def modifier_calls(G, sources=(), repulsors=()):
     return calls
 
 
+# ---------------------------------------------------------------- village repels (findings/water-lava-sim.md
+# "Village repel push, exact" and "Village repel switch-on, measured")
+REPEL = {   # per song: base size (m_radius, level 0), m_scaleFactor; peak: +6 radius at 1 + 2.2 (water only)
+    'water': dict(size=40.0, scale=0.2, peak=True),
+    'lava': dict(size=35.0, scale=0.05, peak=False),
+}
+REPEL_DURATION = 10.0        # s, m_minimalApplicationTime; restarts at once while the threat stays (measured live)
+REPEL_THREAT_RADIUS = 15     # cells; 1.5 (m_threatDetectionRadiusFactor) x 10 assumed: live data fits 11..20
+REPEL_THREAT = {'water': 2.0, 'lava': 1.5}   # m_threatWaterHeightThreshold / m_threatLavaHeightThreshold
+REPEL_BAR_TICKS = 61.8       # music bar measured live (~2.0 s): peak pushes on every bar, all villages in step
+
+
+class VillageRepels:
+    """Switches each village's repel on / off as the game does (measured on Map 10, 2026-11-27): a song
+    starts when a cell within REPEL_THREAT_RADIUS has water deeper than 2 (water song) or lava deeper than
+    1.5 (lava song; the game's lava song also reacts to fire, not modelled) and then runs exactly 10 s,
+    restarting while the threat stays. While on: radius = size x 2/3 (water truncated), amount 1; the size
+    jumps to size x (1 + scale) once per episode at the first half bar and shrinks back in 1 s; water also
+    pushes one tick of radius + 6 at amount 3.2 on every bar. Not modelled: the 0.1-1.6 s delay before the
+    villagers start (the model starts at once), the game's music clock (bars run from model tick 0)."""
+
+    def __init__(self, rate=31.0):
+        self.rate, self.state = rate, {}
+
+    @staticmethod
+    def threatened(G, col, row, kind, radius=REPEL_THREAT_RADIUS):
+        W = G['W']
+        r0, r1, c0, c1 = max(row - radius, 0), min(row + radius + 1, W.shape[0]), max(col - radius, 0), min(col + radius + 1, W.shape[1])
+        sub = W[r0:r1, c0:c1]
+        yy, xx = np.ogrid[r0:r1, c0:c1]
+        disc = (yy - row) ** 2 + (xx - col) ** 2 <= radius * radius
+        depth = sub if kind == 'water' else -sub
+        return bool((depth[disc] > REPEL_THREAT[kind]).any())
+
+    def entries(self, G, reps, tick):
+        """This tick's RepulseFluid entries: entries with a 'totem' key are village songs and are gated by
+        the rule above; others pass unchanged."""
+        out, bar = [], REPEL_BAR_TICKS
+        for e in reps:
+            tid = e.get('totem')
+            if tid is None:
+                out.append(e)
+                continue
+            kind = 'water' if e['f5'] < 0 else 'lava'
+            key, cfg = (tid, kind), REPEL[kind]
+            st = self.state.get(key)
+            if st is None or tick >= st['end']:
+                if not self.threatened(G, int(e['col']), int(e['row']), kind):
+                    self.state.pop(key, None)
+                    continue
+                st = self.state[key] = dict(end=tick + REPEL_DURATION * self.rate, jump=None)
+            base = cfg['size']
+            if st['jump'] is None and int(tick / bar - 0.5) != int((tick - 1) / bar - 0.5):
+                st['jump'] = tick                                   # first half bar of the episode
+            size = base
+            if st['jump'] is not None:
+                size = max(base, base * (1 + cfg['scale']) - base * cfg['scale'] * (tick - st['jump']) / self.rate)
+            radius = float(int(size * 2 / 3)) if kind == 'water' else size * 2 / 3
+            amount = 1.0
+            if cfg['peak'] and int(tick / bar) != int((tick - 1) / bar):
+                radius, amount = float(int(size * 2 / 3) + 6), 3.2
+            out.append(dict(e, radius=radius, amount=amount))
+        return out
+
+
 def tick(G, P, sources=(), repulsors=(), step_fn=None):
     """One full game tick as far as modelled: border ring reset, step(), sources, then RepulseFluid
     modifiers (village outposts; entries with col, row, radius, amount, f5). The 32-cell band

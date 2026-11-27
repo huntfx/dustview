@@ -150,9 +150,11 @@ def state_to_grid(G, like=None):
 # song scan only show the ones active at that moment. Assumed: every village repels water (seen on every
 # village of Maps 3 and 10; possibly not on Map 2, not checked further); repel lava is per village. Totem
 # dicts carry built, water, lava (radius, 0 = none).
-# The model applies a known repel every tick: the same as the game's on-demand one except for the short
-# window before it triggers and the pulse (TODO in findings/water-lava-sim.md).
+# The model switches each song on only while its village is threatened (dustsim.VillageRepels, measured live
+# 2026-11-27: water > 2 within ~15 cells, 10 s episodes, size jump and peak push on the music bar);
+# VILLAGE_REPEL_RULE = False applies every known song every tick as before.
 SONG_RADIUS = {'water': 26.0, 'lava': 35 * 2 / 3}
+VILLAGE_REPEL_RULE = True    # model: songs only while threatened (dustsim.VillageRepels); False = every tick
 SONG_MODE = {'water': -1, 'lava': +1}
 def with_knowledge(totems, level=None):
     """Give every totem the repel-water knowledge (assumption: all villages repel water; the exact rule
@@ -904,6 +906,9 @@ class ModelSource(Source):
         """Water / lava / sand step, then the modifier pass (springs, vents, drains, village repels), each as
         chosen on the Model tab (FLUID_STEP, SOURCE_STEP). Returns a new state dict."""
         fluid, mods, reps = FLUID_STEP, SOURCE_STEP, self.other_modifiers
+        if VILLAGE_REPEL_RULE:                   # villages repel only while threatened (10 s episodes, pulses)
+            vr = self.__dict__.setdefault('village_repels', dustsim.VillageRepels(self.GAME_RATE))
+            reps = vr.entries(self.G, reps, self.tick)
         if fluid == 'off':                       # fresh arrays: published frames keep the old ones
             G = {k: v.copy() for k, v in self.G.items()}
         else:
