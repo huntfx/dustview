@@ -559,6 +559,145 @@ def tree_fire_burst(c6, c7, col, row, block):
     return n
 
 
+# ---------------------------------------------------------------- explosive trees (DustAi::BangTree)
+def bang_tree_hole(T, col, row, hole_radius=30.0, hole_depth=20.0):
+    """The crater an explosive tree blasts (dustai 0x1007D870, read 2026-11-27), on the ground surface T in place;
+    returns the number of cells written. r = trunc(hole_radius x 2/3) (20 cells); every cell of the 2r x 2r square
+    col - r .. col + r - 1, row - r .. row + r - 1 inside 33..478 gets, from the ground before the blast
+    (c = the tree's cell, g = the cell; world distance d = 1.5 x cell distance):
+        depth  = ((hole_radius - d) / hole_radius)^2 x hole_depth      (not clamped at d > hole_radius: the square's
+                                                                        corners are dug too, up to ~3.4 deep)
+        target = max(c - depth, 0)
+        new    = g if target > g else max(target, g - depth), clamped to 0..255
+    i.e. a bowl hanging from the tree's own ground height; no cell drops more than `depth`. The value is queued
+    (0x10140E80 -> manager list +0x48) and written as the ground height (component 0) by 0x100DC897; the sand
+    thickness (component 1) is left as it was, so the material is simply removed. Water depth is untouched."""
+    f = np.float32
+    R, D = f(hole_radius), f(hole_depth)
+    inv = f(1) / R
+    r = int(float(R) * (2 / 3))
+    c0, r0 = int(col), int(row)
+    cols = np.arange(c0 - r, c0 + r)
+    rows = np.arange(r0 - r, r0 + r)
+    cols = cols[(cols >= 33) & (cols < 479)]
+    rows = rows[(rows >= 33) & (rows < 479)]
+    if not len(cols) or not len(rows) or not (0 <= r0 < T.shape[0] and 0 <= c0 < T.shape[1]):
+        return 0
+    wx = lambda v: np.asarray(v, f) * f(1.5) + f(0.75) + f(-384)
+    dx = (wx(c0) - wx(cols))[None, :]
+    dy = (wx(r0) - wx(rows))[:, None]
+    dist = np.sqrt(dx * dx + dy * dy).astype(f)
+    depth = (((R - dist) * inv) ** 2 * D).astype(f)
+    c = f(T[r0, c0])
+    target = np.maximum(c - depth, f(0))
+    g = T[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    new = np.where(target > g, g, np.maximum(target, g - depth))
+    g[...] = np.clip(new, 0, 255).astype(f)
+    return g.size
+
+
+def bang_fire_danger(c6):
+    """grid_danger for bang_tree_step: True when a burning plant cell (vegetation component 6, fire flag bit 6; c6
+    may be None) or a lava cell (fluid < 0, any depth) lies in the square of +-trunc(grid_perception_radius x 2/3)
+    = +-6 cells around the tree. The game's grid sensor (kind 0x0F) was seen live to report burning plant cells
+    (Waves) and lava cells down to 0.03 deep (Story 10, 2026-11-27), at offsets up to 6 cells on both axes at once
+    (e.g. (+6, -6)), so a square, not a disc."""
+    def danger(G, t):
+        r = int(t.get('grid_perception_radius', 10.0) * 2 / 3)
+        c0, r0 = int(t['col']), int(t['row'])
+        y0, y1, x0, x1 = max(r0 - r, 0), min(r0 + r + 1, 512), max(c0 - r, 0), min(c0 + r + 1, 512)
+        if (G['W'][y0:y1, x0:x1] < 0).any():
+            return True
+        return c6 is not None and bool(((c6[y0:y1, x0:x1] & 0x40) != 0).any())
+    return danger
+
+
+def _tree_cell_ok(W, t):
+    """The rooting cell test (dustai 0x1007EE60): water cells need |fluid| <= water_threshold_max, lava cells
+    |fluid| <= lava_threshold_max (both minimums 0); height 0..255 and ground type 'any' always pass."""
+    v = float(W[int(t['row']), int(t['col'])])
+    lim = t.get('lava_threshold_max', 0.0) if v < 0 else t.get('water_threshold_max', 20.0)
+    return abs(v) <= lim and (v >= 0 or lim > 0)
+
+
+def bang_tree_step(G, trees, fire_trees=(), water_trees=(), dt=1 / 31, rng=None, grid_danger=None):
+    """One frame of every explosive tree (dicts from sav_sources.bang_trees / live_generators.bang_trees), decoded
+    2026-11-27 (findings/water-lava-sim.md "Explosive trees"). Changes G['T'] in place (craters) and the tree lists
+    (removals, seeds); returns the blasts of this frame as (col, row) tuples.
+    Adult (state 3, the generic tree update 0x10080A50): danger = a burning fire tree within
+    entities_perception_radius (20 world units; 0x1007DB10), or the tree was hit by another blast (+0x35C bit 2), or
+    grid_danger(G, tree) (the game's grid sensor, kind 0x0F within grid_perception_radius: what it detects is NOT
+    decoded; None = not modelled). While in danger the danger timer grows by dt (it is never reset); past
+    explosion_delay (0.2 s) the tree switches to exploding. Entering the exploding state (0x10080590 -> 0x1007E090):
+    one seed thrown (0x1007F4F0(1): ejection physics not modelled, the seed is placed 2-2.7 cells away like a
+    water tree's seed), the crater (bang_tree_hole), and every entity within entities_perception_radius is hit
+    (0x1007DC70): seeds are removed, rooted trees of any kind get the hit flag (fire / water trees have
+    explosion_delay 0, so they go a frame later: a fire tree is removed after 1 s, a water tree after 5 s with its
+    store, nothing poured; other entity kinds would be removed too, not modelled). The exploding tree is removed
+    after explosion_duration (1 s). Seeds root after time_to_activate_seed if the cell test passes (water and lava
+    <= 5; seed drift, rest and bury checks not modelled), grow for time_to_grow_tree (10 s), then are adults with
+    no life time (-1 in every save). State 'ending' (4) trees are kept as they are (not modelled)."""
+    rng = rng if rng is not None else np.random.default_rng()
+    T = G['T']
+    blasts, born, gone = [], [], []
+    for t in trees:
+        st = t.get('state')
+        t['clock'] = t.get('clock', 0.0) + dt
+        if st == 'seed':
+            if t['clock'] >= t.get('time_to_activate_seed', 10.0) and _tree_cell_ok(G['W'], t):
+                t['state'], t['clock'] = 'growing', 0.0
+        elif st == 'growing':                     # a blast's hit flag stays: the tree goes off once grown (seen live)
+            if t['clock'] >= t.get('time_to_grow_tree', 10.0):
+                t.update(state='adult', clock=0.0, danger_timer=0.0, danger=False)
+        elif st == 'exploding':
+            if t['clock'] >= t.get('explosion_duration', 1.0):
+                gone.append(t)
+        elif st == 'ending':                      # withering (state 4): removed after time_to_degenerate_tree,
+            if t['clock'] >= t.get('time_to_degenerate_tree', 10.0):   # leaving a seed (generate seeds when dying)
+                gone.append(t)
+                born += _water_tree_seeds(dict(t, nb_seeds_random=0), rng)
+        elif st == 'adult':
+            reach2 = (t['entities_perception_radius'] / 1.5) ** 2
+            t['danger'] = bool(t.get('hit')) or any(
+                _tree_burning(f) and (f['col'] - t['col']) ** 2 + (f['row'] - t['row']) ** 2 <= reach2
+                for f in fire_trees) or bool(grid_danger and grid_danger(G, t))
+            if t['danger']:
+                t['danger_timer'] = t.get('danger_timer', 0.0) + dt
+            if t.get('danger_timer', 0.0) > t['explosion_delay']:
+                t['state'], t['clock'] = 'exploding', 0.0
+                blasts.append(t)
+            elif not _tree_cell_ok(G['W'], t):   # cell test fails (water / lava deeper than 5): withers
+                t['state'], t['clock'] = 'ending', 0.0   # (0x10080A50 -> state 4 +0x328; seen live 2026-11-27)
+    for t in blasts:                                   # the game runs each tree's blast inside its own update;
+        bang_tree_hole(T, t['col'], t['row'], t['hole_radius'], t['hole_depth'])   # same-frame order = list order
+        born += _water_tree_seeds(dict(t, nb_seeds_random=0), rng)
+        reach2 = (t['entities_perception_radius'] / 1.5) ** 2
+        for lst, kind in ((trees, 'bang'), (fire_trees, 'fire'), (water_trees, 'water')):
+            for o in lst:
+                if o is t or (o['col'] - t['col']) ** 2 + (o['row'] - t['row']) ** 2 > reach2:
+                    continue
+                if o.get('state') in ('seed', 1):
+                    gone.append(o)
+                elif kind == 'bang':
+                    o['hit'] = True
+                elif o.get('state') not in ('exploding',):
+                    o['state'], o['explode_clock'] = 'exploding', 0.0   # delay 0: next frame, then removed
+    for lst, life in ((fire_trees, 1.0), (water_trees, 5.0)):
+        for o in list(lst):
+            if o.get('state') == 'exploding':
+                o['explode_clock'] = o.get('explode_clock', 0.0) + dt
+                if o['explode_clock'] >= o.get('explosion_duration', life):
+                    lst.remove(o)
+    for o in gone:
+        for lst in (trees, fire_trees, water_trees):
+            if o in lst:
+                lst.remove(o)
+    for s in born:
+        s.update(state='seed', clock=0.0, danger_timer=0.0, danger=False, hit=False)
+    trees.extend(born)
+    return [(t['col'], t['row']) for t in blasts]
+
+
 def typed_fluid_args(e):
     """(rate, sediment, temperature) for fluid_modifier from a list entry of type 4-7, which names the
     modifier directly instead of picking it by sign and temperature as type 0 does. Fire trees (Map 6) push

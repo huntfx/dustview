@@ -525,6 +525,10 @@ class LiveGame(Source):
                     self.water_trees = live_generators.water_trees(self.p, delta)
                 except Exception:
                     pass
+                try:                                     # explosive trees (DustAi::BangTree): state, danger
+                    self.bang_trees = live_generators.bang_trees(self.p, delta)
+                except Exception:
+                    pass
                 if getattr(self, 'vec', None) is None:
                     self.source_note = 'looking for the source list...'
                     self.vec = live_generators.known_modifier_list(self.p)        # remembered address first
@@ -722,9 +726,11 @@ class ModelSource(Source):
     name = 'python model'
 
     def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None, totems=None,
-                 fire_trees=None, water_trees=None):
+                 fire_trees=None, water_trees=None, bang_trees=None):
         self.fire_trees = [dict(t) for t in fire_trees] if fire_trees else []   # dustsim.fire_tree_entries
         self.water_trees = [dict(t) for t in water_trees] if water_trees else []   # dustsim.water_tree_step
+        self.bang_trees = [dict(t) for t in bang_trees] if bang_trees else []   # dustsim.bang_tree_step
+        self.blasts = []                         # (col, row, wall time) of recent explosions, for the overlay
         self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(params, np.float32))}
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
@@ -919,6 +925,15 @@ class ModelSource(Source):
             if pours:
                 dustsim.apply_modifiers(G, pours, self.P)
             self._helper_holds = None
+        if self.bang_trees and mods != 'off':    # explosive trees: craters written straight into the ground
+            ex = getattr(self, 'extra', None)    # plants: burning cells near a tree set it off (grid sensor)
+            fire = dustsim.bang_fire_danger(ex[6] if ex is not None and len(ex) > 6 else None)   # + lava cells
+            b = dustsim.bang_tree_step(G, self.bang_trees, self.fire_trees, self.water_trees, 1 / self.GAME_RATE,
+                                       grid_danger=fire)
+            if b:
+                now = time.time()
+                self.blasts = [x for x in self.blasts if now - x[2] < 3] + [(c, r, now) for c, r in b]
+                self._helper_holds = None
         return G
 
     def _game_modifiers(self, G, srcs, reps):
@@ -1533,7 +1548,8 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
     tu = sav.read_sav(grid_path)[1] if grid_path else u
     trees = sav_sources.fire_trees(tu)                    # Map 6: player-planted fire trees
     ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, label, schedule=sch,
-                     totems=list(tot.values()), fire_trees=trees, water_trees=sav_sources.water_trees(tu))
+                     totems=list(tot.values()), fire_trees=trees, water_trees=sav_sources.water_trees(tu),
+                     bang_trees=sav_sources.bang_trees(tu))
     ms.progress_note = note
     ms.level_name = name
     if villages is not None:                     # an explicit --villages schedule overrides the totem count
@@ -2352,9 +2368,15 @@ class App:
                 wtrees = live_generators.water_trees(self.src.p)
             except Exception:
                 pass
+        btrees = getattr(self.src, 'bang_trees', None)
+        if getattr(self.src, 'p', None) is not None:     # fresh: danger timers change every frame
+            try:
+                btrees = live_generators.bang_trees(self.src.p)
+            except Exception:
+                pass
         self.src = ModelSource(fr.grid, fr.params, self.current_sources(), fr.tick, 'from live tick %d' % fr.tick,
                                live_repulsors(self.src), totems=getattr(self.src, 'totems', None), fire_trees=trees,
-                               water_trees=wtrees)
+                               water_trees=wtrees, bang_trees=btrees)
         self.dirty = True
 
     def on_move(self, e):
@@ -2618,6 +2640,23 @@ class App:
                 if st == 'absorbing' and not t.get('danger'):
                     rr = t['absorption_radius'] * 2 / 3 * k
                     dr.rectangle([cx - rr, cy - rr, cx + rr, cy + rr], outline=(60, 150, 255), width=1)
+        btrees = getattr(self.src, 'bang_trees', None) if self.overlay else None
+        if btrees:                               # explosive trees: diamond; yellow adult, orange = in danger (fuse
+            dr = ImageDraw.Draw(img)             # burning), white = exploding, grey = seed / growing / other
+            for t in list(btrees):
+                y, x = self.cell_to_disp[int(t['row']), int(t['col'])]
+                cx, cy = self.to_px(y, x)
+                r = 3 * self.scale
+                st = t.get('state')
+                colour = ((255, 255, 255) if st == 'exploding' else (255, 120, 0) if st == 'adult' and t.get('danger')
+                          else (230, 200, 40) if st == 'adult' else (130, 130, 130))
+                dr.polygon([(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)], outline=colour)
+        now = time.time()
+        for c, rw, t0 in getattr(self.src, 'blasts', []) if self.overlay else []:   # craters of the last 3 s
+            if now - t0 < 3:
+                y, x = self.cell_to_disp[int(rw), int(c)]
+                cx, cy, rr = *self.to_px(y, x), 20 * k
+                ImageDraw.Draw(img).ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=(255, 120, 0), width=2)
         others = (getattr(self.src, 'other_modifiers', []) if self.is_model() else live_repulsors(self.src)) if self.overlay else []
         if others:
             dr = ImageDraw.Draw(img)

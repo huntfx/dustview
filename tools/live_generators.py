@@ -293,6 +293,57 @@ def water_trees(p, delta=None):
     return out
 
 
+# ---------------------------------------------------------------- explosive trees
+BANG_TREE_VTABLES = (0x1015CB40, 0x1015CB34)     # +0, +4 of DustAi::BangTree (0x3A4 bytes, constructor 0x1007D380)
+BANG_TREE_FIELDS = ('hole_radius', 'hole_depth', 'grid_perception_radius', 'entities_perception_radius')  # +0x360..
+BANG_TREE_STATE_OFFSETS = {0x2A4: 'seed', 0x308: 'growing', 0x374: 'adult', 0x328: 'ending', 0x334: 'state5',
+                           0x344: 'exploding'}   # state objects inside the tree; +0x2A0 points at the current one
+BANG_TREE_SETTINGS = (('explosion_delay', 0x28C, 'f'),) + TREE_SETTINGS + (('lava_threshold_max', 0x104, 'f'),)
+
+
+def bang_trees(p, delta=None):
+    """Live explosive trees (class DustAi::BangTree, decoded 2026-11-27, findings/water-lava-sim.md "Explosive
+    trees"): grid cell +0x144 / +0x148, settings +0x360.. (BANG_TREE_FIELDS), +0x388 / +0x38C the grid / entity
+    sensor ids, +0x394 / +0x398 the grid sensor's hit cell (outside 33..478 = nothing found), +0x3A0 bit 0 = danger
+    (grid hit or a burning fire tree in reach), +0x35C bit 2 = hit by another blast. The current state is the state
+    object +0x2A0 points at; the adult state's +8 = clock, +0xC = life time (-1 = none), +0x10 = danger timer."""
+    delta = dustai_delta(p) if delta is None else delta
+    out = []
+    for a in p.find(struct.pack('<2I', BANG_TREE_VTABLES[0] + delta, BANG_TREE_VTABLES[1] + delta)):
+        d = bang_tree_at(p, a, delta)
+        if d is not None:
+            out.append(d)
+    return out
+
+
+def bang_tree_at(p, a, delta):
+    """One explosive tree at address a (as bang_trees; None if it is not a live tree any more). Cheap: use it to
+    follow trees found once by bang_trees (which scans memory, ~1.5 s)."""
+    raw = p.read(a, 0x3A4)
+    if raw is None or struct.unpack_from('<2I', raw, 0) != (BANG_TREE_VTABLES[0] + delta, BANG_TREE_VTABLES[1] + delta):
+        return None
+    col, row = struct.unpack_from('<2I', raw, 0x144)
+    hid = struct.unpack_from('<I', raw, 0x54)[0]
+    if hid >= 0xFFFFFFF0 or not (0 < col < 512 and 0 < row < 512):
+        return None
+    d = dict(address=hex(a), id='%X' % hid, col=col, row=row)
+    d.update(zip(BANG_TREE_FIELDS, struct.unpack_from('<4f', raw, 0x360)))
+    for name, off, f in BANG_TREE_SETTINGS:
+        d[name] = struct.unpack_from('<' + f, raw, off)[0]
+    gc, gr = struct.unpack_from('<2i', raw, 0x394)
+    bits = struct.unpack_from('<I', raw, 0x3A0)[0]
+    d.update(grid_hit=(gc, gr) if 33 <= gc < 479 and 33 <= gr < 479 else None, bits=bits, danger=bool(bits & 1),
+             hit=bool(struct.unpack_from('<I', raw, 0x35C)[0] & 4))
+    sub = struct.unpack_from('<I', raw, 0x2A0)[0]
+    d['state'] = BANG_TREE_STATE_OFFSETS.get(sub - a, 'other' if sub else 'none')
+    s = p.read(sub, 0x14) if sub else None
+    if s:
+        d['clock'] = struct.unpack_from('<f', s, 8)[0]
+        if d['state'] == 'adult':
+            d['life_time'], d['danger_timer'] = struct.unpack_from('<2f', s, 0xC)
+    return d
+
+
 # ---------------------------------------------------------------- village repel songs
 SONG_VTABLES = {'water': 0x1016C1CC, 'lava': 0x1016C214}     # dustai objects for entities 0x20400009 / 0x2040000A
 

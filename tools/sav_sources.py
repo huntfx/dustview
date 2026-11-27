@@ -245,6 +245,44 @@ def water_trees(u):
     return out
 
 
+BANG_TREE_TAG = b'\x28\x00\x00\x04'
+# Class settings of the explosive tree (DustAi::BangTree), BinPC/Wor_15104E22.lin.bf Bombarde_0.ai (read 2026-11-27;
+# not in the save records). Radii in world units (1.5 per cell).
+BANG_TREE_SETTINGS = dict(hole_radius=30.0, hole_depth=20.0, grid_perception_radius=10.0,
+                          entities_perception_radius=20.0, explosion_delay=0.2, explosion_duration=1.0,
+                          time_to_activate_seed=10.0, time_to_grow_tree=10.0, nb_seeds=1, nb_seeds_random=0,
+                          diffusion_radius_min=3.0, diffusion_radius_max=4.0, water_threshold_max=5.0,
+                          lava_threshold_max=5.0, seed_ejection_strength=20.0, seed_ejection_angle=20.0,
+                          time_to_degenerate_tree=10.0)
+BANG_TREE_STATES = {1: 'seed', 2: 'growing', 3: 'adult', 4: 'ending', 6: 'exploding'}
+
+
+def bang_trees(u):
+    """Explosive trees (DustAi::BangTree, entity type 0x28000004) in a save or level file, decoded 2026-11-27
+    (findings/water-lava-sim.md "Explosive trees"). Same header as the other trees (+0x10 handle, +0x28 world
+    position, +0xD4 state, +0xD8 the state's clock). Record sizes: 0x104 / 0xF8 adult (state 3: +0xDC life time,
+    -1 = none, +0xE0 the danger timer, +0xE8 the BangTree bits, bit 0 = danger), 0x178 / 0x16C seed (state 1),
+    0xFC / 0xF0 states 2 (growing) and 4 (end of life). Class settings: BANG_TREE_SETTINGS."""
+    out = []
+    i = u.find(BANG_TREE_TAG)
+    while i >= 0:
+        sizes = (u32(u, i - 0x10), u32(u, i - 8)) if i >= 0x10 else None
+        if sizes in ((0x104, 0xF8), (0x178, 0x16C), (0xFC, 0xF0)):
+            x, y, z = f32(u, i + 0x28), f32(u, i + 0x2C), f32(u, i + 0x30)
+            state = u32(u, i + 0xD4)
+            t = dict(id=handle_id(u32(u, i + 0x10), u32(u, i + 0x14), u32(u, i + 0x18)),
+                     col=int(256 + 2 * x / 3), row=int(256 + 2 * y / 3), x=x, y=y, z=z,
+                     state=BANG_TREE_STATES.get(state, str(state)), clock=f32(u, i + 0xD8), danger_timer=0.0,
+                     danger=False)
+            if sizes[0] == 0x104:
+                t.update(life_time=f32(u, i + 0xDC), danger_timer=f32(u, i + 0xE0),
+                         danger=bool(u32(u, i + 0xE8) & 1))
+            t.update(BANG_TREE_SETTINGS)
+            out.append(t)
+        i = u.find(BANG_TREE_TAG, i + 1)
+    return out
+
+
 def _entry_start(u, tag):
     """Offsets just after each entry tag (the handle block follows)."""
     return [m.start() + 4 for m in re.finditer(re.escape(struct.pack('>I', tag)), u)]
