@@ -85,7 +85,7 @@ import argparse, os, struct, sys, threading, time
 os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
 import tkinter as tk
 import numpy as np
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageChops, ImageTk, ImageDraw
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import memscan, galileo, live_check, live_generators, dustsim  # noqa: E402
@@ -1702,6 +1702,8 @@ class App:
         self.smooth = True                               # interpolate when zoomed (False: crisp cells)
         self.ground_tex = True                           # natural view: the game's sand / rock textures
         self.show_plants = True                          # natural view: plants / fire (flowtex.SHOW_VEGETATION)
+        self.show_limit = True                           # the game's cursor limit (tools/offmap.py), outside dimmed
+        self._limit_masks, self._limit_px = {}, None     # (level, flip, rotate) -> display mask; screen-size cache
         self.drag = None                                 # (x, y, view_x0, view_y0, moved) while panning
         self.painting, self.paint_time = None, None      # +1 add / -1 remove while a mouse button is held
         self.show_events, self.events = True, []        # (time, row, col, cells, total)
@@ -2320,6 +2322,50 @@ class App:
             self.last_image.save(p)
             print('saved', p)
 
+    def cursor_limit_mask(self):
+        """(N, N) bool in display orientation: cells the game's cursor can reach on this level (tools/offmap.py:
+        the level's DustAi::OffmapCollider), or None (level unknown, e.g. challenge maps, or no limit data)."""
+        lvl = level_number(self.src)
+        if lvl is None:
+            return None
+        key = (lvl, self.flip, self.rotate)
+        if key not in self._limit_masks:
+            m = None
+            try:
+                import offmap
+                lim = offmap.limits('%02d' % lvl)
+                if lim is not None:
+                    m = np.ascontiguousarray(self.orient(offmap.reachable(lim)))
+            except (KeyError, OSError, ValueError):       # no world archive for this level (story 7)
+                m = None
+            self._limit_masks[key] = m
+        return self._limit_masks[key]
+
+    def draw_cursor_limit(self, img):
+        """Dim what the game's cursor cannot reach and outline the limit in yellow, on the screen-sized image
+        of the visible window. The screen-sized mask is cached per level / orientation / zoom / pan."""
+        m = self.cursor_limit_mask()
+        if m is None:
+            return img
+        size, v = img.size[0], N / self.zoom
+        x0, y0 = self.view_x0, self.view_y0
+        key = (id(m), size, x0, y0, v)
+        if self._limit_px is None or self._limit_px[0] != key:
+            px = Image.fromarray((m * 255).astype(np.uint8)).resize((size, size), Image.NEAREST,
+                                                                     box=(x0, y0, x0 + v, y0 + v))
+            a = np.asarray(px) > 127
+            p = np.pad(a, 1, mode='edge')                  # no wrap-around at the window edge
+            edge = a & ~(p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:])
+            if size >= 768:                               # 2 px line on big canvases
+                edge = edge | np.roll(edge, 1, 0) | np.roll(edge, 1, 1)
+            fac = px.point(lambda c: 255 if c > 127 else 141)          # x 0.55 outside, via multiply
+            ys, xs = np.nonzero(edge)
+            self._limit_px = (key, Image.merge('RGB', (fac, fac, fac)), list(zip(xs.tolist(), ys.tolist())))
+        _, fac, edge = self._limit_px                      # PIL (C) only: the numpy version took ~30 ms at 1024 px
+        img = ImageChops.multiply(img, fac)
+        ImageDraw.Draw(img).point(edge, fill=(255, 220, 40))
+        return img
+
     def draw(self):
         fr = self.frame
         flow_tex = self.view == 'engine texture' and self.texture in FLOW_TEXTURES
@@ -2361,6 +2407,8 @@ class App:
             if self.scale != 1 or self.zoom != 1:
                 smooth = self.smooth and self.zoom != 1
                 img = img.resize((size, size), Image.BILINEAR if smooth else Image.NEAREST, box=(x0, y0, x0 + v, y0 + v))
+        if self.show_limit:
+            img = self.draw_cursor_limit(img)
         k = self.px_per_cell()
         sources = self.current_sources()
         off = list(getattr(self.src, 'off_sources', ())) if self.is_model() else []
