@@ -221,13 +221,60 @@ def live_repulsors(src):
 
 
 def level_number(src):
-    """Story level number of what a source shows (or None): from a model's map name (ALPHA_Map8_...)
-    or by matching its totems' handle IDs with the level files' totems (data/level_scripts)."""
+    """Story level number of what a source shows (or None): from a model's map name (ALPHA_Map8_...),
+    by matching its totems' handle IDs with the level files' totems (data/level_scripts), or else the
+    level its terrain matched (`src.terrain_level`, set by App._update_terrain_level: needed for live
+    levels without totems, e.g. Story 1)."""
     import re
     m = re.search(r'Map(\d+)_', getattr(src, 'label', '') or '')
     if m:
         return int(m.group(1))
-    tots = getattr(src, 'totems', None)
+    n = _level_by_totems(getattr(src, 'totems', None))
+    return n if n is not None else getattr(src, 'terrain_level', None)
+
+
+_LEVEL_HARD, _LEVEL_HARD_LOADING = None, False
+
+
+def _load_level_hard():
+    global _LEVEL_HARD
+    import compare_sim, re, sav
+    out = []
+    for f in sorted(os.listdir(compare_sim.SAVES)):
+        m = re.match(r'ALPHA_Map(\d+)_.*\.sav$', f, re.I)
+        if not m:
+            continue
+        _, u = sav.read_sav(os.path.join(compare_sim.SAVES, f))
+        g = np.frombuffer(sav.float_layer(u, 0), np.float32).reshape(N, N)
+        s = np.frombuffer(sav.float_layer(u, 2), np.float32).reshape(N, N)
+        out.append((int(m.group(1)), (g - s)[::4, ::4].copy()))
+    _LEVEL_HARD = out
+
+
+def level_by_terrain(fr, min_score=0.5):
+    """Story level number whose shipped hard ground (ground - soft, every 4th cell) matches the frame's in
+    the most cells (|difference| < 0.01), or None (no frame, below min_score, or the level files are still
+    loading in the background: ~15 files, done once). Play changes soft ground, water and lava but rarely
+    hard ground (a player's save matches its level in ~97 % of cells)."""
+    global _LEVEL_HARD_LOADING
+    if fr is None or getattr(fr, 'ground', None) is None or getattr(fr, 'soft', None) is None:
+        return None
+    if _LEVEL_HARD is None:
+        if not _LEVEL_HARD_LOADING:
+            _LEVEL_HARD_LOADING = True
+            threading.Thread(target=_load_level_hard, daemon=True).start()
+        return None
+    hard = (np.asarray(fr.ground, np.float32) - np.asarray(fr.soft, np.float32))[::4, ::4]
+    best, score = None, 0.0
+    for n, h in _LEVEL_HARD:
+        sc = float((np.abs(hard - h) < 0.01).mean())
+        if sc > score:
+            best, score = n, sc
+    return best if score >= min_score else None
+
+
+def _level_by_totems(tots):
+    import re
     if not tots:
         return None
     global _LEVEL_TOTEMS
@@ -2322,6 +2369,22 @@ class App:
             self.last_image.save(p)
             print('saved', p)
 
+    def _update_terrain_level(self):
+        """Live sources: every 3 s, if neither the label nor the totems identify the level (Story 1 has no
+        totems), match the live terrain against the level files (level_by_terrain); follows level changes."""
+        if self.is_model() or self.frame is None:
+            return
+        now = time.time()
+        if now - getattr(self, '_terrain_check', 0.0) < 3.0:
+            return
+        self._terrain_check = now
+        src = self.src
+        src.terrain_level = None
+        if level_number(src) is None:
+            src.terrain_level = level_by_terrain(self.frame)
+            if src.terrain_level is None and _LEVEL_HARD is None:
+                self._terrain_check = now - 2.5            # level files still loading: try again soon
+
     def cursor_limit_mask(self):
         """(N, N) bool in display orientation: cells the game's cursor can reach on this level (tools/offmap.py:
         the level's DustAi::OffmapCollider), or None (level unknown, e.g. challenge maps, or no limit data)."""
@@ -2368,6 +2431,7 @@ class App:
 
     def draw(self):
         fr = self.frame
+        self._update_terrain_level()
         flow_tex = self.view == 'engine texture' and self.texture in FLOW_TEXTURES
         if (self.view == 'natural' or flow_tex) and (self.flow is None or self.flow.s != self.scale):
             import flowtex
