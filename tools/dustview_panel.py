@@ -4,7 +4,8 @@ Everything here calls the same App actions as the keyboard shortcuts (shown in b
 (called every frame) copies the App's state back into the widgets, so keys and panel never disagree.
 Layout: what is shown (live game or the Python model) and the live / takeover buttons always at the top,
 then tabs: Map (pick a level, then one of its saves or New, all profiles), Model (pause, step, speed,
-villages), Edit (paint water / lava / sand / rock with the game's own modifiers, model mode), View (views
+villages), Script (what the level script is doing: running / upcoming events, conditions, preview graphs;
+tools/dustview_script.py), Edit (paint water / lava / sand / rock with the game's own modifiers, model mode), View (views
 incl. the engine-texture dropdown, overlays, display), Slice (pick two points on the map for a side-on
 cross-section in its own window: rock, sand, water / lava, air; tools/dustslice.py).
 """
@@ -48,7 +49,11 @@ class ControlPanel:
         # ---- tabs: Map / Model / View
         self.tabs = ttk.Notebook(f, takefocus=False)
         self.tabs.pack(fill='both', expand=True)
-        tab_map, tab_model, tab_edit, tab_view, tab_slice = (self._tab(t) for t in ('Map', 'Model', 'Edit', 'View', 'Slice'))
+        tab_map, tab_model, tab_script, tab_edit, tab_view, tab_slice = (
+            self._tab(t) for t in ('Map', 'Model', 'Script', 'Edit', 'View', 'Slice'))
+        self.tab_script = tab_script
+        import dustview_script
+        self.script = dustview_script.ScriptTab(tab_script, app)
         self.tab_slice = tab_slice
         self.tabs.bind('<<NotebookTabChanged>>', lambda e: self._tab_changed())
 
@@ -98,6 +103,7 @@ class ControlPanel:
         for attr, label, choices in (('FLUID_STEP', 'Water / lava / sand', ('off', 'game', 'model')),
                                      ('SOURCE_STEP', 'Sources / repels', ('off', 'game', 'model')),
                                      ('WAVE_STEP', 'Waves / tide', ('off', 'model')),
+                                     ('TERRAFORM_STEP', 'Terraforming', ('off', 'game', 'model')),
                                      ('VEGETATION_STEP', 'Vegetation / fire', ('off', 'game', 'model'))):
             row = ttk.Frame(box); row.pack(fill='x', pady=(2, 0))
             ttk.Label(row, text=label, width=17).pack(side='left')
@@ -109,7 +115,9 @@ class ControlPanel:
                             "exactly). Model = DustView's re-implementation. Water, lava and sand are one step in "
                             "the game, so they share one choice. Sources / repels = springs, lava vents, drains "
                             "and village repels. Waves / tide = the level script's edge waves and sea level "
-                            "(Disabled keeps the current level). Painting works whatever is chosen.",
+                            "(Disabled keeps the current level). Terraforming = the script's TerraForming "
+                            "events (ground raised / lowered by a brush over time, e.g. Story 1's sea swell); "
+                            "its Model is approximate (brush texture sampling not exact). Painting works whatever is chosen.",
                   wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
         box = self._section('Villages (or click a totem on the map)', tab_model)
         self.totem_frame = ttk.Frame(box); self.totem_frame.pack(fill='x')
@@ -360,6 +368,8 @@ class ControlPanel:
             var.set(value)
 
     def sync(self):
+        if self.tabs.select() == str(self.tab_script):
+            self.script.sync()
         app, dv = self.app, self.dv
         src = app.src
         model = app.is_model()

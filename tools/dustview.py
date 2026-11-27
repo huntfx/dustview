@@ -14,11 +14,13 @@ Run with the project venv while a level is loaded:
 bottom), which matches the game according to play; --no-flip shows grid row 0 at the top.
 --model MAP runs the Python model from a map's .sav (e.g. ALPHA_Map11_Void) driven by its level script
 (tools/level_schedule.py: sources switching on/off/moving, the tide); --villages "0:0,200:1,900:3" gives
-the village counts the script checks. Waves and tsunamis drive the edge lines (wave table). No game needed.
+the village counts the script checks. Waves and tsunamis drive the edge lines (wave table); TerraForming events
+raise / lower the ground with the game's brushes (tools/terraform.py; Model tab Terraforming: Game = the game's
+brush job in the helper, Model = approximate Python copy). No game needed.
 
 Control panel (right; tools/dustview_panel.py): source status with Live game / Continue in model, then
 tabs Map (pick a level, then start it fresh or load one of its saves from any profile, or open a .sav), Model (pause, step,
-speed, villages) and View (views, overlays, flip / rotate, zoom, screenshot). Without a running game the
+speed, villages), Script (the level script's running / upcoming events and preview graphs; tools/dustview_script.py) and View (views, overlays, flip / rotate, zoom, screenshot). Without a running game the
 viewer opens empty. The keys below do the same; the panel follows them.
 
 Views (panel only): natural, height, water depth, lava temperature, sediment, flow speed, unexplained
@@ -455,8 +457,13 @@ class LiveGame(Source):
                     if self.vec is not None:
                         self.refresh_sources(paused_check=True)
                 delta = live_generators.dustai_delta(self.p) if delta is None else delta
+                if getattr(self, 'script_reader', None) is None:
+                    import live_script
+                    self.script_reader = live_script.Reader(self.p, delta)
                 gens = live_generators.generators(self.p, delta)
                 self.gen_addrs = [int(g['address'], 16) for g in gens]
+                self.gens_running = sum(1 for g in gens if g['mode'] in (1, 2) and g['activity'] > 0)
+                self.gens_scanned = True                 # (none running: the source list cannot be found)
                 try:
                     self.totems = live_generators.totems(self.p, delta)
                 except Exception:
@@ -486,6 +493,8 @@ class LiveGame(Source):
             if getattr(self, '_relook', False):
                 self._relook = False
                 self.vec, self.sources, self.gen_addrs, self._latest_entries = None, [], [], None
+                self.gens_scanned = False                # the new level's generators are not scanned yet
+                self.script_log = {}                     # nor its script snapshots
                 self.__dict__.pop('seen_repulsors', None)   # the old level's repels
                 self._last_count = None
 
@@ -504,7 +513,47 @@ class LiveGame(Source):
                             self._latest_entries = (time.time(), es)
                 except Exception:
                     pass
+            self._poll_script()
             time.sleep(0.002)
+
+    SCRIPT_KEEP = 1200                           # ticks of running-action snapshots kept (~40 s)
+
+    def _poll_script(self):
+        """Once per game tick: the level script's running actions (live_script; TerraForming, waves,
+        tsunamis, tide), kept by tick in self.script_log for compare mode."""
+        r = getattr(self, 'script_reader', None)
+        if r is None:
+            return
+        try:
+            m = self._counter()
+            last = getattr(self, '_script_tick', None)
+            if m == last:
+                return
+            if last is not None and m < last:            # the counter went back (map loaded / reloaded): the old
+                self.script_log = {}                     # level's snapshots must not be matched to the new ticks
+            acts = r.running()
+            self._script_tick = m
+            log = self.__dict__.setdefault('script_log', {})
+            log[m] = acts
+            if len(log) > self.SCRIPT_KEEP:
+                for k in sorted(log)[:len(log) - self.SCRIPT_KEEP]:
+                    del log[k]
+        except Exception:
+            pass
+
+    def script_at(self, tick, reach=8):
+        """The running actions at game tick `tick` (that tick's snapshot, else the latest one up to `reach`
+        ticks earlier with the timers moved on by 1/31 s per tick); None if there is none."""
+        log = getattr(self, 'script_log', None)
+        if not log:
+            return None
+        for k in range(tick, tick - reach - 1, -1):
+            acts = log.get(k)
+            if acts is not None:
+                if k == tick:
+                    return acts
+                return [dict(a, timer=a['timer'] + (tick - k) / 31.0) for a in acts]
+        return None
 
     def _check_sim(self):
         """After a level change the game may use a new simulator object: when no tick has arrived for 3 s
@@ -688,6 +737,8 @@ class ModelSource(Source):
                     self.P['BorderWaterSurfaceHeight'] = sch.border_level   # tide (kept as it was while off)
             srcs, off = self._compose(level)         # minus removed / switched-off ones, plus placed ones
             G = self._fluid_tick(srcs)
+            if sch is not None and sch.brush_calls and TERRAFORM_STEP != 'off':
+                self._terraform(G, sch.brush_calls)
             if sch is not None:
                 if SOURCE_STEP != 'off':
                     sch.write_back(srcs)
@@ -822,6 +873,29 @@ class ModelSource(Source):
             for e in reps:
                 dustsim.repulse_fluid(G, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
 
+    brush_failed = False                         # the helper could not run the brush job (e.g. an old simstep.exe)
+
+    def _terraform(self, G, calls):
+        """This tick's TerraForming brushes (level script, tools/terraform.py) on G in place: the game's own
+        brush job through the helper (Game), or the approximate Python copy (Model, and the fallback)."""
+        import terraform
+        if TERRAFORM_STEP == 'game' and not (self.helper_failed or self.brush_failed):
+            try:
+                R = self._helper()
+                if self._helper_holds is not G:
+                    R.put(state_to_grid(G), range(6))
+                for c in calls:
+                    R.brush(*c.dll_args())
+                got = R.get((0, 1))
+                G['T'], G['soft'] = got[0].view(np.float32).copy(), got[1].view(np.float32).copy()
+                self._helper_holds = G               # the helper's grid is G again
+                return
+            except Exception as e:
+                print('game terrain brush not available, using the model:', e, flush=True)
+                self.brush_failed = True
+        for c in calls:
+            terraform.apply_brush(G, c)
+
     def _helper(self):
         """The resident simstep helper with the current parameters (self.P changes during a level: tide /
         border level), started on first use."""
@@ -859,8 +933,10 @@ class ModelSource(Source):
         fluid = FLUID_STEP if not (FLUID_STEP == 'game' and self.helper_failed) else 'model (game step failed)'
         mods = SOURCE_STEP if not (SOURCE_STEP == 'game' and (self.helper_failed or self.mods_failed)) else 'model (game modifiers failed)'
         plants = VEGETATION_STEP if not (VEGETATION_STEP == 'game' and self.helper_failed) else 'off (game step failed)'
+        terra = TERRAFORM_STEP if not (TERRAFORM_STEP == 'game' and (self.helper_failed or self.brush_failed)) else 'model (game brush failed)'
         lab = lambda v: STEP_LABELS.get(v, v)
-        return 'water/lava/sand: %s, sources/repels: %s, waves: %s, plants: %s' % (lab(fluid), lab(mods), lab(WAVE_STEP), lab(plants))
+        return 'water/lava/sand: %s, sources/repels: %s, waves: %s, terraforming: %s, plants: %s' % (
+            lab(fluid), lab(mods), lab(WAVE_STEP), lab(terra), lab(plants))
 
     def _vegetation_tick(self, G):
         """One step of the game's own vegetation / fire job on the new state (ground, sand, water from G;
@@ -966,9 +1042,11 @@ class ModelSource(Source):
 class CompareSource(Source):
     """The live game plus a copy of it in the Python model, run in lockstep: whenever the game advances N
     ticks the model advances N ticks too, with the game's own per-tick list (fluid sources at the amounts
-    the game applied, RepulseFluid entries as listed), so what drifts apart is the simulation, not
-    DustView's source / bury / village rules. Not modelled: tides / waves / weather, player powers,
-    vegetation and fire (all of these show up as differences). read() returns the game's frame or the
+    the game applied, RepulseFluid entries as listed, and its HardGround / SoftGround entries: ground the
+    player's powers add or remove, so those edits appear in the model at the same tick), so what drifts
+    apart is the simulation, not DustView's source / bury / village rules or the player's edits. Not fed
+    in: tides / waves / weather, scripted terrain (TerraForming), changes made outside the per-tick list,
+    vegetation and fire (these show up as differences). read() returns the game's frame or the
     model's (show = 'game' / 'model'), each with .other = the other one; resync() copies the game into
     the model again. Anything not defined here (sources, totems, songs, ...) comes from the live reader."""
     name = 'model vs game'
@@ -993,6 +1071,8 @@ class CompareSource(Source):
         return getattr(self.live, k)
 
     def _sync_to(self, fr):
+        self.released = False if getattr(self, '_new_level', False) else getattr(self, 'released', False)
+        self._new_level = False
         with self.lock:
             self.G, self.extra = dustsim.from_grid(fr.grid), fr.grid
             self.model_tick, self.target, self.synced_at = fr.tick, fr.tick, fr.tick
@@ -1002,6 +1082,92 @@ class CompareSource(Source):
 
     def resync(self):
         self._sync_to(self.game)
+
+    SCRIPT_OFFSET = -1                             # the running actions of the game tick before: the game applies a brush
+                                                   # one tick after its action's timer (live, Story 1: TerraForming spots
+                                                   # median 0.38 at -1, 0.78 at 0, 0.65 at +1; edge water 0.54 / 0.71 / 0.84)
+    helper = None
+    brush_failed = False
+    script_note = ''
+
+    def _script_effects(self, G, tick):
+        """The level script's TerraForming brushes and edge waves the game is running at `tick` (read from the
+        game: LiveGame.script_at), applied to G in place: brushes through the game's own brush job (helper;
+        the Python copy if that fails), waves as the model's edge profiles."""
+        acts = self.live.script_at(tick) if hasattr(self.live, 'script_at') else None
+        if acts is None:
+            self.script_note = 'script: no running-action snapshot for this tick'
+            return
+        import terraform, level_schedule
+        calls, profiles = [], {}
+        cache = self.__dict__.setdefault('_tf_cache', {})
+        for a in acts:
+            if a['name'] == 'TerraForming':
+                key = (a['address'], a['col'], a['row'], a['op'], a['start_size'], a['end_size'], a['curve'])
+                tf = cache.get(key)
+                if tf is None:
+                    if len(cache) > 64:
+                        cache.clear()
+                    tf = cache[key] = terraform.Terraform(dict(a))
+                c = tf.call_at(a['timer'])
+                if c is not None:
+                    calls.append(c)
+            elif a['name'] in ('Wave', 'Tsunami') and a.get('direction') in level_schedule.SIDE:
+                cyc = a['name'] == 'Wave'
+                dur = a['cycle_duration'] if cyc else a['duration']
+                if dur and dur > 0 and a['timer'] >= 0:
+                    t = a['timer'] % dur if (cyc and a.get('cycle')) else a['timer']
+                    if t < dur:
+                        level_schedule.add_wave_profile(profiles, level_schedule.SIDE[a['direction']], a['amplitude'], t, dur)
+        if calls:
+            done = False
+            if not self.brush_failed:
+                try:
+                    if self.helper is None:
+                        self.helper = galileo.Resident(galileo.param_image(self.params, 2))
+                    R = self.helper
+                    R.put({0: G['T'].view(np.uint32), 1: G['soft'].view(np.uint32)}, (0, 1))
+                    for c in calls:
+                        R.brush(*c.dll_args())
+                    got = R.get((0, 1))
+                    G['T'], G['soft'] = got[0].view(np.float32).copy(), got[1].view(np.float32).copy()
+                    done = True
+                except Exception as e:
+                    print('compare: game brush not available, using the Python copy:', e, flush=True)
+                    self.brush_failed = True
+            if not done:
+                for c in calls:
+                    terraform.apply_brush(G, c)
+        if profiles:
+            dustsim.apply_edges(G, self.P['BorderWaterSurfaceHeight'], profiles)
+        self.script_note = 'script from the game: %d terraforming, %d waves / tsunamis running' % (
+            sum(1 for a in acts if a['name'] == 'TerraForming'), sum(1 for a in acts if a['name'] in ('Wave', 'Tsunami')))
+
+    released = False
+
+    def _hold(self):
+        """Keep the model on the game: the game's per-tick list (sources, repels, ground edits) is not found
+        yet and a spring / vent is running, so ticks without the list would differ for that reason alone. The
+        list is found through a running, unburied source, so with none running (Story 1 has no springs) it
+        cannot be found: then the model runs without it. Once released the model is never held again (a
+        hold copies the game into the model every frame, which hides all differences)."""
+        live = self.live
+        if getattr(live, 'script_reader', None) is None and hasattr(live, 'script_at'):
+            first = self.__dict__.setdefault('_no_reader_since', time.time())
+            if time.time() - first < 15:                  # the script reader is set up in the live reader's first
+                return True                               # rounds: wait for it (not forever: 15 s)
+        if getattr(live, 'script_reader', None) is not None:
+            log = getattr(live, 'script_log', None)
+            if not log or self.model_tick + 1 + self.SCRIPT_OFFSET < min(log):
+                return True                           # no script snapshot for the model's next tick: it would miss
+                                                      # running brushes (read() re-syncs it to the game meanwhile)
+        if self.released or getattr(live, 'vec', None) is not None:
+            self.released = True
+            return False
+        if getattr(live, 'gens_scanned', False) and not getattr(live, 'gens_running', 0):
+            self.released = True
+            return False
+        return True
 
     def _loop(self):
         while self.running:
@@ -1015,7 +1181,7 @@ class CompareSource(Source):
                 self.note = 'model was %d ticks behind: re-synced at game tick %d' % (behind, self.game.tick)
                 continue
             live = self.live
-            if getattr(live, 'vec', None) is None:       # source list not found yet: no model ticks (see read)
+            if self._hold():                              # source list not found yet: no model ticks (see read)
                 time.sleep(0.01)
                 continue
             if self._params_obj is not self.game_params:   # the game's current parameters (tide / border level, ...)
@@ -1027,6 +1193,7 @@ class CompareSource(Source):
             ground = [e for e in (getattr(live, 'entries', None) or []) if e.get('type') in (2, 3)]
             if ground:                                # HardGround / SoftGround entries (e.g. a power adding sand)
                 dustsim.apply_modifiers(G, ground, self.P)
+            self._script_effects(G, self.model_tick + 1 + self.SCRIPT_OFFSET)
             with self.lock:
                 if self.gen == gen:                   # not re-synced meanwhile
                     self.G, self.model_tick = G, self.model_tick + 1
@@ -1046,15 +1213,19 @@ class CompareSource(Source):
             if fr.tick < self.game.tick or sim_changed:   # the game went back or a new level loaded: start again
                 self.sim_changes = getattr(self.live, 'sim_changes', 0)
                 self.game = fr
+                self._new_level = True                    # wait for the new level's source list again
                 self._sync_to(fr)
                 self.note = 'new level / map reload: re-synced at game tick %d' % fr.tick
             self.game, self.game_params, changed = fr, fr.params, True
             self.recent = [g for g in getattr(self, 'recent', []) if g.tick < fr.tick][-8:] + [fr]
-            if getattr(self.live, 'vec', None) is None:     # no sources yet: keep the model on the game
+            if self._hold():                              # no sources yet: keep the model on the game
                 self._sync_to(fr)
-                self.note = 'waiting for the source list (model held on the game until then)'
+                self.note = 'waiting for the source list (model held on the game until then, so no differences)'
             elif self.note.startswith('waiting'):
-                self.note = 'source list found: in step since game tick %d' % self.synced_at
+                self.note = ('source list found: in step since game tick %d' % self.synced_at
+                             if getattr(self.live, 'vec', None) is not None else
+                             'no springs / vents in this level: model runs without the source list since game tick %d '
+                             '(power edits are not copied: they show as differences)' % self.synced_at)
             with self.lock:
                 self.target = fr.tick
         with self.lock:
@@ -1094,12 +1265,21 @@ class CompareSource(Source):
 
     def status(self):
         lag = self.game.tick - self.model_tick
+        pair = getattr(self, 'pair', None)
+        stale = pair is not None and pair[1] is not None and self.game.tick - pair[1].tick > 10
         frozen = ' | game grid not changing (paused / menu?): model held' if getattr(self, 'frozen', 0) > 3 else ''
-        return 'model vs game (G: game / model / differences) | game tick %d, model tick %d%s%s | %s | %s' % (
-            self.game.tick, self.model_tick, (' (%d behind)' % lag) if lag else '', frozen, self.note, self.live.status())
+        return 'model vs game (G: game / model / differences) | game tick %d, model tick %d%s%s | %s | %s | %s' % (
+            self.game.tick, self.model_tick, ((' (%d behind%s)' % (lag, ': the differences shown are from tick %d, the model is not '
+                                              'keeping up' % pair[1].tick if stale else '')) if lag else ''), frozen, self.note,
+            self.script_note or 'script: -', self.live.status())
 
     def stop(self):                                 # the live reader stays (App.live)
         self.running = False
+        if self.helper is not None:
+            try:
+                self.helper.close()
+            except Exception:
+                pass
 
 
 def render_compare(fr):
@@ -1211,8 +1391,9 @@ def progress_save_for(name):
 
 def model_from_save(path, villages=None):
     """ModelSource starting from a player's save: its grids (terrain, water, lava as saved) and its
-    villages and songs, with the sources and script of the level it belongs to. The level script starts
-    from its beginning (the save's script state and the sources it had switched on are not read)."""
+    villages and songs, with the sources and script of the level it belongs to. The level script continues
+    from the save's script state (level clock, sequences, fired rules, running effects:
+    level_schedule.LevelSchedule.resume_from); the sources it had switched on are replayed from the script."""
     return model_from_map(level_for_save(path), villages, progress=path, grid_path=path)
 
 
@@ -1234,6 +1415,13 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
         grid[6], grid[7] = c6, c7
     import level_schedule
     sch = level_schedule.LevelSchedule(name, villages=villages, border_level=border[0])
+    resumed = None
+    if grid_path:                                # a player's save: continue its script where it was
+        try:
+            resumed = sch.resume_from(grid_path, ground=T.astype(np.float32))
+        except Exception as e:
+            print('script state not read from the save (script starts at 0 s):', e, flush=True)
+            sch = level_schedule.LevelSchedule(name, villages=villages, border_level=border[0])
     st = sav_sources.statues(sav.read_sav(grid_path)[1] if grid_path else u)   # a save: totems where they are now
     tot = {t['index']: dict(id=t['id'], col=t['col'], row=t['row'], power=t['power'], built=False, water=0.0, lava=0.0)
            for t in st}
@@ -1247,7 +1435,8 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
                 tot[i].update(d)
         note = '%s (%s)' % (os.path.basename(path), time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(path))))
         print('villages and songs from', path, flush=True)
-    label = name + (' from %s (script restarted)' % os.path.basename(grid_path) if grid_path else '')
+    label = name + ((' from %s (script %s)' % (os.path.basename(grid_path), 'resumed at %.0f s' % resumed
+                                               if resumed is not None else 'restarted')) if grid_path else '')
     ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, label, schedule=sch,
                      totems=list(tot.values()))
     ms.progress_note = note
@@ -1277,6 +1466,8 @@ FLUID_STEP = 'model'          # the step: 'off' (no flow), 'game' (the game's ow
 SOURCE_STEP = 'model'         # the modifier pass (springs, vents, drains, village repels): 'off' | 'game' (the
                               # game's modifier code in the same helper) | 'model' (dustsim's copies)
 WAVE_STEP = 'model'           # waves and tide at the map edge from the level script: 'off' | 'model'
+TERRAFORM_STEP = 'game'       # the level script's TerraForming brushes: 'off' | 'game' (the game's brush job in
+                              # the helper, exact) | 'model' (terraform.apply_brush, approximate sampling)
 VEGETATION_STEP = 'model'     # 'off' | 'game' (the game's own vegetation / fire step via the helper) | 'model'
                               # (ganja_step / ganja_step_nb, our re-implementation, exact against the DLL)
 STEP_LABELS = {'off': 'disabled', 'game': 'game', 'model': 'model'}
@@ -1595,6 +1786,19 @@ class App:
         self.view_x0, self.view_y0 = cx - ex / k, cy - ey / k
         self._clamp_view()
         self.dirty = True
+
+    def centre_on(self, row, col, radius=0):
+        """Centre the view on grid cell (row, col) (zooming in to at least 2x) and ring it for a few seconds."""
+        if self.zoom < 2:
+            self.zoom = 2.0
+        y, x = self.cell_to_disp[int(row), int(col)]
+        v = N / self.zoom
+        self.view_x0, self.view_y0 = x + 0.5 - v / 2, y + 0.5 - v / 2
+        self._clamp_view()
+        self.highlight = (int(row), int(col), float(radius), time.time())
+        self.dirty = True
+
+    highlight = None                             # (row, col, radius, time): ring drawn by draw() for 6 s
 
     def zoom_step(self, d, ex=None, ey=None):
         i = min(range(len(self.ZOOMS)), key=lambda j: abs(self.ZOOMS[j] - self.zoom))
@@ -2217,6 +2421,17 @@ class App:
                 dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(235, 235, 235), width=1)
                 dr.text((cx + r + 2, cy - 6), 'mod %+g/%+g' % (e['amount'], e['f5']), fill=(235, 235, 235))
         self.draw_slice(img)
+        if self.highlight is not None:           # Script tab: the event double-clicked
+            hr, hc, hrad, ht = self.highlight
+            if time.time() - ht > 6:
+                self.highlight = None
+            else:
+                y, x = self.cell_to_disp[hr, hc]
+                cx, cy, r = *self.to_px(y, x), max(6, (hrad + 0.5) * k)
+                d = ImageDraw.Draw(img)
+                d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 230, 0), width=2)
+                d.line([cx - 5, cy, cx + 5, cy], fill=(255, 230, 0), width=2)
+                d.line([cx, cy - 5, cx, cy + 5], fill=(255, 230, 0), width=2)
         if self.tool not in ('inspect', 'slice') and self.mouse is not None:
             y, x = self.mouse
             emitter = self.tool in EMITTER_TOOLS
@@ -2329,6 +2544,8 @@ class App:
         sig = tuple(id(getattr(self.src, k, None)) for k in ('sources', 'totems', 'other_modifiers'))
         if sig != getattr(self, '_drawn_sources', None):
             self._drawn_sources = sig
+            self.dirty = True
+        if self.highlight is not None:           # the Script tab's ring: redraw until it expires
             self.dirty = True
         if self.frame is not None and self.dirty:
             self.draw()

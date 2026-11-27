@@ -13,7 +13,8 @@ What is modelled:
 - effects: FluidGenerator (Type 1 changes generator #index, Type 0 spawns a new one; switches it on
   with the settings, moves it if a cell is given; after Duration >= 0 seconds switches it off), Tide
   (the border sea level cycle), Wave and Tsunami (edge profiles from the wave table, applied to the grid
-  with dustsim.apply_edges), Sequence; everything else is logged as an event only;
+  with dustsim.apply_edges), TerraForming (terrain brushes over time, tools/terraform.py: `brush_calls`
+  each tick), Sequence; everything else is logged as an event only;
 - generators: mode 0 off, 1/2 on, 3 sphere-power only (off here); a generator switched on fades in over
   100 ticks; stored height and height mode are carried for the bury rule (dustsim.bury_activity); a
   script move of a height-mode-0 generator resets its stored height to the ground there (if `ground`
@@ -40,8 +41,10 @@ _WAVE_TABLE = None
 
 def wave_table():
     """The 32 x 512 wave table (wave_A.tga in Wor_BD00993D.lin.bf; the only wave template, TemplateID 0):
-    value = grey / 255, rows = animation frames. Frame order assumed top row first (the TGA is stored
-    bottom-up; which way the engine reads it is not traced)."""
+    value = grey / 255, rows = animation frames in the TGA's stored order (it is stored bottom-up, so frame 0
+    is the image's bottom row). Checked against the running game on Story 1 (2026-11-27, compare mode
+    with the game's running waves): stored order gives edge-water differences of median 0.58 / max 1.05,
+    the image's top row first (used until then) median 9.1."""
     global _WAVE_TABLE
     if _WAVE_TABLE is None:
         import numpy as np
@@ -53,9 +56,23 @@ def wave_table():
             os.makedirs(os.path.dirname(p), exist_ok=True)
             open(p, 'wb').write(open(arc, 'rb').read()[e['offset']:e['offset'] + e['size']])
         b = open(p, 'rb').read()
-        px = np.frombuffer(b[18:18 + 512 * 32 * 4], np.uint8).reshape(32, 512, 4)[::-1, :, 2]
+        px = np.frombuffer(b[18:18 + 512 * 32 * 4], np.uint8).reshape(32, 512, 4)[:, :, 2]
         _WAVE_TABLE = px.astype(np.float32) / np.float32(255)
     return _WAVE_TABLE
+
+
+def add_wave_profile(profiles, side, amp, t, dur, tab=None):
+    """Add one wave / tsunami at time t of its duration dur to profiles {side: 512 floats} (dustai
+    0x10110E40 / 0x10110B40): phase = t / dur x 32, frame = min(int(phase), 30), buffer[j] += A x
+    lerp(row f, row f+1, phase - f)[j + 33] for j < 446."""
+    import numpy as np
+    tab = wave_table() if tab is None else tab
+    ph = t / dur * 32
+    f = min(int(ph), 30)
+    fr = np.float32(ph - f)
+    row = tab[f, 33:479] + (tab[f + 1, 33:479] - tab[f, 33:479]) * fr
+    buf = profiles.setdefault(side, np.zeros(512, np.float32))
+    buf[:446] += np.float32(amp) * row
 
 
 class Generator:
@@ -110,14 +127,16 @@ class LevelSchedule:
         self.time = 0.0
         self.active = []                                  # running effects: dict(effect, timer, target)
         self.events = []                                  # (time, text)
-        if border_level is None:                          # the map's border sea level (ground + water at (5, 5))
-            import numpy as np
-            lay = lambda k: np.frombuffer(u[0x80 + k * 0x100000:0x80 + (k + 1) * 0x100000], np.float32).reshape(512, 512)
-            border_level = float(lay(0)[5, 5] + lay(1)[5, 5])
-        self.border_level = border_level
+        import numpy as np                                # the level file's border sea level (ground + water at (5, 5))
+        lay = lambda k: np.frombuffer(u[0x80 + k * 0x100000:0x80 + (k + 1) * 0x100000], np.float32).reshape(512, 512)
+        self.level_border = float(lay(0)[5, 5] + lay(1)[5, 5])
+        self.border_level = self.level_border if border_level is None else border_level
         self.tide = None
         self.waves = []                                   # active Wave / Tsunami objects
         self.profiles = {}                                # this tick's edge profiles {side: 512 floats}
+        self.terraforms = []                              # running TerraForming effects (terraform.Terraform)
+        self.brush_calls = []                             # this tick's terrain brushes (terraform.BrushCall)
+        self.frame_clock = 0.0                            # the game's frame clock (brushes run per frame = per tick)
         self.lists = [self.root]
 
     # ---------------------------------------------------------------- conditions
@@ -203,6 +222,15 @@ class LevelSchedule:
             self.waves.append(dict(kind='tsunami', side=SIDE[e['direction']], amp=e['amplitude'], dur=e['duration'], t=0.0))
             self._log(ss.describe_effect(e, []))
             return
+        if name == 'TerraForming':
+            import terraform
+            tf = terraform.Terraform(e)
+            self.terraforms.append(tf)
+            f = tf.f
+            self._log('TerraForming at col %d row %d: brush %d %s %s, size %d -> %d over %gs, curve %d' % (
+                f['col'], f['row'], f['brush'], 'absolute' if f['mode'] else 'relative', 'add' if f['op'] else 'subtract',
+                f['start_size'], f['end_size'], f['duration'], f['curve']))
+            return
         self._log('%s (not simulated)' % ss.describe_effect(e, []))
 
     def _tick_effects(self, dt):
@@ -274,10 +302,97 @@ class LevelSchedule:
         self._tick_effects(dt)
         self._tick_tide(dt)
         self._tick_waves(dt)
+        self._tick_terraforms(dt)
         for g in list(self.gens.values()) + self.spawned:
             if g.on() and g.fade < FADE_TICKS:
                 g.fade += 1
         self.time += dt
+
+    def _tick_terraforms(self, dt):
+        """This tick's brush calls: one per running TerraForming effect for every game frame in the tick (the
+        brushes run per frame; the game steps the simulation once per frame, so at dt = terraform.FRAME this
+        is one call per effect per tick)."""
+        import terraform
+        self.brush_calls = []
+        self.frame_clock += dt
+        while self.frame_clock >= terraform.FRAME - 1e-9:    # (1e-9: no frame lost to rounding at dt = FRAME)
+            self.frame_clock -= terraform.FRAME
+            for tf in self.terraforms:
+                c = tf.frame(terraform.FRAME)
+                if c is not None:
+                    self.brush_calls.append(c)
+            self.terraforms = [tf for tf in self.terraforms if not tf.done]
+
+    # ---------------------------------------------------------------- resuming a player's save
+    def resume_from(self, save, ground=None):
+        """Continue the script from a player's save (path or unpacked bytes) instead of from 0 s. The save
+        holds the script with its runtime fields (level files have them empty): the level clock (root
+        _Timer), each Sequence's clock and playing flag, each rule's _State (0 waiting, 1 armed, 2 expired,
+        3 fired) and _VerificationTime (game time it fired), and each effect's _Timer (>= 0 while it runs).
+        Restored: clocks, playing flags, rule states, running TerraForming effects (part-way), running Waves /
+        Tsunamis, the Tide (fast-forwarded from its start). FluidGenerator effects are replayed in firing order
+        (the save has no generator list: a timed effect that has ended leaves its generator off, a running
+        one has it on). Returns the level time."""
+        import terraform
+        u = sav.read_sav(save)[1] if isinstance(save, str) else save
+        sroot = ss.find_root(u)
+        if sroot is None:
+            raise ValueError('no script in the save')
+        fired = []                                     # (verification time, effect) of fired rules' effects
+        self.lists = [self.root]
+
+        def load(lst, sdata):
+            lst.t = max(sdata['timer'], 0.0)
+            lst.playing = bool(sdata['playing']) or lst is self.root
+            if len(lst.rules) != len(sdata['rules']):
+                raise ValueError("the save's script does not match the level's")
+            for x, sr in zip(lst.rules, sdata['rules']):
+                x['state'] = sr['state'] if sr['state'] in (0, 1, 2, 3) else 0
+                x['conds'] = [self._cond_start(c) for c in x['r']['conditions']] if x['state'] == 1 else None
+                if x['state'] != 3:
+                    continue
+                for e in sr['effects']:
+                    fired.append((sr['verification_time'], e))
+                    if e['name'] == 'Sequence' and e['playing']:
+                        sub = RuleList(e, playing=True)
+                        load(sub, e)
+                        self.lists.append(sub)
+        load(self.root, sroot)
+        self.time = max(sroot['timer'], 0.0)
+        running = lambda e: e.get('timer', -1) >= 0 and (e.get('duration', -1) < 0 or e['timer'] < e['duration'])
+        for vt, e in sorted(fired, key=lambda x: x[0]):
+            name, timer = e['name'], e.get('timer', -1)
+            if name == 'FluidGenerator':
+                g = self._target(e)
+                if g is None:
+                    continue
+                if running(e):
+                    self._start_effect(e, ground)
+                    if self.active and self.active[-1]['e'] is e:
+                        self.active[-1]['timer'] = timer
+                    g.fade = FADE_TICKS
+                elif e['duration'] >= 0:
+                    g.mode = 0
+            elif not running(e):
+                continue
+            elif name == 'TerraForming':
+                tf = terraform.Terraform(e)
+                tf.elapsed = timer
+                self.terraforms.append(tf)
+            elif name in ('Wave', 'Tsunami', 'RandomTsunami'):
+                self._start_effect(e, ground)
+                w = self.waves[-1] if self.waves else None
+                if w is not None:
+                    w['age'] = timer
+                    w['t'] = timer % w['dur'] if (w['kind'] == 'wave' and w['cycle']) else timer
+            elif name == 'Tide':
+                self.border_level = self.level_border     # the tide cycles about the level's own sea level
+                self._start_effect(e, ground)
+                for _ in range(int(timer * 31)):
+                    self._tick_tide(1 / 31)
+        self._log('script resumed from the save at %.0f s (%d sequences running, %d terraforming effects running)'
+                  % (self.time, len(self.lists) - 1, len(self.terraforms)))
+        return self.time
 
     def write_back(self, sources):
         """Copy what the model changed (stored height lowered by erosion) back into the generators."""
@@ -309,12 +424,7 @@ class LevelSchedule:
             elif w['t'] >= w['dur']:
                 self._log('tsunami on edge %d ended' % w['side'])
                 continue
-            ph = w['t'] / w['dur'] * 32
-            f = min(int(ph), 30)
-            fr = np.float32(ph - f)
-            row = tab[f, 33:479] + (tab[f + 1, 33:479] - tab[f, 33:479]) * fr
-            buf = self.profiles.setdefault(w['side'], np.zeros(512, np.float32))
-            buf[:446] += np.float32(w['amp']) * row
+            add_wave_profile(self.profiles, w['side'], w['amp'], w['t'], w['dur'], tab)
             w['t'] += dt
             keep.append(w)
         self.waves = keep

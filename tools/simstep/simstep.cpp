@@ -73,12 +73,17 @@ static int runJob(JobFn fn, const void *param, void *scratch) {
 // u32 modifier RVA, 12 bytes padding, the 0x50-byte block; the block's grid pointer is filled in here).
 // Each stdin line "run <job> <steps>" runs that many steps of the job on the grid in place (rows the step
 // skips keep their values); "mods <n>" applies the first n modifier records to the grid in order (needs
-// the modifier dll). Answers "ok" (or "err ...") on stdout; "quit" or end of input exits. Used by
-// galileo.Resident (DustView's model: the game's own water, modifier and vegetation steps).
+// the modifier dll); "brush <tex_log2> <x> <y> <size> <effect> <dir_x> <dir_y> <strength> <min> <max>" runs
+// the terrain brush (job 14 CallbackUpdateTexture, as brushstep.cpp) once on the grid with the brush
+// texture (mip chain, 4 bytes per texel) at SERVE_TEX_OFS. Answers "ok" (or "err ...") on stdout; "quit"
+// or end of input exits. Used by galileo.Resident (DustView's model: the game's own water, modifier,
+// vegetation and terrain-brush steps).
 static const size_t SERVE_GRID_OFS = 0x1000;
 static const size_t SERVE_MOD_OFS = SERVE_GRID_OFS + GRID_BYTES;
 static const size_t SERVE_MOD_SIZE = 0x60;
 static const int SERVE_MAX_MODS = 4096;
+static const size_t SERVE_TEX_OFS = SERVE_MOD_OFS + SERVE_MAX_MODS * SERVE_MOD_SIZE;   // with the modifier dll
+static const size_t SERVE_TEX_BYTES = 0x10000;
 
 static int serve(const char *dllPath, const char *mapName, const char *modDllPath) {
     HMODULE dll = LoadLibraryA(dllPath);
@@ -88,7 +93,7 @@ static int serve(const char *dllPath, const char *mapName, const char *modDllPat
     JobQuery stackSize = (JobQuery)GetProcAddress(dll, "sStackSizeJob");
     HANDLE h = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, mapName);
     if (!codeAddr || !stackSize || !h) { printf("err setup %lu\n", GetLastError()); return 1; }
-    size_t viewBytes = SERVE_GRID_OFS + GRID_BYTES + (modDllPath ? SERVE_MAX_MODS * SERVE_MOD_SIZE : 0);
+    size_t viewBytes = SERVE_GRID_OFS + GRID_BYTES + (modDllPath ? SERVE_MAX_MODS * SERVE_MOD_SIZE + SERVE_TEX_BYTES : 0);
     unsigned char *view = (unsigned char *)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, viewBytes);
     if (!view) { printf("err map %lu\n", GetLastError()); return 1; }
     unsigned char *param = (unsigned char *)_aligned_malloc(0x360, 64);
@@ -112,6 +117,32 @@ static int serve(const char *dllPath, const char *mapName, const char *modDllPat
                 *(unsigned char **)(block + 0x08) = view + SERVE_GRID_OFS;
                 ex = runMod((ModFn)((unsigned char *)modDll + rva), block, rva == 0xF800);
             }
+            if (ex) printf("err exception 0x%08X\n", ex); else printf("ok\n");
+            fflush(stdout);
+            continue;
+        }
+        if (strncmp(line, "brush ", 6) == 0) {
+            unsigned int lg, x, y, size, effect, lo, hi;
+            float dx, dy, strength;
+            if (!modDll || sscanf(line + 6, "%u %u %u %u %u %f %f %f %u %u", &lg, &x, &y, &size, &effect, &dx, &dy,
+                                  &strength, &lo, &hi) != 10) {
+                printf("err bad brush\n"); fflush(stdout); continue;
+            }
+            JobFn fn = (JobFn)codeAddr(14);
+            unsigned long need = stackSize(14);
+            if (!fn) { printf("err no job\n"); fflush(stdout); continue; }
+            if (need + 64 > scratchCap) { _aligned_free(scratch); scratchCap = need + 64; scratch = _aligned_malloc(scratchCap, 64); }
+            unsigned int *pu = (unsigned int *)param;           // UpdateTextureParam (0x40 bytes, see brushstep.cpp)
+            float *pf = (float *)param;
+            memset(param, 0, 0x40);
+            pu[0] = x; pu[1] = y; pu[2] = size; pu[3] = effect;
+            pf[4] = dx; pf[5] = dy; pf[6] = strength;
+            *(unsigned char **)(param + 0x20) = view + SERVE_GRID_OFS;
+            *(unsigned char **)(param + 0x24) = view + SERVE_TEX_OFS;
+            pu[10] = lg;
+            pu[12] = pu[14] = lo; pu[13] = pu[15] = hi;
+            memset(scratch, 0, need);
+            int ex = runJob(fn, param, scratch);
             if (ex) printf("err exception 0x%08X\n", ex); else printf("ok\n");
             fflush(stdout);
             continue;

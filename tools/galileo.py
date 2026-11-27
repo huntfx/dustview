@@ -239,11 +239,13 @@ class Resident:
     GRID_OFS = 0x1000
     MOD_OFS = GRID_OFS + N * N * 32              # modifier records (simstep.cpp serve(): 0x60 bytes each)
     MOD_SIZE, MAX_MODS = 0x60, 4096
+    TEX_OFS = MOD_OFS + MAX_MODS * MOD_SIZE      # terrain brush texture (simstep.cpp SERVE_TEX_OFS)
+    TEX_BYTES = 0x10000
 
     def __init__(self, param_bytes=None):
         import mmap, threading
         self.name = 'DustSimstep_%d_%d' % (os.getpid(), id(self))
-        self.mm = mmap.mmap(-1, self.MOD_OFS + self.MAX_MODS * self.MOD_SIZE, tagname=self.name)
+        self.mm = mmap.mmap(-1, self.TEX_OFS + self.TEX_BYTES, tagname=self.name)
         self.cells = np.frombuffer(self.mm, np.uint32, N * N * 8, self.GRID_OFS).reshape(N, N // 16, 8, 16)
         if param_bytes is not None:
             self.set_params(param_bytes)
@@ -285,6 +287,20 @@ class Resident:
 
     def run(self, job, steps=1):
         self._command('run %d %d' % (job, steps))
+
+    _brush_tex = None
+
+    def brush(self, texture, tex_log2, x, y, size, effect, dir_x, dir_y, strength, lo=32, hi=480):
+        """Run the game's terrain brush (job 14 CallbackUpdateTexture) once on the shared grid. texture: the
+        brush's mip chain as bytes (terraform.brush_texture), 4 bytes per texel; effect: kBrushParamEffect_*
+        (1/2 hard relative add/sub ...); lo / hi: the game's MinMax (32, 480)."""
+        if texture is not self._brush_tex:
+            if len(texture) > self.TEX_BYTES:
+                raise ValueError('brush texture too large')
+            self.mm[self.TEX_OFS:self.TEX_OFS + len(texture)] = texture
+            self._brush_tex = texture
+        self._command('brush %d %d %d %d %d %.9g %.9g %.9g %d %d' % (tex_log2, x, y, size, effect, dir_x, dir_y,
+                                                                      strength, lo, hi))
 
     def _command(self, cmd):
         self.p.stdin.write(cmd + '\n')

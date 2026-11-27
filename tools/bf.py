@@ -13,6 +13,7 @@ Layout (from the community bftool, github.com/DrChat/FromDustHook, checked again
         +0   name[64]  (NUL-terminated, rest 0x7F)
         +84  i32 id    (starts at -1)
         +88  u32 size  (whole entry, incl. its 32-byte inner header)
+        +100 u32 key   (global entry key, e.g. 0x66000356; references between entries use it)
         +108 u32 offset (from start of archive)
   Entry data is not compressed. Most entries start with a 32-byte header
   (u32 size-after-header, ..., ext[4] at +20); .bik/.tga do not.
@@ -37,7 +38,8 @@ def read_index(path):
         name = r[:64].split(b'\0')[0].decode('latin-1')
         fid, size = struct.unpack_from('<iI', r, 84)
         off = struct.unpack_from('<I', r, 108)[0]
-        out.append({'name': name, 'id': fid, 'size': size, 'offset': off})
+        key = struct.unpack_from('<I', r, 100)[0]   # entry key; other entries refer to it (e.g. 0x66000356)
+        out.append({'name': name, 'id': fid, 'size': size, 'offset': off, 'key': key})
     return out
 
 
