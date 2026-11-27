@@ -792,6 +792,8 @@ class ModelSource(Source):
                     self.P['BorderWaterSurfaceHeight'] = sch.border_level   # tide (kept as it was while off)
             srcs, off = self._compose(level)         # minus removed / switched-off ones, plus placed ones
             G = self._fluid_tick(srcs)
+            if self.fire_trees and (self._burst_queue or any(t.get('burst') for t in self.fire_trees)):
+                self._tree_bursts()                  # fire trees ending their burning phase light their neighbours
             if sch is not None and sch.brush_calls and TERRAFORM_STEP != 'off':
                 self._terraform(G, sch.brush_calls)
             if sch is not None:
@@ -1022,6 +1024,27 @@ class ModelSource(Source):
             print('vegetation step off:', e, flush=True)
             self.helper_failed = True
             return None
+
+    _burst_queue = ()                            # [(ticks left, col, row)]: fire-tree bursts waiting to be applied
+    BURST_DELAY = 2                              # the game lights the cells 2 ticks after the tree's burst (edit list)
+
+    def _tree_bursts(self):
+        """Fire trees whose burning phase ended set their 8 neighbours alight (dustsim.tree_fire_burst), BURST_DELAY
+        ticks later as in the game (checked live 2026-11-27: model = game exactly with the delay, fire times +2
+        without it), in copies of the vegetation layers (published frames keep the old ones), before the fire step."""
+        import vegsim
+        q = [(k - 1, c, r) for k, c, r in self._burst_queue]
+        q += [(self.BURST_DELAY - 1, t['col'], t['row']) for t in self.fire_trees if t.get('burst')]
+        due = [(c, r) for k, c, r in q if k < 0]
+        self._burst_queue = [x for x in q if x[0] >= 0]
+        if not due:
+            return
+        block = vegsim.ganja_block(vegsim.level_set(getattr(self, 'level_name', '') or ''))
+        ex = self.extra.copy()
+        for c, r in due:
+            dustsim.tree_fire_burst(ex[6], ex[7], c, r, block)
+        with self.lock:
+            self.extra = ex
 
     _veg_consts = None                           # (level name, ganja block, propagate table) for the model step
 

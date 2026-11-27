@@ -211,7 +211,8 @@ FIRE_TREE_STATES = {0x1015D9DC: 3, 0x1015D34C: 1}  # state object vtable -> stat
 
 
 def fire_trees(p, delta=None):
-    """Live fire trees (decoded 2026-11-27 from dustai 0x10083540 / 0x10082E80, checked against the per-tick list):
+    """Live fire trees (class DustAi::Pyrix: +0x360 m_burningStatePeriod, +0x364 m_burningStateDuration, +0x368
+    m_waterEvaporationRadius, +0x36C m_waterEvaporationSpeed; state 1 = SEED, 3 = burning cycle) (decoded 2026-11-27 from dustai 0x10083540 / 0x10082E80, checked against the per-tick list):
     grid cell +0x144 / +0x148 (u32), +0x360 idle time (s, 40), +0x364 active time (s, 20), +0x368 size (= radius of
     the RemoveWater disc, 10), +0x36C rate (water per second per cell, 5), +0x440 = 1 while active and some cell within
     int(size x 2/3) holds > 0.1 water; state object at +0x2A0 (its +8 = the tree's clock in s, +0x14 = when the next

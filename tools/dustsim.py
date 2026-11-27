@@ -383,12 +383,12 @@ def fire_tree_entries(trees, dt=1 / 31):
     clock, next) by dt seconds and return this tick's per-tick-list entries, as dustai 0x10083540 does per frame:
     clock += dt; before `next`: idle; for `active_time` s from `next`: push RemoveWater (type 4) on the disc of
     radius `size` with amount -rate x dt; then set the 8 neighbouring cells' plants alight (0x10082DD0 ->
-    0x10141550, not modelled: sets 'ignite' on the tree) and `next` = clock + idle. Only state 3 trees cycle.
+    0x10141550: sets 'burst' on the tree for this tick, see tree_fire_burst) and `next` = clock + idle. Only state 3 trees cycle.
     dt = 1/31: the game's amount is rate x frame time (0.166 in a 1/30 s frame) and its clock runs on the
     same frame time; the model's tick stands for 1/31 s like the level script."""
     out = []
     for t in trees:
-        t['active'] = False
+        t['active'] = t['burst'] = False
         if t.get('state') != 3:
             continue
         t['clock'] += dt
@@ -399,9 +399,34 @@ def fire_tree_entries(trees, dt=1 / 31):
             out.append(dict(type=4, col=float(t['col']), row=float(t['row']), radius=float(t['size']), f3=0.0,
                             amount=-t['rate'] * dt, f5=0.0, sediment=0.0, temperature=0.0))
         else:
-            t['ignite'] = t.get('ignite', 0) + 1
+            t['burst'] = True                    # tree_fire_burst lights its 8 neighbours this tick
             t['next'] = t['clock'] + t['idle']
     return out
+
+
+TREE_FIRE_BASE = 16 + 1     # value added to FireIgnition: [[[0x1017989C]+0x20]+0x5C] (16 on Map 6, constant) + 1
+
+
+def tree_fire_burst(c6, c7, col, row, block):
+    """A fire tree's burst at the end of its burning phase (dustai 0x10082DD0 -> 0x10141550), on the vegetation
+    components c6 / c7 in place: each of the 8 neighbouring cells (inside cells 33..478) holding a plant of type t
+    is queued as a vegetation edit (col, row, FireIgnition[t] + 17), and the game applies that as fire flag set
+    (component 6 bit 6) and fire time = that value (component 7 bits 16-31), seen live 2026-11-27 on Map 6 (type 1:
+    57, then the normal fire step; types 2 / 6, FireIgnition 4800: 4817, burned at once). block = the 512-byte
+    per-type vegetation table (vegsim.ganja_block; FireIgnition low bytes at +0x00, high bytes at +0x10).
+    Returns the number of cells lit."""
+    n = 0
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            c, r = int(col) + dc, int(row) + dr
+            if (dc or dr) and 33 <= c < 479 and 33 <= r < 479:
+                t = int(c6[r, c]) & 15
+                if t:
+                    v = (block[t] | block[0x10 + t] << 8) + TREE_FIRE_BASE
+                    c6[r, c] = np.uint32(int(c6[r, c]) | 0x40)
+                    c7[r, c] = np.uint32((int(c7[r, c]) & 0xFFFF) | (min(v, 0xFFFF) << 16))
+                    n += 1
+    return n
 
 
 def typed_fluid_args(e):
