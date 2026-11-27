@@ -240,6 +240,59 @@ def fire_trees(p, delta=None):
     return out
 
 
+# ---------------------------------------------------------------- water trees
+WATER_TREE_VTABLES = (0x1015D420, 0x1015D414)    # +0, +4 of DustAi::Figuier (0x3D8 bytes, constructor 0x10081790)
+WATER_TREE_FIELDS = ('max_quantity', 'generation_speed', 'absorption_radius', 'absorption_cell_min', 'absorption_speed',
+                     'absorption_factor', 'rejection_radius', 'rejection_speed', 'quantity_to_blow_up',
+                     'blow_up_rejection_speed', 'danger_radius')   # +0x360 .. +0x388 (m_water... names, dustai 0x10081C8E)
+WATER_TREE_STATE_VTABLES = {0x1015D780: 'absorbing', 0x1015D7A0: 'blow_up'}  # state objects at +0x3B4 / +0x3C8
+TREE_STATE_VTABLES = {0x1015D34C: 'seed', 0x1015D260: 'growing'}   # DustTree states 1 (SEED) and 2 (growing, 15 s)
+TREE_SETTINGS = (('time_to_activate_seed', 0x228, 'f'), ('time_to_grow_tree', 0x22C, 'f'),
+                 ('explosion_duration', 0x288, 'f'), ('nb_seeds', 0x210, 'i'), ('nb_seeds_random', 0x214, 'i'),
+                 ('diffusion_radius_min', 0x21C, 'f'), ('diffusion_radius_max', 0x220, 'f'),
+                 ('water_threshold_max', 0xFC, 'f'))   # DustTree / DustEntity fields (dustai 0x1007F9A0 / 0x10064940)
+
+
+def water_trees(p, delta=None):
+    """Live water trees (class DustAi::Figuier, decoded 2026-11-27, findings/water-lava-sim.md "Water trees"):
+    grid cell +0x144 / +0x148, class settings +0x360..+0x388 (WATER_TREE_FIELDS), +0x39C water stored, +0x3D4 bits
+    (0 danger: pours instead of drinking, 1 absorbed this frame, 2 store ran out while pouring, 3 generated).
+    The current state is the state object that the tree's +0x2A0 points at (absorbing / blow_up / other)."""
+    delta = dustai_delta(p) if delta is None else delta
+    out = []
+    for a in p.find(struct.pack('<2I', WATER_TREE_VTABLES[0] + delta, WATER_TREE_VTABLES[1] + delta)):
+        raw = p.read(a, 0x3D8)
+        if raw is None:
+            continue
+        col, row = struct.unpack_from('<2I', raw, 0x144)
+        hid = struct.unpack_from('<I', raw, 0x54)[0]
+        if hid >= 0xFFFFFFF0 or not (0 < col < 512 and 0 < row < 512):
+            continue
+        d = dict(address=hex(a), id='%X' % hid, col=col, row=row)
+        d.update(zip(WATER_TREE_FIELDS, struct.unpack_from('<11f', raw, 0x360)))
+        d['stored'] = struct.unpack_from('<f', raw, 0x39C)[0]
+        bits = struct.unpack_from('<I', raw, 0x3D4)[0]
+        d.update(bits=bits, danger=bool(bits & 1))
+        sub = struct.unpack_from('<I', raw, 0x2A0)[0]
+        st = 'none'
+        if sub == a + 0x3B4:
+            st = 'absorbing'
+        elif sub == a + 0x3C8:
+            st = 'blow_up'
+        elif sub:
+            s = p.read(sub, 0x18)
+            vt = struct.unpack_from('<I', s, 0)[0] - delta if s else None
+            st = TREE_STATE_VTABLES.get(vt, 'other vtable %X' % vt if s else '?')
+            if s:
+                d['state_clock'] = d['clock'] = struct.unpack_from('<f', s, 8)[0]
+        for name, off, f in TREE_SETTINGS:
+            d[name] = struct.unpack_from('<' + f, raw, off)[0]
+        d['state'] = st
+        d['danger_cell'] = struct.unpack_from('<2i', raw, 0x3AC)
+        out.append(d)
+    return out
+
+
 # ---------------------------------------------------------------- village repel songs
 SONG_VTABLES = {'water': 0x1016C1CC, 'lava': 0x1016C214}     # dustai objects for entities 0x20400009 / 0x2040000A
 

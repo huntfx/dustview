@@ -404,7 +404,137 @@ def fire_tree_entries(trees, dt=1 / 31):
     return out
 
 
-TREE_FIRE_BASE = 16 + 1     # value added to FireIgnition: [[[0x1017989C]+0x20]+0x5C] (16 on Map 6, constant) + 1
+WATER_TREE_BLOW_UP_TIME = 5.0   # s in the blow-up state (DustTree +0x288, read live 2026-11-27)
+
+
+def _tree_burning(f):
+    """dustai 0x10082FF0: a fire tree counts as danger while in state 3 with its clock past `next`."""
+    return f.get('state') == 3 and f['clock'] > f['next']
+
+
+def water_tree_step(G, trees, fire_trees=(), dt=1 / 31, rng=None):
+    """One frame of every water tree (DustAi::Figuier; dicts from live_generators.water_trees or
+    sav_sources.water_trees), decoded 2026-11-27 (findings/water-lava-sim.md "Water trees"). Absorption is applied
+    to G in place (dustai writes it straight into the grid, 0x100DA3C0); returns this frame's pour entries
+    (type 0 fluid modifiers, like a spring) for apply_modifiers.
+    Absorbing state (0x10082720): danger (a burning fire tree within danger_radius; the game's second sensor,
+    presumably lava, is not modelled) -> pour rejection_speed x dt; else store += generation_speed x dt (capped at
+    max_quantity), absorb, and switch to blow_up once store > quantity_to_blow_up. Blow-up state: pour
+    blow_up_rejection_speed x dt for explosion_duration (5 s), then the tree is removed from `trees` and its seeds
+    added (0x1007F4F0: nb_seeds + random 0..nb_seeds_random, each at a random angle and a random distance
+    diffusion_radius_min..max world units = x 2/3 cells; seen live: one seed 2-3 cells away).
+    Seed (state 1, 0x10081060): roots once its clock reaches time_to_activate_seed (10 s) and its cell passes the
+    game's cell test (0x1007EE60: no lava, |fluid| <= water_threshold_max). APPROXIMATE: the game also needs the
+    seed to have come to rest and buried itself (drift physics and the shared bury rule not modelled, seeds stay
+    put) and has exclusion / entity checks not read, so a seed that stays a seed in the game (e.g. Waves 155840FC)
+    roots here. Growing (state 2, 0x10080990): time_to_grow_tree (15 s), then absorbing with an empty store.
+    Trees are mutated in place; rng (numpy Generator) picks the seed positions."""
+    out = []
+    W, sed = G['W'], G['sed']
+    rng = rng if rng is not None else np.random.default_rng()
+    born, dead = [], []
+    for t in trees:
+        t['poured'] = t['absorbed'] = 0.0
+        st = t.get('state')
+        if st == 'seed':
+            t['clock'] = t.get('clock', 0.0) + dt
+            if t['clock'] >= t.get('time_to_activate_seed', 10.0) and _water_tree_cell_ok(W, t):
+                t['state'], t['clock'] = 'growing', 0.0
+            continue
+        if st == 'growing':
+            t['clock'] = t.get('clock', 0.0) + dt
+            if t['clock'] >= t.get('time_to_grow_tree', 15.0):
+                t['state'], t['stored'], t['danger'] = 'absorbing', 0.0, False
+            continue
+        if st == 'blow_up':
+            t['blow_clock'] = t.get('blow_clock', 0.0) + dt
+            out += _water_tree_pour(t, t['blow_up_rejection_speed'], dt)
+            if t['blow_clock'] >= t.get('explosion_duration', WATER_TREE_BLOW_UP_TIME):
+                dead.append(t)
+                born += _water_tree_seeds(t, rng)
+            continue
+        if st != 'absorbing':
+            continue
+        r2 = t['danger_radius'] ** 2
+        t['danger'] = any(_tree_burning(f) and (f['col'] - t['col']) ** 2 + (f['row'] - t['row']) ** 2 <= r2
+                          for f in fire_trees)
+        if t['danger']:
+            out += _water_tree_pour(t, t['rejection_speed'], dt)
+            continue
+        room = max(t['max_quantity'] - t['stored'], 0.0)
+        t['stored'] += min(t['generation_speed'] * dt, room)
+        t['absorbed'] = _water_tree_absorb(W, sed, t)
+        t['stored'] += t['absorbed']
+        if t['stored'] > t['quantity_to_blow_up']:
+            t['state'], t['blow_clock'] = 'blow_up', 0.0
+    for t in dead:
+        trees.remove(t)
+    trees.extend(born)
+    return out
+
+
+def _water_tree_cell_ok(W, t):
+    """The rooting cell test (dustai 0x1007EE60) as it applies to water trees: no lava on the cell and |fluid| <=
+    water_threshold_max (20); height limits 0..255 and ground type 'any' always pass."""
+    f = float(W[int(t['row']), int(t['col'])])
+    return f >= 0 and abs(f) <= t.get('water_threshold_max', 20.0)
+
+
+def _water_tree_seeds(t, rng):
+    """Seeds a blown-up tree leaves (dustai 0x1007F4F0 with argument 0): nb_seeds + random 0..nb_seeds_random, each
+    at a random angle and distance diffusion_radius_min..max world units (2/3 cell per unit) from the tree."""
+    n = int(t.get('nb_seeds', 1)) + int(rng.integers(0, int(t.get('nb_seeds_random', 0)) + 1))
+    out = []
+    for k in range(n):
+        a = rng.uniform(0, 2 * np.pi)
+        d = rng.uniform(t.get('diffusion_radius_min', 3.0), t.get('diffusion_radius_max', 4.0)) * 2 / 3
+        c = int(min(max(t['col'] + d * np.cos(a), 33), 478))
+        r = int(min(max(t['row'] + d * np.sin(a), 33), 478))
+        s = {k2: v for k2, v in t.items() if k2 not in ('address', 'blow_clock', 'danger_cell', 'bits', 'state_clock')}
+        s.update(id='%s.s%d' % (t['id'], k), col=c, row=r, state='seed', clock=0.0, stored=0.0, danger=False,
+                 poured=0.0, absorbed=0.0)
+        out.append(s)
+    return out
+
+
+def _water_tree_absorb(W, sed, t):
+    """dustai 0x100DA3C0 for one tree, on W / sed in place; returns the amount credited to the tree."""
+    R = float(t['absorption_radius'])
+    r = int(R * 2 / 3)
+    c0, r0 = int(t['col']), int(t['row'])
+    rows = np.arange(max(r0 - r, 33), min(r0 + r, 478) + 1)
+    cols = np.arange(max(c0 - r, 33), min(c0 + r, 478) + 1)
+    if not len(rows) or not len(cols):
+        return 0.0
+    w = W[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    s = sed[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    d2 = ((rows[:, None] - r0) ** 2 + (cols[None, :] - c0) ** 2).astype(np.float32)
+    weight = np.float32(1) - np.minimum(d2 * np.float32(1 / (R * R)), np.float32(1))
+    cap = np.float32(t['absorption_speed'] / (2 * r) ** 2)
+    wet = w > 0
+    take = np.minimum(np.maximum(w - np.float32(t['absorption_cell_min']), 0), cap) * weight
+    take = np.where(wet, take, np.float32(0)).astype(np.float32)
+    frac = np.where(wet, take / np.where(wet, w, 1), 0).astype(np.float32)
+    w -= take
+    s *= np.float32(1) - frac
+    return float(take.sum(dtype=np.float64)) * t['absorption_factor']
+
+
+def _water_tree_pour(t, speed, dt):
+    """dustai 0x10081930: pour min(speed x dt, store) as a type-0 fluid modifier of radius rejection_radius,
+    spread as amount / (pi x trunc(2R/3)^2) per cell."""
+    amount = min(speed * dt, t['stored'])
+    t['stored'] -= amount
+    t['poured'] = amount
+    R = float(t['rejection_radius'])
+    area = np.pi * int(R * 2 / 3) ** 2
+    if amount <= 0 or area <= 0:
+        return []
+    return [dict(type=0, col=float(t['col']), row=float(t['row']), radius=R, f3=0.0, amount=amount / area,
+                 f5=0.0, sediment=0.0, temperature=0.0)]
+
+
+TREE_FIRE_BASE = 16 + 1    # value added to FireIgnition: [[[0x1017989C]+0x20]+0x5C] (16 on Map 6, constant) + 1
 
 
 def tree_fire_burst(c6, c7, col, row, block):

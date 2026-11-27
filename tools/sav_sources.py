@@ -210,6 +210,41 @@ def fire_trees(u):
     return out
 
 
+WATER_TREE_TAG = b'\x28\x00\x00\x03'
+# class settings (live, Story 7 Waves, 2026-11-27; not in the save records), names as live_generators.WATER_TREE_FIELDS
+WATER_TREE_SETTINGS = dict(max_quantity=1500.0, generation_speed=5.0, absorption_radius=10.0, absorption_cell_min=0.5,
+                           absorption_speed=40.0, absorption_factor=0.9, rejection_radius=5.0, rejection_speed=200.0,
+                           quantity_to_blow_up=2000.0, blow_up_rejection_speed=300.0, danger_radius=15.0,
+                           # DustTree / DustEntity settings (BinPC/Wor_15104E37.lin.bf FiguierBarrique_0.ai, 2026-11-27)
+                           time_to_activate_seed=10.0, time_to_grow_tree=15.0, explosion_duration=5.0, nb_seeds=1,
+                           nb_seeds_random=0, diffusion_radius_min=3.0, diffusion_radius_max=4.0,
+                           water_threshold_max=20.0)
+
+
+def water_trees(u):
+    """Water trees (DustAi::Figuier) in a save or level file, decoded 2026-11-27 from profile_01 MAP_06.SAV
+    against the same 25 trees in the running game (same handles, cells, stores). Entity type 0x28000003, preceded
+    by the record sizes (0x108 / 0xFC rooted, 0x17C / 0x170 seed). Same header as fire_trees: +0x10 handle,
+    +0x28 world position, +0xD4 state (3 = rooted, absorbing; 1 = seed), +0xD8 clock (s); rooted: +0xE8 the
+    water stored in the tree (live +0x39C). Class settings are not saved (WATER_TREE_SETTINGS, the same values
+    as FiguierBarrique_0.ai and the running game)."""
+    out = []
+    i = u.find(WATER_TREE_TAG)
+    while i >= 0:
+        sizes = (u32(u, i - 0x10), u32(u, i - 8)) if i >= 0x10 else None
+        if sizes in ((0x108, 0xFC), (0x17C, 0x170)):
+            x, y, z = f32(u, i + 0x28), f32(u, i + 0x2C), f32(u, i + 0x30)
+            state = u32(u, i + 0xD4)
+            t = dict(id=handle_id(u32(u, i + 0x10), u32(u, i + 0x14), u32(u, i + 0x18)),
+                     col=int(256 + 2 * x / 3), row=int(256 + 2 * y / 3), x=x, y=y, z=z,
+                     state='absorbing' if state == 3 else 'seed' if state == 1 else str(state),
+                     clock=f32(u, i + 0xD8), stored=f32(u, i + 0xE8) if sizes[0] == 0x108 else 0.0, danger=False)
+            t.update(WATER_TREE_SETTINGS)
+            out.append(t)
+        i = u.find(WATER_TREE_TAG, i + 1)
+    return out
+
+
 def _entry_start(u, tag):
     """Offsets just after each entry tag (the handle block follows)."""
     return [m.start() + 4 for m in re.finditer(re.escape(struct.pack('>I', tag)), u)]

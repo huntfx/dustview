@@ -521,6 +521,10 @@ class LiveGame(Source):
                     self.fire_trees = live_generators.fire_trees(self.p, delta)
                 except Exception:
                     pass
+                try:                                     # water trees (DustAi::Figuier): objects, state, store
+                    self.water_trees = live_generators.water_trees(self.p, delta)
+                except Exception:
+                    pass
                 if getattr(self, 'vec', None) is None:
                     self.source_note = 'looking for the source list...'
                     self.vec = live_generators.known_modifier_list(self.p)        # remembered address first
@@ -718,8 +722,9 @@ class ModelSource(Source):
     name = 'python model'
 
     def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None, totems=None,
-                 fire_trees=None):
+                 fire_trees=None, water_trees=None):
         self.fire_trees = [dict(t) for t in fire_trees] if fire_trees else []   # dustsim.fire_tree_entries
+        self.water_trees = [dict(t) for t in water_trees] if water_trees else []   # dustsim.water_tree_step
         self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(params, np.float32))}
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
@@ -909,6 +914,11 @@ class ModelSource(Source):
             if mods != 'off' and trees:
                 dustsim.apply_modifiers(G, trees, self.P)
                 self._helper_holds = None        # G changed after the helper's copy
+        if self.water_trees and mods != 'off':   # water trees: absorption straight into the grid, pours as springs
+            pours = dustsim.water_tree_step(G, self.water_trees, self.fire_trees, 1 / self.GAME_RATE)
+            if pours:
+                dustsim.apply_modifiers(G, pours, self.P)
+            self._helper_holds = None
         return G
 
     def _game_modifiers(self, G, srcs, reps):
@@ -1520,9 +1530,10 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
         print('villages and songs from', path, flush=True)
     label = name + ((' from %s (script %s)' % (os.path.basename(grid_path), 'resumed at %.0f s' % resumed
                                                if resumed is not None else 'restarted')) if grid_path else '')
-    trees = sav_sources.fire_trees(sav.read_sav(grid_path)[1] if grid_path else u)   # Map 6: player-planted fire trees
+    tu = sav.read_sav(grid_path)[1] if grid_path else u
+    trees = sav_sources.fire_trees(tu)                    # Map 6: player-planted fire trees
     ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, label, schedule=sch,
-                     totems=list(tot.values()), fire_trees=trees)
+                     totems=list(tot.values()), fire_trees=trees, water_trees=sav_sources.water_trees(tu))
     ms.progress_note = note
     ms.level_name = name
     if villages is not None:                     # an explicit --villages schedule overrides the totem count
@@ -2335,8 +2346,15 @@ class App:
                 trees = live_generators.fire_trees(self.src.p)
             except Exception:
                 pass
+        wtrees = getattr(self.src, 'water_trees', None)
+        if getattr(self.src, 'p', None) is not None:     # fresh: stores change every frame
+            try:
+                wtrees = live_generators.water_trees(self.src.p)
+            except Exception:
+                pass
         self.src = ModelSource(fr.grid, fr.params, self.current_sources(), fr.tick, 'from live tick %d' % fr.tick,
-                               live_repulsors(self.src), totems=getattr(self.src, 'totems', None), fire_trees=trees)
+                               live_repulsors(self.src), totems=getattr(self.src, 'totems', None), fire_trees=trees,
+                               water_trees=wtrees)
         self.dirty = True
 
     def on_move(self, e):
@@ -2582,6 +2600,24 @@ class App:
                 if t.get('active'):
                     rr = t['size'] * k
                     dr.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=colour, width=1)
+        wtrees = getattr(self.src, 'water_trees', None) if self.overlay else None
+        if wtrees:                               # water trees: blue circle, filled by the store (of quantity_to_blow_up);
+            dr = ImageDraw.Draw(img)             # orange outline = danger (pouring), white = blowing up, grey = seed / spent
+            for t in list(wtrees):
+                y, x = self.cell_to_disp[int(t['row']), int(t['col'])]
+                cx, cy = self.to_px(y, x)
+                r = 3 * self.scale
+                st = t.get('state')
+                colour = ((130, 130, 130) if st not in ('absorbing', 'blow_up') else (255, 255, 255) if st == 'blow_up'
+                          else (255, 150, 40) if t.get('danger') else (60, 150, 255))
+                full = max(0.0, min(1.0, t.get('stored', 0.0) / max(t.get('quantity_to_blow_up', 2000.0), 1.0)))
+                if full > 0:
+                    rf = max(1.0, r * full)
+                    dr.ellipse([cx - rf, cy - rf, cx + rf, cy + rf], fill=(60, 150, 255))
+                dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=1)
+                if st == 'absorbing' and not t.get('danger'):
+                    rr = t['absorption_radius'] * 2 / 3 * k
+                    dr.rectangle([cx - rr, cy - rr, cx + rr, cy + rr], outline=(60, 150, 255), width=1)
         others = (getattr(self.src, 'other_modifiers', []) if self.is_model() else live_repulsors(self.src)) if self.overlay else []
         if others:
             dr = ImageDraw.Draw(img)
