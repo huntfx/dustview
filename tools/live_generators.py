@@ -65,7 +65,8 @@ def read_generator(p, a):
 
 # ---------------------------------------------------------------- the simulator's per-tick modifier list
 # Every tick the game clears and refills a list of 36-byte entries that the simulation applies:
-#   u32 type (0 = fluid source, 1 = other, probably terrain), f32 col, f32 row, f32 radius, f32 ?,
+#   u32 type (ISimulatorWaterConst::tModifier: 0 fluid source, 1 RepulseFluid, 2 HardGround, 3 SoftGround,
+#   4 RemoveWater (fire trees, Map 6), 5 AddWater, 6 RemoveLava, 7 AddLava), f32 col, f32 row, f32 radius, f32 ?,
 #   f32 amount (fluid per cell this tick, after burying / fade-in / Jellify; negative = drain),
 #   f32 ? (+-1 on type 1), f32 sediment fraction, f32 temperature (internal; > 0 = lava)
 # held by a vector {u32 data pointer, u32 count, u32 capacity}. Found 2026-11-13 on Map 10: the count
@@ -76,7 +77,7 @@ ENTRY = 36
 def _valid_entry(raw, o):
     t = struct.unpack_from('<I', raw, o)[0]
     col, row, rad = struct.unpack_from('<3f', raw, o + 4)
-    return t in (0, 1) and 0 <= col < 512 and 0 <= row < 512 and col == int(col) and row == int(row) and 0 < rad < 64
+    return 0 <= t <= 7 and 0 <= col < 512 and 0 <= row < 512 and col == int(col) and row == int(row) and 0 < rad < 64
 
 
 _HINT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'live', 'modifier_list_address.txt')
@@ -202,6 +203,40 @@ def totems(p, delta=None):
             out[sid]['built'] = struct.unpack_from('<I', raw, 0x2C4)[0] == 0
     return list(out.values())
 
+
+
+# ---------------------------------------------------------------- fire trees (Map 6)
+FIRE_TREE_VTABLES = (0x1015D7F8, 0x1015D7EC)     # +0, +4 of the tree object (0x468 bytes, constructor 0x10082C40)
+FIRE_TREE_STATES = {0x1015D9DC: 3, 0x1015D34C: 1}  # state object vtable -> state id (vtable slot 1 returns it)
+
+
+def fire_trees(p, delta=None):
+    """Live fire trees (decoded 2026-11-27 from dustai 0x10083540 / 0x10082E80, checked against the per-tick list):
+    grid cell +0x144 / +0x148 (u32), +0x360 idle time (s, 40), +0x364 active time (s, 20), +0x368 size (= radius of
+    the RemoveWater disc, 10), +0x36C rate (water per second per cell, 5), +0x440 = 1 while active and some cell within
+    int(size x 2/3) holds > 0.1 water; state object at +0x2A0 (its +8 = the tree's clock in s, +0x14 = when the next
+    active phase starts). Only state 3 runs the cycle (dustsim.fire_tree_entries); state 1 trees do nothing to water."""
+    delta = dustai_delta(p) if delta is None else delta
+    out = []
+    for a in p.find(struct.pack('<2I', FIRE_TREE_VTABLES[0] + delta, FIRE_TREE_VTABLES[1] + delta)):
+        raw = p.read(a, 0x468)
+        if raw is None:
+            continue
+        col, row = struct.unpack_from('<2I', raw, 0x144)
+        hid = struct.unpack_from('<I', raw, 0x54)[0]
+        if hid >= 0xFFFFFFF0 or not (0 < col < 512 and 0 < row < 512):
+            continue                                                  # class default / stray match
+        idle, active, size, rate = struct.unpack_from('<4f', raw, 0x360)
+        sub = struct.unpack_from('<I', raw, 0x2A0)[0]
+        s = p.read(sub, 0x18) if sub else None
+        if s is None:
+            continue
+        state = FIRE_TREE_STATES.get(struct.unpack_from('<I', s, 0)[0] - delta)
+        clock, nxt = struct.unpack_from('<f', s, 8)[0], struct.unpack_from('<f', s, 0x14)[0]
+        out.append(dict(address=hex(a), id='%X' % hid, col=col, row=row, state=state, idle=idle, active_time=active,
+                        size=size, rate=rate, clock=clock, next=nxt, water=struct.unpack_from('<I', raw, 0x440)[0],
+                        active=state == 3 and nxt <= clock < nxt + active))
+    return out
 
 
 # ---------------------------------------------------------------- village repel songs

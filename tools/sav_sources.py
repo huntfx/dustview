@@ -182,6 +182,34 @@ VILLAGE_TAG, REPEL_WATER_TAG, REPEL_LAVA_TAG = 0x20800001, 0x20400009, 0x2040000
 PROGRESS_DIR = os.path.expanduser(r'~\Documents\Dust\DustSave')
 
 
+FIRE_TREE_TAG = b'\x28\x00\x00\x02'
+
+
+def fire_trees(u):
+    """Fire trees (Map 6, planted by the player) in a save, decoded 2026-11-27 from profile_01 MAP_05.SAV and
+    checked against the same trees in the running game after loading it. Entity type 0x28000002, preceded by
+    the record sizes (0x104 / 0xF8 for state 3, 0x174 / 0x168 for state 1). From the type word: +0x10 handle
+    (class 53, index, serial), +0x28 world position x, y, z (grid: col = 256 + 2x/3, row = 256 + 2y/3), +0x40
+    facing, +0xD4 state (3 = cycling, live_generators.fire_trees; 1 = other, its record carries what looks like
+    a destination and a movement vector; such trees were seen to move a few cells in the game), +0xD8 the
+    tree's clock (s), state 3: +0xE4 when the next active phase starts. Idle / active times, size and rate are
+    not in the record (class settings: 40 s, 20 s, 10, 5 in the running game)."""
+    out = []
+    i = u.find(FIRE_TREE_TAG)
+    while i >= 0:
+        sizes = (u32(u, i - 0x10), u32(u, i - 8)) if i >= 0x10 else None
+        if sizes in ((0x104, 0xF8), (0x174, 0x168)):
+            x, y, z = f32(u, i + 0x28), f32(u, i + 0x2C), f32(u, i + 0x30)
+            state = u32(u, i + 0xD4)
+            t = dict(id=handle_id(u32(u, i + 0x10), u32(u, i + 0x14), u32(u, i + 0x18)),
+                     col=int(256 + 2 * x / 3), row=int(256 + 2 * y / 3), x=x, y=y, z=z, state=state,
+                     clock=f32(u, i + 0xD8), idle=40.0, active_time=20.0, size=10.0, rate=5.0)
+            t['next'] = f32(u, i + 0xE4) if sizes[0] == 0x104 else 25.0
+            out.append(t)
+        i = u.find(FIRE_TREE_TAG, i + 1)
+    return out
+
+
 def _entry_start(u, tag):
     """Offsets just after each entry tag (the handle block follows)."""
     return [m.start() + 4 for m in re.finditer(re.escape(struct.pack('>I', tag)), u)]

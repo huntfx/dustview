@@ -214,6 +214,8 @@ def live_repulsors(src):
                          and (a['f5'] < 0) == (b['f5'] < 0))
     out = []
     for e in cands:
+        if 4 <= e.get('type', 0) <= 7:                  # RemoveWater etc. (fire trees): drawn as trees
+            continue
         if e.get('type') == 1 and any(o.get('type') == 1 and same(o, e) for o in out):
             continue
         out.append(e)
@@ -515,6 +517,10 @@ class LiveGame(Source):
                     self.totems = live_generators.totems(self.p, delta)
                 except Exception:
                     pass
+                try:                                     # fire trees (Map 6): objects, their cycle and state
+                    self.fire_trees = live_generators.fire_trees(self.p, delta)
+                except Exception:
+                    pass
                 if getattr(self, 'vec', None) is None:
                     self.source_note = 'looking for the source list...'
                     self.vec = live_generators.known_modifier_list(self.p)        # remembered address first
@@ -711,7 +717,9 @@ class ModelSource(Source):
     """The Python model (dustsim.tick) stepping in a background thread as fast as it can."""
     name = 'python model'
 
-    def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None, totems=None):
+    def __init__(self, grid, params, sources, tick=0, label='', repulsors=(), schedule=None, totems=None,
+                 fire_trees=None):
+        self.fire_trees = [dict(t) for t in fire_trees] if fire_trees else []   # dustsim.fire_tree_entries
         self.P = {n: float(v) for n, v in zip(galileo.PARAM_NAMES, np.asarray(params, np.float32))}
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
@@ -894,6 +902,11 @@ class ModelSource(Source):
             dustsim.apply_sources(G, srcs, self.P)
             for e in reps:
                 dustsim.repulse_fluid(G, e['col'], e['row'], e['radius'], e['amount'], e['f5'])
+        if self.fire_trees:                      # fire trees: RemoveWater while active (after the sources, as the
+            trees = dustsim.fire_tree_entries(self.fire_trees, 1 / self.GAME_RATE)   # game's list orders them)
+            if mods != 'off' and trees:
+                dustsim.apply_modifiers(G, trees, self.P)
+                self._helper_holds = None        # G changed after the helper's copy
         return G
 
     def _game_modifiers(self, G, srcs, reps):
@@ -1237,8 +1250,8 @@ class CompareSource(Source):
             srcs = live.applied_sources()             # what the game applied this tick (fade-in, burial included)
             reps = [e for e in (getattr(live, 'other_modifiers', None) or []) if e.get('type') == 1]
             G = dustsim.tick(G, self.P, srcs, reps)
-            ground = [e for e in (getattr(live, 'entries', None) or []) if e.get('type') in (2, 3)]
-            if ground:                                # HardGround / SoftGround entries (e.g. a power adding sand)
+            ground = [e for e in (getattr(live, 'entries', None) or []) if 2 <= e.get('type', 0) <= 7]
+            if ground:                                # HardGround / SoftGround (e.g. a power adding sand), RemoveWater (fire trees)
                 dustsim.apply_modifiers(G, ground, self.P)
             self._script_effects(G, self.model_tick + 1 + self.SCRIPT_OFFSET)
             with self.lock:
@@ -1484,8 +1497,9 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
         print('villages and songs from', path, flush=True)
     label = name + ((' from %s (script %s)' % (os.path.basename(grid_path), 'resumed at %.0f s' % resumed
                                                if resumed is not None else 'restarted')) if grid_path else '')
+    trees = sav_sources.fire_trees(sav.read_sav(grid_path)[1] if grid_path else u)   # Map 6: player-planted fire trees
     ms = ModelSource(grid, galileo.fluid_params(border=border), sch.sources(), 0, label, schedule=sch,
-                     totems=list(tot.values()))
+                     totems=list(tot.values()), fire_trees=trees)
     ms.progress_note = note
     ms.level_name = name
     if villages is not None:                     # an explicit --villages schedule overrides the totem count
@@ -2292,8 +2306,14 @@ class App:
             return
         self.pending_takeover = None
         fr = self.frame
+        trees = getattr(self.src, 'fire_trees', None)
+        if getattr(self.src, 'p', None) is not None:     # fresh: their phase moves every frame
+            try:
+                trees = live_generators.fire_trees(self.src.p)
+            except Exception:
+                pass
         self.src = ModelSource(fr.grid, fr.params, self.current_sources(), fr.tick, 'from live tick %d' % fr.tick,
-                               live_repulsors(self.src), totems=getattr(self.src, 'totems', None))
+                               live_repulsors(self.src), totems=getattr(self.src, 'totems', None), fire_trees=trees)
         self.dirty = True
 
     def on_move(self, e):
@@ -2524,6 +2544,21 @@ class App:
                 colour = (255, 205, 60) if t.get('built') else (150, 150, 150)
                 dr.rectangle([cx - r, cy - r, cx + r, cy + r], outline=colour, width=2)
                 dr.text((cx + r + 2, cy + 2), totem_label(t), fill=colour)
+        trees = getattr(self.src, 'fire_trees', None) if self.overlay else None
+        if trees:                                # fire trees: red while removing water (disc), dark red idle, grey state 1
+            dr = ImageDraw.Draw(img)
+            if not self.is_model():              # live: active = in this tick's list (the objects are read every few s)
+                on = {(int(e['col']), int(e['row'])) for e in (getattr(self.src, 'entries', None) or []) if e.get('type') == 4}
+                trees = [dict(t, active=(t['col'], t['row']) in on) for t in trees]
+            for t in list(trees):
+                y, x = self.cell_to_disp[int(t['row']), int(t['col'])]
+                cx, cy = self.to_px(y, x)
+                colour = (255, 70, 40) if t.get('active') else ((170, 40, 30) if t.get('state') == 3 else (130, 130, 130))
+                r = 3 * self.scale
+                dr.polygon([(cx, cy - r), (cx - r, cy + r), (cx + r, cy + r)], outline=colour)
+                if t.get('active'):
+                    rr = t['size'] * k
+                    dr.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=colour, width=1)
         others = (getattr(self.src, 'other_modifiers', []) if self.is_model() else live_repulsors(self.src)) if self.overlay else []
         if others:
             dr = ImageDraw.Draw(img)

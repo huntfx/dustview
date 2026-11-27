@@ -363,7 +363,7 @@ def apply_sources(G, sources, P=None):
 def apply_modifiers(G, entries, P=None):
     """Apply the game's per-tick modifier list in its order: type 0 = fluid source (dict with 'amount'
     or 'rate'), type 1 = RepulseFluid (col, row, radius, amount, f5 = mode), 2 / 3 = HardGround /
-    SoftGround (col, row, radius, amount). Other types are skipped."""
+    SoftGround (col, row, radius, amount), 4-7 = RemoveWater / AddWater / RemoveLava / AddLava (typed_fluid_args)."""
     for e in entries:
         t = e.get('type', 0)
         if t == 0:
@@ -373,6 +373,51 @@ def apply_modifiers(G, entries, P=None):
         elif t in (2, 3):                                   # HardGround, SoftGround
             ys, xs = disc(e['col'], e['row'], e['radius'])
             ground_modifier(G, ys, xs, e['amount'], soft=(t == 3))
+        elif 4 <= t <= 7:                                   # RemoveWater, AddWater, RemoveLava, AddLava
+            ys, xs = disc(e['col'], e['row'], e['radius'])
+            fluid_modifier(G, ys, xs, *typed_fluid_args(e), P=P)
+
+
+def fire_tree_entries(trees, dt=1 / 31):
+    """Advance fire trees (dicts from live_generators.fire_trees: col, row, state, idle, active_time, size, rate,
+    clock, next) by dt seconds and return this tick's per-tick-list entries, as dustai 0x10083540 does per frame:
+    clock += dt; before `next`: idle; for `active_time` s from `next`: push RemoveWater (type 4) on the disc of
+    radius `size` with amount -rate x dt; then set the 8 neighbouring cells' plants alight (0x10082DD0 ->
+    0x10141550, not modelled: sets 'ignite' on the tree) and `next` = clock + idle. Only state 3 trees cycle.
+    dt = 1/31: the game's amount is rate x frame time (0.166 in a 1/30 s frame) and its clock runs on the
+    same frame time; the model's tick stands for 1/31 s like the level script."""
+    out = []
+    for t in trees:
+        t['active'] = False
+        if t.get('state') != 3:
+            continue
+        t['clock'] += dt
+        if t['next'] > t['clock']:
+            continue
+        if t['clock'] - t['next'] < t['active_time']:
+            t['active'] = True
+            out.append(dict(type=4, col=float(t['col']), row=float(t['row']), radius=float(t['size']), f3=0.0,
+                            amount=-t['rate'] * dt, f5=0.0, sediment=0.0, temperature=0.0))
+        else:
+            t['ignite'] = t.get('ignite', 0) + 1
+            t['next'] = t['clock'] + t['idle']
+    return out
+
+
+def typed_fluid_args(e):
+    """(rate, sediment, temperature) for fluid_modifier from a list entry of type 4-7, which names the
+    modifier directly instead of picking it by sign and temperature as type 0 does. Fire trees (Map 6) push
+    type 4 = RemoveWater with amount -0.166, radius 10 (seen live 2026-11-27); 5-7 not seen yet, signs
+    assumed the same as type 0's (the DLL's Remove* modifiers take a negative rate)."""
+    t, a = e['type'], abs(float(e.get('amount', 0.0)))
+    sed = float(e.get('sediment', 0.0))
+    if t == 4:
+        return -a, sed, 0.0
+    if t == 5:
+        return a, sed, 0.0
+    if t == 6:
+        return -a, 0.0, max(float(e.get('temperature', 0.0)), 1.0)
+    return a, 0.0, max(float(e.get('temperature', 0.0)), 1.0)
 
 
 def modifier_calls(G, sources=(), repulsors=()):
