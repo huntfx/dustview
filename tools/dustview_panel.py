@@ -18,7 +18,8 @@ VIEW_LABELS = (('natural', 'Natural'), ('height', 'Height'), ('water depth', 'Wa
                ('lava temperature', 'Lava temperature'), ('sediment', 'Sediment'), ('flow speed', 'Flow speed'),
                ('unexplained changes', 'Unexplained changes (live)'), ('engine texture', 'Engine texture:'))
 TOOL_LABELS = (('inspect', 'View (drag pans, wheel zooms; click a totem: village on / off)'), ('water', 'Water'),
-               ('sand', 'Sand (soft ground)'), ('rock', 'Rock (hard ground)'), ('lava', 'Lava'))
+               ('sand', 'Sand (soft ground)'), ('rock', 'Rock (hard ground)'), ('lava', 'Lava'),
+               ('spring', 'Spring (water source)'), ('drain', 'Water drain'), ('vent', 'Lava vent'), ('lava drain', 'Lava drain'))
 EMPTY_MAP = 'New (the level as shipped, no villages)'
 SPEED_LABELS = ((1, '1x'), (2, '2x'), (4, '4x'), (0, 'max'))
 
@@ -119,10 +120,12 @@ class ControlPanel:
         self.tool = tk.StringVar(value=app.tool)
         for tool, text in TOOL_LABELS:
             self._radio(box, text, self.tool, tool, lambda: app.set_tool(self.tool.get())).pack(anchor='w')
-        ttk.Label(box, text='Left button adds, middle smooths, right removes, wheel = brush size. '
+        ttk.Label(box, text='Water / sand / rock / lava: left button adds, middle smooths, right removes, wheel = brush size. '
+                            'Springs, drains, vents: left click places one, right click removes the nearest source '
+                            '(placed or the level\'s own; ringed white), middle click switches it off / on, wheel = its radius. '
                             'Ctrl + left-drag pans, Ctrl + wheel zooms.', wraplength=250,
                   foreground='#666').pack(fill='x', pady=(4, 0))
-        box = self._section('Brush', tab_edit)
+        box = self.brush_box = self._section('Brush (water, sand, rock, lava)', tab_edit)
         self.brush_radius = tk.IntVar(value=app.brush_radius)
         self.brush_strength = tk.DoubleVar(value=app.brush_strength)
         self.lava_temperature = tk.DoubleVar(value=app.lava_temperature * 8)   # shown x 8
@@ -144,9 +147,42 @@ class ControlPanel:
                             'on water boils it off and hardens; sand and rock raise the ground. The fixed '
                             'border band is not edited.',
                   wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
-        ttk.Label(tab_edit, text='Painting works on the Python model (Map tab, or "Continue in model" from the '
-                                 'live game); the game itself is never written to.',
-                  wraplength=260, foreground='#666').pack(fill='x', pady=(4, 0))
+        box = self.source_box = self._section('New source (spring, drain, lava vent / drain)', tab_edit)
+        self.source_box.pack_forget()            # shown instead of the brush while a source tool is picked
+        self.emitter_rate = tk.DoubleVar(value=app.emitter_rate)
+        self.emitter_radius = tk.DoubleVar(value=app.emitter_radius)
+        self.emitter_sediment = tk.DoubleVar(value=app.emitter_sediment)
+        self.erate_text, self.eradius_text, self.esed_text = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.etemp_text = tk.StringVar()
+        for label, var, text, lo, hi, cmd in (
+                ('Lava heat', self.lava_temperature, self.etemp_text, 100, 2040,
+                 lambda v: app.set_brush(temperature=round(float(v)) / 8)),
+                ('Rate', self.emitter_rate, self.erate_text, 0.05, 3.0,
+                 lambda v: app.set_emitter(rate=round(float(v), 2))),
+                ('Radius', self.emitter_radius, self.eradius_text, dv.EMITTER_RADIUS_MIN, dv.EMITTER_RADIUS_MAX,
+                 lambda v: app.set_emitter(radius=round(float(v) * 2) / 2)),
+                ('Sediment', self.emitter_sediment, self.esed_text, 0.0, 1.0,
+                 lambda v: app.set_emitter(sediment=round(float(v), 2)))):
+            row = ttk.Frame(box); row.pack(fill='x', pady=(2, 0))
+            ttk.Label(row, text=label, width=10).pack(side='left')
+            ttk.Scale(row, from_=lo, to=hi, variable=var, command=cmd, takefocus=False).pack(side='left', fill='x', expand=True)
+            ttk.Label(row, textvariable=text, width=7).pack(side='left')
+        row = ttk.Frame(box); row.pack(fill='x', pady=(4, 0))
+        self.clear_btn = self._button(row, 'Remove placed, restore level\'s', app.clear_placed)
+        self.clear_btn.pack(side='left')
+        ttk.Label(box, text='Rate = height added (or drained) per cell per tick, 31 ticks a second; the shipped springs '
+                            'have 0.66 with radius 2.5, the Map 9 lava vent 1.04 with radius 1.5. Sediment: mud a spring '
+                            'carries (shipped 0 or 0.42); a drain with sediment also takes mud. Lava heat: lava vents '
+                            '(2040 = the shipped vents). A drain empties its own cells, so above ~0.66 it is limited '
+                            'by the water flowing in: a bigger radius drains faster, a higher rate does not. '
+                            'Settings apply to the next source placed. Placed sources are never buried (no stored '
+                            'height). Labels: * = placed, grey "off" = switched off. They are lost when another map '
+                            'is loaded.',
+                  wraplength=250, foreground='#666').pack(fill='x', pady=(4, 0))
+        self.edit_note = ttk.Label(tab_edit, text='Painting works on the Python model (Map tab, or "Continue in model" '
+                                   'from the live game); the game itself is never written to.',
+                                   wraplength=260, foreground='#666')
+        self.edit_note.pack(fill='x', pady=(4, 0))
 
         # ---- view
         box = self._section('Map view', tab_view)
@@ -364,6 +400,17 @@ class ControlPanel:
         self._put(self.radius_text, '%d' % app.brush_radius)
         self._put(self.strength_text, '%.1f/s' % app.brush_strength)
         self._put(self.temp_text, '%.0f' % (app.lava_temperature * 8))
+        self._put(self.emitter_radius, app.emitter_radius)          # the wheel changes it
+        self._put(self.erate_text, '%.2f' % app.emitter_rate)
+        self._put(self.eradius_text, '%g' % app.emitter_radius)
+        self._put(self.esed_text, '%.2f' % app.emitter_sediment)
+        self._put(self.etemp_text, '%.0f' % (app.lava_temperature * 8))
+        self._enable(self.clear_btn, model)
+        want = self.source_box if app.tool in dv.EMITTER_TOOLS else self.brush_box   # one settings box at a time
+        if not want.winfo_manager():
+            other = self.brush_box if want is self.source_box else self.source_box
+            other.pack_forget()
+            want.pack(fill='x', pady=(0, 5), before=self.edit_note)
         self._put(self.zoom_text, '%gx' % app.zoom)
         self._put(self.smooth, bool(app.smooth))
         for attr, v in self.checks.items():

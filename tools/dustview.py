@@ -59,6 +59,11 @@ Views (panel only): natural, height, water depth, lava temperature, sediment, fl
      Ctrl + left-drag pans, Ctrl + wheel zooms. Adding / removing uses the game's own modifiers
      (Add/RemoveWater, Add/RemoveLava at the brush's heat, SoftGround, HardGround); smoothing moves each cell
      towards its 5 x 5 mean (smooth_edit); the fixed border band is not edited.
+     Source tools spring, water drain, lava vent, lava drain: left click places one (rate per cell per tick,
+     radius, sediment from the panel; vents at the lava heat), right click removes the nearest source (placed
+     or the level's own, ringed white), middle click switches it off / on, wheel = its radius. They run in the
+     same modifier pass as the level's sources (Model tab Sources: Game or Model); placed ones have no stored
+     height, so they are never buried. Removed / switched-off level sources stay so while the script runs.
   S  save a screenshot to data/live/    Esc quit
 Mouse wheel: zoom (1x-8x) about the cursor (brush size with an edit tool; Ctrl + wheel zooms). Middle-drag
 pans (except with an edit tool, where it smooths).
@@ -615,8 +620,16 @@ class ModelSource(Source):
         self.params = np.asarray(params, np.float32)
         self.sources = [dict(s) for s in sources]
         self.other_modifiers = [dict(e) for e in repulsors if e.get('type') == 1]
-        for s in self.sources:
+        for i, s in enumerate(self.sources):
             s['_cells'] = dustsim.disc(s['col'], s['row'], s['radius'])
+            if schedule is None:                 # a level script's sources are keyed by generator index
+                s['_key'] = ('S', i)
+        self.static_sources = self.sources       # without a level script: the fixed list (e.g. from the takeover)
+        self.level_sources = self.sources        # the level's sources of the last tick (before removals)
+        self.user_sources = []                   # placed on the Edit tab (Spring / Drain / Lava vent / Lava drain)
+        self.removed, self.muted = set(), set()  # keys of level sources removed / switched off on the Edit tab
+        self.off_sources = []                    # sources switched off (drawn grey)
+        self._user_n = 0
         self.G = dustsim.from_grid(grid)
         self.extra = grid                       # components 6/7 (vegetation, fire) are carried along
         self.tick = tick
@@ -666,13 +679,14 @@ class ModelSource(Source):
                     time.sleep(due - now)
                 due = max(due, time.perf_counter() - 0.25) + 1 / (self.GAME_RATE * speed)
             sch = self.schedule
-            srcs = self.sources
+            level = self.static_sources
             waves = WAVE_STEP == 'model'
             if sch is not None:
                 sch.tick(1 / 31, ground=self.G['T'])
-                srcs = sch.sources()                 # fresh dicts: 'activity' (burial) is set by the tick,
+                level = sch.sources()                # fresh dicts: 'activity' (burial) is set by the tick,
                 if waves:                            # so publish them only after it
                     self.P['BorderWaterSurfaceHeight'] = sch.border_level   # tide (kept as it was while off)
+            srcs, off = self._compose(level)         # minus removed / switched-off ones, plus placed ones
             G = self._fluid_tick(srcs)
             if sch is not None:
                 if SOURCE_STEP != 'off':
@@ -682,6 +696,7 @@ class ModelSource(Source):
             extra = self._vegetation_tick(G)
             with self.lock:
                 self.G, self.tick, self.sources = G, self.tick + 1, srcs
+                self.level_sources, self.off_sources = level, off
                 if extra is not None:
                     self.extra = extra
                 now = time.time()
@@ -693,7 +708,75 @@ class ModelSource(Source):
         with self.lock:
             self.pending.append(fn)
 
-    helper = None                                # galileo.Resident running the game's own steps (job 0 water / lava,
+    # ---- sources placed / removed / switched off on the Edit tab (UI thread; the model thread picks the
+    # change up at its next tick through _compose, and the overlay shows it at once, also while paused)
+    @staticmethod
+    def source_key(s):
+        return s.get('_key') or ('L', s.get('index'))   # placed / fixed list: own key; level script: generator index
+
+    def _compose(self, level):
+        """This tick's active sources and the switched-off ones: the level's (minus removed ones) + placed ones."""
+        on, off = [], []
+        removed, muted = self.removed, self.muted
+        for s in level:
+            k = self.source_key(s)
+            if k not in removed:
+                (off if k in muted else on).append(s)
+        for u in self.user_sources:
+            (off if u.get('off') else on).append(u)
+        return on, off
+
+    def _sources_changed(self):
+        with self.lock:
+            self.sources, self.off_sources = self._compose(self.level_sources)
+            self.edits += 1                      # republish the frame (overlay) while paused
+
+    def add_source(self, col, row, radius, rate, sediment=0.0, temperature=0.0):
+        """Place a spring (rate > 0), water drain (< 0), lava vent / lava drain (temperature > 0). Placed
+        sources have no stored height, so the bury rule leaves them at full strength."""
+        self._user_n += 1
+        s = dict(col=int(col), row=int(row), radius=float(radius), rate=float(rate), sediment=float(sediment),
+                 temperature=float(temperature), _key=('U', self._user_n), placed=True)
+        s['_cells'] = dustsim.disc(s['col'], s['row'], s['radius'])
+        self.user_sources = self.user_sources + [s]   # a new list: the model thread may be iterating the old one
+        self._sources_changed()
+        return s
+
+    def nearest_source(self, row, col, reach=4.0):
+        """The source (active or switched off) whose centre is nearest (row, col), within its radius + reach."""
+        best, bd = None, None
+        for s in list(self.sources) + list(self.off_sources):
+            d = ((s['row'] - row) ** 2 + (s['col'] - col) ** 2) ** 0.5
+            if d <= s['radius'] + reach and (bd is None or d < bd):
+                best, bd = s, d
+        return best
+
+    def remove_source(self, s):
+        k = self.source_key(s)
+        if k[0] == 'U':
+            self.user_sources = [u for u in self.user_sources if u['_key'] != k]
+        else:
+            self.removed = self.removed | {k}
+        self._sources_changed()
+
+    def toggle_source(self, s):
+        """Switch a source off / on again (returns True if it is now on)."""
+        k = self.source_key(s)
+        if k[0] == 'U':
+            s['off'] = not s.get('off')
+            on = not s['off']
+        else:
+            on = k in self.muted
+            self.muted = (self.muted - {k}) if on else (self.muted | {k})
+        self._sources_changed()
+        return on
+
+    def clear_placed(self):
+        """Remove every placed source and bring back the level's removed / switched-off ones."""
+        self.user_sources, self.removed, self.muted = [], set(), set()
+        self._sources_changed()
+
+    helper = None                               # galileo.Resident running the game's own steps (job 0 water / lava,
     helper_failed = False                        # job 4 vegetation / fire, the modifiers); one helper process
     mods_failed = False                          # the helper could not run modifiers (e.g. an old simstep.exe)
     _helper_consts = _helper_image = _helper_holds = None   # _helper_holds: state dict the helper's grid equals
@@ -855,8 +938,11 @@ class ModelSource(Source):
         note = getattr(self, 'progress_note', '')
         vil = (' | villages %d/%d%s (click a totem: village on/off)' % (sum(1 for t in self.totems if t.get('built')), len(self.totems),
                                                                (', from ' + note) if note else '')) if self.totems else ''
-        return '%s%s | %s | %s | %d sources, %d repulsors%s%s' % (self.name, ' (%s)' % self.label if self.label else '', state,
-                                                              self.step_modes(), len(self.sources), len(self.other_modifiers), vil, extra)
+        placed = len(self.user_sources)
+        edited = ' (%d placed, %d off, %d removed)' % (placed, len(self.off_sources), len(self.removed)) if (
+            placed or self.off_sources or self.removed) else ''
+        return '%s%s | %s | %s | %d sources%s, %d repulsors%s%s' % (self.name, ' (%s)' % self.label if self.label else '', state,
+                                                                self.step_modes(), len(self.sources), edited, len(self.other_modifiers), vil, extra)
 
     def stop(self):
         self.running = False                     # the model thread closes the vegetation helper on its way out
@@ -1172,8 +1258,16 @@ def model_from_map(name, villages=None, progress='none', grid_path=None):
 
 
 # ---------------------------------------------------------------- editing (model mode)
-TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock')   # 'inspect' is shown as View
+TOOLS = ('inspect', 'water', 'lava', 'sand', 'rock', 'spring', 'drain', 'vent', 'lava drain')   # 'inspect' = View
 EDIT_TOOLS = ('water', 'lava', 'sand', 'rock')
+# Source tools (Edit tab): left click places, right click removes the nearest source (placed or the level's),
+# middle click switches it off / on. sign: +1 adds fluid, -1 drains; lava: uses the lava heat setting.
+EMITTER_TOOLS = {'spring': (+1, False), 'drain': (-1, False), 'vent': (+1, True), 'lava drain': (-1, True)}
+EMITTER_RATE = 0.66        # per cell per tick: the shipped springs (Map 2 / 5 / 9 generators; the Map 9 vent has 1.04)
+EMITTER_RADIUS = 2.5       # the shipped springs (Map 9's vent: 1.5)
+EMITTER_RADIUS_MIN, EMITTER_RADIUS_MAX = 0.5, 20.0
+TOOL_COLOURS = {'water': (120, 200, 255), 'lava': (255, 120, 40), 'sand': (240, 210, 140), 'rock': (200, 200, 200),
+                'spring': (120, 230, 255), 'drain': (170, 90, 255), 'vent': (255, 140, 30), 'lava drain': (200, 40, 60)}
 CONTROL = 0x0004                                 # Tk event.state bit for the Control key
 LAVA_TEMPERATURE = 255.0                         # internal units, as the level files' lava vents
 BRUSH_MIN, BRUSH_MAX = 1, 40
@@ -1409,6 +1503,7 @@ class App:
         self.texture, self.tex_read = 'wp_foam_nofade', None   # engine texture view: entry, cell readout
         self.tool, self.brush_radius, self.brush_strength = 'inspect', 6, 10.0   # editing (model mode)
         self.lava_temperature = LAVA_TEMPERATURE
+        self.emitter_rate, self.emitter_radius, self.emitter_sediment = EMITTER_RATE, EMITTER_RADIUS, 0.0
         self.slice_a = self.slice_b = None               # Slice tab: end points (row, col), the point being dragged,
         self.slice_drag, self.slice_win = None, None     # the slice window (tools/dustslice.py)
         self.slice_hover, self.slice_whole, self.slice_time, self.slice_range = None, False, 0.0, None
@@ -1511,6 +1606,9 @@ class App:
         if self.tool in EDIT_TOOLS and not e.state & CONTROL:     # edit tools: wheel = brush size
             self.set_brush(radius=self.brush_radius + (1 if e.delta > 0 else -1))
             return
+        if self.tool in EMITTER_TOOLS and not e.state & CONTROL:  # source tools: wheel = source radius
+            self.set_emitter(radius=self.emitter_radius + (0.5 if e.delta > 0 else -0.5))
+            return
         ex, ey = e.x_root - self.canvas.winfo_rootx(), e.y_root - self.canvas.winfo_rooty()
         self.zoom_step(1 if e.delta > 0 else -1, ex, ey)
 
@@ -1587,9 +1685,69 @@ class App:
             self.brush_strength = float(strength)
         self.dirty = True
 
+    def set_emitter(self, rate=None, radius=None, sediment=None):
+        if rate is not None:
+            self.emitter_rate = float(min(5.0, max(0.01, rate)))
+        if radius is not None:
+            self.emitter_radius = float(min(EMITTER_RADIUS_MAX, max(EMITTER_RADIUS_MIN, radius)))
+        if sediment is not None:
+            self.emitter_sediment = float(min(1.0, max(0.0, sediment)))
+        self.dirty = True
+
+    def _model_cell(self, e):
+        """(row, col) under the mouse event in model mode, else None (with a hint)."""
+        if not self.is_model():
+            self.say('placing sources works on the Python model: press M (Continue in model) or load a map first')
+            return None
+        y, x = self.cell_at(e.x, e.y)
+        return int(self.idx_r[y, x]), int(self.idx_c[y, x])
+
+    def place_emitter(self, e):
+        cell = self._model_cell(e)
+        if cell is None:
+            return
+        sign, lava = EMITTER_TOOLS[self.tool]
+        s = self.src.add_source(cell[1], cell[0], self.emitter_radius, sign * self.emitter_rate,
+                                self.emitter_sediment if not lava else 0.0, self.lava_temperature if lava else 0.0)
+        self.say('placed %s at col %d, row %d: %+.2f per cell per tick, radius %g' % (
+            self.tool, s['col'], s['row'], s['rate'], s['radius']))
+
+    @staticmethod
+    def _source_name(s):
+        kind = ('lava vent' if s['temperature'] else 'spring') if s['rate'] > 0 else ('lava drain' if s['temperature'] else 'drain')
+        return '%s%s at col %d, row %d' % ('placed ' if s.get('placed') else "level's ", kind, s['col'], s['row'])
+
+    def remove_emitter(self, e):
+        cell = self._model_cell(e)
+        s = cell and self.src.nearest_source(*cell)
+        if s is None:
+            if cell:
+                self.say('no source near the cursor')
+            return
+        self.src.remove_source(s)
+        self.say('removed %s' % self._source_name(s))
+
+    def toggle_emitter(self, e):
+        cell = self._model_cell(e)
+        s = cell and self.src.nearest_source(*cell)
+        if s is None:
+            if cell:
+                self.say('no source near the cursor')
+            return
+        on = self.src.toggle_source(s)
+        self.say('%s switched %s' % (self._source_name(s), 'on' if on else 'off'))
+
+    def clear_placed(self):
+        if self.is_model():
+            self.src.clear_placed()
+            self.say('placed sources removed, level sources restored')
+
     def start_paint(self, e, sign):
         if self.tool == 'slice':                 # right button: point B
             self.set_slice_point('b', self.cell_at(e.x, e.y))
+            return
+        if self.tool in EMITTER_TOOLS:           # right button: remove the nearest source
+            self.remove_emitter(e)
             return
         if self.tool == 'inspect':
             return
@@ -1901,6 +2059,8 @@ class App:
             self.set_slice_point('a', self.cell_at(e.x, e.y))
         elif self.tool in EDIT_TOOLS and not e.state & CONTROL:
             self.start_paint(e, +1)
+        elif self.tool in EMITTER_TOOLS and not e.state & CONTROL:
+            self.place_emitter(e)
         else:
             self.start_drag(e)
 
@@ -1920,6 +2080,8 @@ class App:
     def on_middle(self, e):
         if self.tool in EDIT_TOOLS:
             self.start_paint(e, 'smooth')
+        elif self.tool in EMITTER_TOOLS:
+            self.toggle_emitter(e)
         else:
             self.start_drag(e)
 
@@ -1997,8 +2159,13 @@ class App:
                 img = img.resize((size, size), Image.BILINEAR if smooth else Image.NEAREST, box=(x0, y0, x0 + v, y0 + v))
         k = self.px_per_cell()
         sources = self.current_sources()
-        if self.overlay and sources:
+        off = list(getattr(self.src, 'off_sources', ())) if self.is_model() else []
+        if self.overlay and (sources or off):
             marks = []
+            for s in off:                              # switched off on the Edit tab
+                y, x = self.cell_to_disp[int(s['row']), int(s['col'])]
+                cx, cy, r = *self.to_px(y, x), max(3, (s['radius'] + 1.5) * k)
+                marks.append((cx, cy, r, (110, 110, 110), ('*' if s.get('placed') else '') + 'off'))
             for s in sources:
                 y, x = self.cell_to_disp[int(s['row']), int(s['col'])]
                 cx, cy, r = *self.to_px(y, x), max(3, (s['radius'] + 1.5) * k)
@@ -2010,7 +2177,7 @@ class App:
                 if act < 0.95:                         # noticeably buried: grey
                     colour = (150, 150, 150)
                 amount = s.get('amount', s['rate'] * act)
-                label = '%+.2f' % amount + (' (%d%%)' % round(act * 100) if act < 0.99 else '')
+                label = ('*' if s.get('placed') else '') + '%+.2f' % amount + (' (%d%%)' % round(act * 100) if act < 0.99 else '')
                 marks.append((cx, cy, r, colour, label))
             dr = ImageDraw.Draw(img)
             for cx, cy, r, colour, label in marks:
@@ -2052,9 +2219,16 @@ class App:
         self.draw_slice(img)
         if self.tool not in ('inspect', 'slice') and self.mouse is not None:
             y, x = self.mouse
-            cx, cy, r = *self.to_px(y, x), (self.brush_radius + 0.5) * k
-            colour = {'water': (120, 200, 255), 'lava': (255, 120, 40), 'sand': (240, 210, 140), 'rock': (200, 200, 200)}[self.tool]
-            ImageDraw.Draw(img).ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=1)
+            emitter = self.tool in EMITTER_TOOLS
+            cx, cy, r = *self.to_px(y, x), ((self.emitter_radius if emitter else self.brush_radius) + 0.5) * k
+            dr = ImageDraw.Draw(img)
+            dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=TOOL_COLOURS.get(self.tool, (255, 255, 255)), width=1)
+            if emitter and self.is_model():          # the source a right / middle click would remove / switch
+                s = self.src.nearest_source(int(self.idx_r[y, x]), int(self.idx_c[y, x]))
+                if s is not None:
+                    sy, sx = self.cell_to_disp[int(s['row']), int(s['col'])]
+                    scx, scy, sr = *self.to_px(sy, sx), max(3, (s['radius'] + 1.5) * k) + 3
+                    dr.ellipse([scx - sr, scy - sr, scx + sr, scy + sr], outline=(255, 255, 255), width=1)
         self.last_image = img
         ph = getattr(self, 'photo', None)
         if ph is not None and (ph.width(), ph.height()) == img.size:
