@@ -741,43 +741,85 @@ def modifier_calls(G, sources=(), repulsors=()):
 
 
 # ---------------------------------------------------------------- village repels (findings/water-lava-sim.md
-# "Village repel push, exact" and "Village repel switch-on, measured")
+# "Village repel push, exact" and "Village threat check, decoded")
 REPEL = {   # per song: base size (m_radius, level 0), m_scaleFactor; peak: +6 radius at 1 + 2.2 (water only)
     'water': dict(size=40.0, scale=0.2, peak=True),
     'lava': dict(size=35.0, scale=0.05, peak=False),
 }
-REPEL_DURATION = 10.0        # s, m_minimalApplicationTime; restarts at once while the threat stays (measured live)
-REPEL_THREAT_RADIUS = 15     # cells; 1.5 (m_threatDetectionRadiusFactor) x 10 assumed: live data fits 11..20
-REPEL_THREAT = {'water': 2.0, 'lava': 1.5}   # m_threatWaterHeightThreshold / m_threatLavaHeightThreshold
+REPEL_DURATION = 10.0        # s, m_minimalApplicationTime (episode length measured live: exactly 310 ticks)
+VILLAGE_RADIUS = 19.0        # Village +0x1C8 (live, all Map 10 villages)
+THREAT_RADIUS_FACTOR = 1.5   # m_threatDetectionRadiusFactor (Village_0.ai)
+THREAT_WATER = 2.0           # m_threatWaterHeightThreshold: water depth
+THREAT_LAVA = 1.5            # m_threatLavaHeightThreshold: lava depth
+THREAT_MEMORY = 3.0          # s: 2 pi / (2 pi rad/s) x 3 (dustai 0x1014B210); a threat counts this long after the last hit
+SWEEP_RATE = 2 * np.pi       # rad/s: the sampling angle (Village +0x2A0) turns once per second
+WORLD_PER_CELL = 1.5         # world units per grid cell (dustai 0x101400C0: cell = trunc((world + 384) x 2/3), live)
+REF_RADIUS = 10              # model only: reference height = lowest ground within this many cells (the game uses
+                             # the lowest of the village's buildings, +0x2B4; live 0-2.2 below this estimate)
 REPEL_BAR_TICKS = 61.8       # music bar measured live (~2.0 s): peak pushes on every bar, all villages in step
 
 
 class VillageRepels:
-    """Switches each village's repel on / off as the game does (measured on Map 10, 2026-11-27): a song
-    starts when a cell within REPEL_THREAT_RADIUS has water deeper than 2 (water song) or lava deeper than
-    1.5 (lava song; the game's lava song also reacts to fire, not modelled) and then runs exactly 10 s,
-    restarting while the threat stays. While on: radius = size x 2/3 (water truncated), amount 1; the size
-    jumps to size x (1 + scale) once per episode at the first half bar and shrinks back in 1 s; water also
-    pushes one tick of radius + 6 at amount 3.2 on every bar. Not modelled: the 0.1-1.6 s delay before the
-    villagers start (the model starts at once), the game's music clock (bars run from model tick 0)."""
+    """Village repels as the game runs them (dustai, decoded 2026-11-27; findings "Village threat check, decoded").
+    Threat sampling per village every update (Village update 0x10075650 -> 0x10074520 water, 0x100747D0 lava / fire):
+      - while no repel of that song runs: 4 points at angles A + i x 90 deg and distances R x (1 - i/4), i = 0..3,
+        R = 1.5 x 19 = 28.5 world units = 19 cells (the points sweep circles of 19, 14.25, 9.5 and 4.75 cells);
+      - while it runs: 1 point at angle A and distance = the repel's current size in world units (40-48 water,
+        35-36.75 lava; / 1.5 for cells);
+      - A turns 2 pi per second. Points outside cells 33..478 are skipped.
+      Water hit: depth > 2 and water surface (ground + depth) above the village's reference height. Lava hit:
+      lava depth > 1.5. Fire hit: a burning plant (grid component 6 bit 0x40; needs `fire`).
+      A song's threat flag is on while its last hit is less than 3 s old (water song: water hits; lava song: lava
+      or fire hits).
+    A song starts when its flag is on (the village knows it) and runs 10 s; at the end it restarts while the flag is
+    still on. While on: radius = size x 2/3 (water truncated), amount 1; the size jumps to size x (1 + scale) once
+    per episode at the first half bar and shrinks back in 1 s; water also pushes one tick of radius + 6 at amount 3.2
+    on every bar. Not modelled: the villager's walk before the first push, the game's music clock (bars run from
+    model tick 0), the exact reference height (the game uses the village's buildings)."""
 
     def __init__(self, rate=31.0):
-        self.rate, self.state = rate, {}
+        self.rate, self.state, self.threat = rate, {}, {}
 
     @staticmethod
-    def threatened(G, col, row, kind, radius=REPEL_THREAT_RADIUS):
-        W = G['W']
-        r0, r1, c0, c1 = max(row - radius, 0), min(row + radius + 1, W.shape[0]), max(col - radius, 0), min(col + radius + 1, W.shape[1])
-        sub = W[r0:r1, c0:c1]
-        yy, xx = np.ogrid[r0:r1, c0:c1]
-        disc = (yy - row) ** 2 + (xx - col) ** 2 <= radius * radius
-        depth = sub if kind == 'water' else -sub
-        return bool((depth[disc] > REPEL_THREAT[kind]).any())
+    def _cell(col, row, ang, dist):
+        # village at its cell centre; points in world units, converted to a cell by truncation as the game does
+        c = int(np.floor(col + 0.5 + np.cos(ang) * dist / WORLD_PER_CELL))
+        r = int(np.floor(row + 0.5 + np.sin(ang) * dist / WORLD_PER_CELL))
+        return (c, r) if 33 <= c < 479 and 33 <= r < 479 else None
 
-    def entries(self, G, reps, tick):
+    @staticmethod
+    def reference_height(G, col, row):
+        T = G['T']
+        r0, c0 = max(row - REF_RADIUS, 0), max(col - REF_RADIUS, 0)
+        sub = T[r0:row + REF_RADIUS + 1, c0:col + REF_RADIUS + 1]
+        yy, xx = np.ogrid[r0:r0 + sub.shape[0], c0:c0 + sub.shape[1]]
+        return float(sub[(yy - row) ** 2 + (xx - col) ** 2 <= REF_RADIUS ** 2].min())
+
+    def _hits(self, G, col, row, kind, ang, active_size, fire):
+        W, T = G['W'], G['T']
+        if active_size is None:
+            R = THREAT_RADIUS_FACTOR * VILLAGE_RADIUS
+            pts = [self._cell(col, row, ang + i * 0.5 * np.pi, R * (1 - 0.25 * i)) for i in range(4)]
+        else:
+            pts = [self._cell(col, row, ang, active_size)]
+        ref = self.reference_height(G, col, row) if kind == 'water' else 0.0
+        for pt in pts:
+            if pt is None:
+                continue
+            c, r = pt
+            w = float(W[r, c])
+            if kind == 'water':
+                if w > THREAT_WATER and float(T[r, c]) + w > ref:
+                    return True
+            elif -w > THREAT_LAVA or (fire is not None and int(fire[r, c]) & 0x40):
+                return True
+        return False
+
+    def entries(self, G, reps, tick, fire=None):
         """This tick's RepulseFluid entries: entries with a 'totem' key are village songs and are gated by
-        the rule above; others pass unchanged."""
-        out, bar = [], REPEL_BAR_TICKS
+        the rule above; others pass unchanged. fire: grid component 6 (uint32) for the lava song's fire test."""
+        out, bar, dt = [], REPEL_BAR_TICKS, 1.0 / self.rate
+        ang = SWEEP_RATE * tick * dt
         for e in reps:
             tid = e.get('totem')
             if tid is None:
@@ -786,17 +828,23 @@ class VillageRepels:
             kind = 'water' if e['f5'] < 0 else 'lava'
             key, cfg = (tid, kind), REPEL[kind]
             st = self.state.get(key)
-            if st is None or tick >= st['end']:
-                if not self.threatened(G, int(e['col']), int(e['row']), kind):
+            running = st is not None and tick < st['end']
+            col, row = int(round(e['col'])), int(round(e['row']))
+            hit = self._hits(G, col, row, kind, ang, st['size'] if running else None, fire)
+            age = 0.0 if hit else self.threat.get(key, 1e9) + dt
+            self.threat[key] = age
+            if not running:
+                if age >= THREAT_MEMORY:
                     self.state.pop(key, None)
                     continue
-                st = self.state[key] = dict(end=tick + REPEL_DURATION * self.rate, jump=None)
+                st = self.state[key] = dict(end=tick + REPEL_DURATION * self.rate, jump=None, size=cfg['size'])
             base = cfg['size']
             if st['jump'] is None and int(tick / bar - 0.5) != int((tick - 1) / bar - 0.5):
                 st['jump'] = tick                                   # first half bar of the episode
             size = base
             if st['jump'] is not None:
                 size = max(base, base * (1 + cfg['scale']) - base * cfg['scale'] * (tick - st['jump']) / self.rate)
+            st['size'] = size
             radius = float(int(size * 2 / 3)) if kind == 'water' else size * 2 / 3
             amount = 1.0
             if cfg['peak'] and int(tick / bar) != int((tick - 1) / bar):

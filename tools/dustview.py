@@ -150,8 +150,8 @@ def state_to_grid(G, like=None):
 # song scan only show the ones active at that moment. Assumed: every village repels water (seen on every
 # village of Maps 3 and 10; possibly not on Map 2, not checked further); repel lava is per village. Totem
 # dicts carry built, water, lava (radius, 0 = none).
-# The model switches each song on only while its village is threatened (dustsim.VillageRepels, measured live
-# 2026-11-27: water > 2 within ~15 cells, 10 s episodes, size jump and peak push on the music bar);
+# The model switches each song on only while its village is threatened (dustsim.VillageRepels, decoded from
+# dustai 2026-11-27: sweeping 4-point threat sampler out to 28.5 cells, 3 s memory, 10 s episodes, pulses);
 # VILLAGE_REPEL_RULE = False applies every known song every tick as before.
 SONG_RADIUS = {'water': 26.0, 'lava': 35 * 2 / 3}
 VILLAGE_REPEL_RULE = True    # model: songs only while threatened (dustsim.VillageRepels); False = every tick
@@ -908,7 +908,8 @@ class ModelSource(Source):
         fluid, mods, reps = FLUID_STEP, SOURCE_STEP, self.other_modifiers
         if VILLAGE_REPEL_RULE:                   # villages repel only while threatened (10 s episodes, pulses)
             vr = self.__dict__.setdefault('village_repels', dustsim.VillageRepels(self.GAME_RATE))
-            reps = vr.entries(self.G, reps, self.tick)
+            ex = getattr(self, 'extra', None)    # grid component 6: burning plants for the lava song
+            reps = vr.entries(self.G, reps, self.tick, ex[6] if ex is not None and len(ex) > 6 else None)
         if fluid == 'off':                       # fresh arrays: published frames keep the old ones
             G = {k: v.copy() for k, v in self.G.items()}
         else:
