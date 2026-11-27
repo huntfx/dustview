@@ -921,7 +921,10 @@ class ModelSource(Source):
                 dustsim.apply_modifiers(G, trees, self.P)
                 self._helper_holds = None        # G changed after the helper's copy
         if self.water_trees and mods != 'off':   # water trees: absorption straight into the grid, pours as springs
-            pours = dustsim.water_tree_step(G, self.water_trees, self.fire_trees, 1 / self.GAME_RATE)
+            ex = getattr(self, 'extra', None)    # burning plants / lava near a tree: danger (grid sensor)
+            pours = dustsim.water_tree_step(G, self.water_trees, self.fire_trees, 1 / self.GAME_RATE,
+                                            grid_danger=dustsim.bang_fire_danger(
+                                                ex[6] if ex is not None and len(ex) > 6 else None, 'danger_radius'))
             if pours:
                 dustsim.apply_modifiers(G, pours, self.P)
             self._helper_holds = None

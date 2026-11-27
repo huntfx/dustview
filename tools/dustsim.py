@@ -412,13 +412,14 @@ def _tree_burning(f):
     return f.get('state') == 3 and f['clock'] > f['next']
 
 
-def water_tree_step(G, trees, fire_trees=(), dt=1 / 31, rng=None):
+def water_tree_step(G, trees, fire_trees=(), dt=1 / 31, rng=None, grid_danger=None):
     """One frame of every water tree (DustAi::Figuier; dicts from live_generators.water_trees or
     sav_sources.water_trees), decoded 2026-11-27 (findings/water-lava-sim.md "Water trees"). Absorption is applied
     to G in place (dustai writes it straight into the grid, 0x100DA3C0); returns this frame's pour entries
     (type 0 fluid modifiers, like a spring) for apply_modifiers.
-    Absorbing state (0x10082720): danger (a burning fire tree within danger_radius; the game's second sensor,
-    presumably lava, is not modelled) -> pour rejection_speed x dt; else store += generation_speed x dt (capped at
+    Absorbing state (0x10082720): danger (a burning fire tree within danger_radius, or grid_danger(G, t): the game's
+    grid sensor, seen live to fire on burning plants and lava in a +-trunc(danger_radius x 2/3) = +-10 square;
+    pass bang_fire_danger(c6, 'danger_radius')) -> pour rejection_speed x dt; else store += generation_speed x dt (capped at
     max_quantity), absorb, and switch to blow_up once store > quantity_to_blow_up. Blow-up state: pour
     blow_up_rejection_speed x dt for explosion_duration (5 s), then the tree is removed from `trees` and its seeds
     added (0x1007F4F0: nb_seeds + random 0..nb_seeds_random, each at a random angle and a random distance
@@ -457,7 +458,7 @@ def water_tree_step(G, trees, fire_trees=(), dt=1 / 31, rng=None):
             continue
         r2 = t['danger_radius'] ** 2
         t['danger'] = any(_tree_burning(f) and (f['col'] - t['col']) ** 2 + (f['row'] - t['row']) ** 2 <= r2
-                          for f in fire_trees)
+                          for f in fire_trees) or bool(grid_danger and grid_danger(G, t))
         if t['danger']:
             out += _water_tree_pour(t, t['rejection_speed'], dt)
             continue
@@ -596,14 +597,15 @@ def bang_tree_hole(T, col, row, hole_radius=30.0, hole_depth=20.0):
     return g.size
 
 
-def bang_fire_danger(c6):
+def bang_fire_danger(c6, radius_key='grid_perception_radius'):
     """grid_danger for bang_tree_step: True when a burning plant cell (vegetation component 6, fire flag bit 6; c6
     may be None) or a lava cell (fluid < 0, any depth) lies in the square of +-trunc(grid_perception_radius x 2/3)
     = +-6 cells around the tree. The game's grid sensor (kind 0x0F) was seen live to report burning plant cells
     (Waves) and lava cells down to 0.03 deep (Story 10, 2026-11-27), at offsets up to 6 cells on both axes at once
-    (e.g. (+6, -6)), so a square, not a disc."""
+    (e.g. (+6, -6)), so a square, not a disc. The water tree's grid sensor is the same kind (radius_key
+    'danger_radius': +-10 cells; seen live on Story 10 to fire on burning plants and lava, offsets up to (+10, +10))."""
     def danger(G, t):
-        r = int(t.get('grid_perception_radius', 10.0) * 2 / 3)
+        r = int(t.get(radius_key, 10.0) * 2 / 3)
         c0, r0 = int(t['col']), int(t['row'])
         y0, y1, x0, x1 = max(r0 - r, 0), min(r0 + r + 1, 512), max(c0 - r, 0), min(c0 + r + 1, 512)
         if (G['W'][y0:y1, x0:x1] < 0).any():
